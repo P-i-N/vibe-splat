@@ -1,0 +1,8 @@
+/build/
+/out/
+/.vcpkg-cache/
+/CMakeUserPresets.json
+/.vs/
+/.vscode/
+/.idea/
+compile_commands.json
