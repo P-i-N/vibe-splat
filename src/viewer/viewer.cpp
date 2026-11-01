@@ -14,6 +14,8 @@
 #include <format>
 #include <memory>
 #include <print>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace splat {
