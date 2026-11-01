@@ -4,6 +4,7 @@
 #include <vk_mem_alloc.h>
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -22,7 +23,7 @@ struct DeviceInfo {
   std::uint64_t deviceLocalBytes = 0;
   std::uint32_t subgroupSize = 0;
   bool hasComputeQueue = false;
-  bool meetsRequirements = false; // Vulkan 1.3 + compute + subgroup arithmetic
+  bool meetsRequirements = false; // Vulkan 1.3, graphics+compute queue, subgroup arithmetic, push descriptors
   bool floatAtomicAdd = false;    // VK_EXT_shader_atomic_float, buffer add
 };
 
@@ -32,6 +33,13 @@ struct DeviceInfo {
 struct ContextOptions {
   bool validation = false;                   // Enable Khronos validation layer if installed
   std::optional<std::uint32_t> deviceIndex;  // Force a device; otherwise best is picked
+
+  // For on-screen rendering: extra instance extensions (from the windowing
+  // library) and a callback that creates the window surface once the instance
+  // exists. The chosen device must then be able to present to that surface,
+  // and VK_KHR_swapchain is enabled. The Context owns the surface.
+  std::vector<const char *> instanceExtensions;
+  std::function<VkSurfaceKHR(VkInstance)> createSurface;
 };
 
 // Owns the Vulkan instance, the chosen device, its compute queue and the VMA
@@ -54,6 +62,10 @@ public:
   [[nodiscard]] VkQueue compute_queue() const noexcept { return computeQueue_; }
   [[nodiscard]] std::uint32_t compute_family() const noexcept { return computeFamily_; }
   [[nodiscard]] VmaAllocator allocator() const noexcept { return allocator_; }
+  [[nodiscard]] VkSurfaceKHR surface() const noexcept { return surface_; }
+  // The one queue does graphics, compute and (with a surface) present.
+  [[nodiscard]] VkQueue queue() const noexcept { return computeQueue_; }
+  [[nodiscard]] VkCommandPool command_pool() const noexcept { return commandPool_; }
   [[nodiscard]] const DeviceInfo &info() const noexcept { return info_; }
 
   // Records commands via `record`, submits them on the compute queue and
@@ -72,6 +84,7 @@ private:
 
   VkInstance instance_ = VK_NULL_HANDLE;
   VkDebugUtilsMessengerEXT messenger_ = VK_NULL_HANDLE;
+  VkSurfaceKHR surface_ = VK_NULL_HANDLE;
   VkPhysicalDevice physical_ = VK_NULL_HANDLE;
   VkDevice device_ = VK_NULL_HANDLE;
   VkQueue computeQueue_ = VK_NULL_HANDLE;

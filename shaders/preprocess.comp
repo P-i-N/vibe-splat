@@ -1,0 +1,137 @@
+#version 460
+// Per-Gaussian preprocessing: frustum cull, project the 3D covariance to a 2D
+// screen-space conic (EWA splatting, as in the 3DGS paper), evaluate the
+// view-dependent SH colour, and emit a depth sort key. Visible splats are
+// counted into the indirect draw arguments.
+#extension GL_GOOGLE_include_directive : require
+#include "splat_types.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Gaussians { Gaussian gaussians[]; };
+layout(std430, binding = 1) readonly buffer SH { float sh[]; };
+layout(std430, binding = 2) readonly buffer Camera { CameraParams cam; };
+layout(std430, binding = 3) writeonly buffer Splats { Splat2D splats[]; };
+layout(std430, binding = 4) writeonly buffer Keys { uint keys[]; };
+layout(std430, binding = 5) writeonly buffer Values { uint values[]; };
+layout(std430, binding = 6) buffer DrawArgs {
+  uint vertexCount;
+  uint instanceCount;
+  uint firstVertex;
+  uint firstInstance;
+} draw;
+
+const float SH_C0 = 0.28209479177387814;
+const float SH_C1 = 0.4886025119029199;
+const float SH_C2[5] = float[](1.0925484305920792, -1.0925484305920792, 0.31539156525252005,
+                               -1.0925484305920792, 0.5462742152960396);
+const float SH_C3[7] = float[](-0.5900435899266435, 2.890611442640554, -0.4570457994644658,
+                               0.3731763325901154, -0.4570457994644658, 1.445305721320277,
+                               -0.5900435899266435);
+
+vec3 sh_coeff(uint base, uint k) {
+  const uint o = base + k * 3u;
+  return vec3(sh[o], sh[o + 1u], sh[o + 2u]);
+}
+
+vec3 eval_sh(uint index, vec3 dir) {
+  const uint base = index * cam.counts.z;
+  const uint degree = cam.counts.y;
+  vec3 result = SH_C0 * sh_coeff(base, 0u);
+  if (degree > 0u) {
+    const float x = dir.x, y = dir.y, z = dir.z;
+    result += -SH_C1 * y * sh_coeff(base, 1u) + SH_C1 * z * sh_coeff(base, 2u) - SH_C1 * x * sh_coeff(base, 3u);
+    if (degree > 1u) {
+      const float xx = x * x, yy = y * y, zz = z * z;
+      const float xy = x * y, yz = y * z, xz = x * z;
+      result += SH_C2[0] * xy * sh_coeff(base, 4u) + SH_C2[1] * yz * sh_coeff(base, 5u) +
+                SH_C2[2] * (2.0 * zz - xx - yy) * sh_coeff(base, 6u) + SH_C2[3] * xz * sh_coeff(base, 7u) +
+                SH_C2[4] * (xx - yy) * sh_coeff(base, 8u);
+      if (degree > 2u) {
+        result += SH_C3[0] * y * (3.0 * xx - yy) * sh_coeff(base, 9u) +
+                  SH_C3[1] * xy * z * sh_coeff(base, 10u) +
+                  SH_C3[2] * y * (4.0 * zz - xx - yy) * sh_coeff(base, 11u) +
+                  SH_C3[3] * z * (2.0 * zz - 3.0 * xx - 3.0 * yy) * sh_coeff(base, 12u) +
+                  SH_C3[4] * x * (4.0 * zz - xx - yy) * sh_coeff(base, 13u) +
+                  SH_C3[5] * z * (xx - yy) * sh_coeff(base, 14u) +
+                  SH_C3[6] * x * (xx - 3.0 * yy) * sh_coeff(base, 15u);
+      }
+    }
+  }
+  return max(result + 0.5, vec3(0.0));
+}
+
+mat3 quat_to_mat(vec4 q) {
+  const float w = q.x, x = q.y, y = q.z, z = q.w;
+  // Columns of the rotation matrix.
+  return mat3(1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y + w * z), 2.0 * (x * z - w * y),
+              2.0 * (x * y - w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z + w * x),
+              2.0 * (x * z + w * y), 2.0 * (y * z - w * x), 1.0 - 2.0 * (x * x + y * y));
+}
+
+void main() {
+  const uint i = gl_GlobalInvocationID.x;
+  if (i >= cam.counts.x) {
+    return;
+  }
+  // Default: invisible. Key 0xFFFFFFFF sorts after every visible splat.
+  keys[i] = 0xFFFFFFFFu;
+  values[i] = i;
+
+  const Gaussian g = gaussians[i];
+  const vec3 t = (cam.view * vec4(g.posOpacity.xyz, 1.0)).xyz;
+  if (t.z < 0.2) {
+    return;
+  }
+  const float opacity = g.posOpacity.w;
+  if (opacity < 1.0 / 255.0) {
+    return;
+  }
+
+  // 3D covariance: R S S^T R^T.
+  const mat3 R = quat_to_mat(g.rotation);
+  const mat3 S = mat3(g.scale.x, 0.0, 0.0, 0.0, g.scale.y, 0.0, 0.0, 0.0, g.scale.z);
+  const mat3 M = R * S;
+  const mat3 sigma = M * transpose(M);
+
+  // Jacobian of the perspective projection at t, with t clamped to a slightly
+  // enlarged frustum to keep splats near the edge stable.
+  const float fx = cam.intrinsics.x, fy = cam.intrinsics.y;
+  const float limX = 1.3 * cam.viewport.z, limY = 1.3 * cam.viewport.w;
+  const float tx = clamp(t.x / t.z, -limX, limX) * t.z;
+  const float ty = clamp(t.y / t.z, -limY, limY) * t.z;
+  const mat3 J = mat3(fx / t.z, 0.0, 0.0,
+                      0.0, fy / t.z, 0.0,
+                      -fx * tx / (t.z * t.z), -fy * ty / (t.z * t.z), 0.0);
+  const mat3 T = J * mat3(cam.view);
+  const mat3 cov = T * sigma * transpose(T);
+
+  // Low-pass filter (0.3 px^2) as in the reference renderer.
+  const float a = cov[0][0] + 0.3;
+  const float b = cov[0][1];
+  const float c = cov[1][1] + 0.3;
+  const float det = a * c - b * b;
+  if (det <= 0.0) {
+    return;
+  }
+  const vec3 conic = vec3(c, -b, a) / det;
+  const float mid = 0.5 * (a + c);
+  const float lambda = mid + sqrt(max(0.1, mid * mid - det));
+  const float radius = ceil(3.0 * sqrt(lambda));
+
+  const vec2 center = vec2(fx * t.x / t.z + cam.intrinsics.z, fy * t.y / t.z + cam.intrinsics.w);
+  if (center.x + radius < 0.0 || center.y + radius < 0.0 || center.x - radius > cam.viewport.x ||
+      center.y - radius > cam.viewport.y) {
+    return;
+  }
+
+  const vec3 dir = normalize(g.posOpacity.xyz - cam.position.xyz);
+  splats[i].centerRadius = vec4(center, radius, t.z);
+  splats[i].conicOpacity = vec4(conic, opacity);
+  splats[i].color = vec4(eval_sh(i, dir), 1.0);
+
+  // Back-to-front order: larger depth must sort first, so invert the
+  // (monotonic, positive) float bits.
+  keys[i] = 0xFFFFFFFFu - floatBitsToUint(t.z);
+  atomicAdd(draw.instanceCount, 1u);
+}

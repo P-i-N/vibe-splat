@@ -42,7 +42,7 @@ SelfTestResult run_selftest(vk::Context &ctx, std::uint32_t elements) {
 
   const auto start = std::chrono::steady_clock::now();
   ctx.submit_and_wait([&](VkCommandBuffer cmd) {
-    pipeline.dispatch(cmd, {&a, &b, &out, &sums}, std::as_bytes(std::span{&push, 1}), groups);
+    pipeline.dispatch(cmd, {&a, &b, &out, &sums}, push, groups);
     vk::compute_barrier(cmd);
   });
   const auto end = std::chrono::steady_clock::now();

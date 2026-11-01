@@ -1,4 +1,11 @@
 splat_add_shader_library(splat_shaders
   SOURCES
     selftest.comp
+    radix_histogram.comp
+    radix_scatter.comp
+    scan_blocks.comp
+    scan_add.comp
+    preprocess.comp
+    splat.vert
+    splat.frag
 )

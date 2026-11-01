@@ -1,0 +1,30 @@
+#version 460
+// Pass 1 of a radix-sort pass: per-tile digit histogram.
+// Output layout is digit-major (hist[digit * numTiles + tile]) so that one
+// exclusive scan over the whole array yields every tile's scatter base.
+#extension GL_GOOGLE_include_directive : require
+#include "radix_common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Keys { uint keys[]; };
+layout(std430, binding = 1) writeonly buffer Hist { uint hist[]; };
+
+shared uint s_hist[RADIX_BUCKETS];
+
+void main() {
+  const uint lid = gl_LocalInvocationIndex;
+  const uint tile = gl_WorkGroupID.x;
+  s_hist[lid] = 0;
+  barrier();
+
+  const uint base = tile * RADIX_TILE;
+  for (uint r = 0; r < RADIX_KEYS_PER_THREAD; ++r) {
+    const uint i = base + r * RADIX_THREADS + lid;
+    if (i < pc.count) {
+      atomicAdd(s_hist[(keys[i] >> pc.shift) & 0xFFu], 1u);
+    }
+  }
+  barrier();
+  hist[lid * pc.numTiles + tile] = s_hist[lid];
+}

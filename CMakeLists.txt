@@ -23,6 +23,12 @@ if(NOT TARGET Vulkan::Headers)
   find_package(Vulkan REQUIRED)
 endif()
 find_package(VulkanMemoryAllocator CONFIG REQUIRED)
+find_package(glm CONFIG REQUIRED)
+# stb is header-only; vcpkg installs it to include/, Debian/Ubuntu to include/stb/.
+find_path(STB_INCLUDE_DIR stb_image_write.h PATH_SUFFIXES stb REQUIRED)
+# The window viewer needs SDL3. Without it, `splat view` is not available but
+# everything else (including headless `splat render`) still builds.
+find_package(SDL3 CONFIG QUIET)
 
 include(cmake/CompilerWarnings.cmake)
 include(cmake/Shaders.cmake)

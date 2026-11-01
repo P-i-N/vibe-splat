@@ -33,6 +33,9 @@ function(splat_add_shader_library target)
   set(header "${gen_dir}/shaders.hpp")
   file(MAKE_DIRECTORY "${gen_dir}")
 
+  # Shared include files: any change recompiles every shader.
+  file(GLOB includes CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.glsl")
+
   set(cpp_files "")
   set(decls "")
   foreach(src IN LISTS ARG_SOURCES)
@@ -46,7 +49,7 @@ function(splat_add_shader_library target)
       OUTPUT "${spv}"
       COMMAND "${GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -g0
               -I"${CMAKE_CURRENT_SOURCE_DIR}" -o "${spv}" "${abs}"
-      DEPENDS "${abs}"
+      DEPENDS "${abs}" ${includes}
       COMMENT "Compiling shader ${fname}"
       VERBATIM)
 
