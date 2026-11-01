@@ -10,6 +10,8 @@
 #include "ingest/ingest.hpp"
 #include "render/offscreen.hpp"
 #include "render/splat_renderer.hpp"
+#include "sfm/sfm.hpp"
+#include "sfm/test_views.hpp"
 #include "splat/gaussian_cloud.hpp"
 #ifdef SPLAT_WITH_VIEWER
 #include "viewer/viewer.hpp"
@@ -40,7 +42,8 @@ Commands:
   info                          List Vulkan devices and whether splat can use them
   selftest                      Run a compute kernel on the GPU and check the result
   ingest <inputs...> -o <dir>   Import photos and videos into a project folder
-  sfm                           Estimate camera poses           (milestone M3)
+  sfm <project>                 Estimate camera poses from an ingested project
+  make-test-views <dir>         Render images with known poses, for trying sfm
   train                         Train Gaussian splats           (milestone M4)
 
 render options:
@@ -73,6 +76,17 @@ it here for a better start; sizes are for the input after rotation):
   --sensor-width-mm <mm>  Sensor size along the image's longer side
   --fov <deg>             Horizontal field of view
   --cx <px>, --cy <px>    Principal point (default: image centre)
+
+sfm options (writes project/sparse/0 in COLMAP's format, plus preview.ply):
+  --matcher <m>           auto (default), exhaustive or sequential
+  --window <n>            Neighbours per image when sequential (default 8)
+  --max-features <n>      Per image (default 4000)
+  --threads <n>           0 uses all cores (default 0)
+  --import <dir>          Instead of estimating, import a COLMAP sparse model
+
+make-test-views options:
+  --count <n>             Number of images (default 12)
+  --width <px>, --height <px>, --focal <px>   Default 640, 480, 500
 
 view options:
   --up <axis>             As for render
@@ -269,6 +283,63 @@ int cmd_ingest(const GlobalOptions &opts) {
   return 0;
 }
 
+int cmd_sfm(const GlobalOptions &opts) {
+  const splat::cli::Args args(opts.rest, {});
+  args.allow_only({"import", "matcher", "window", "max-features", "threads"});
+  if (args.positionals().size() != 1) {
+    std::println(stderr, "Usage: splat sfm <project> [options]  (see splat --help)");
+    return 2;
+  }
+  const std::string project = args.positionals()[0];
+  const auto print_stats = [&](const splat::ColmapStats &stats, std::size_t ingested, std::size_t unregistered) {
+    std::println("Posed {} of {} images, {} points -> {}/sparse/0", stats.images, ingested, stats.points, project);
+    std::println("  mean track length {:.2f}, {:.0f} observations per image, reprojection error {:.3f} px",
+                 stats.meanTrackLength, stats.meanObservationsPerImage, stats.meanReprojectionError);
+    if (unregistered > 0) std::println("  {} images have no pose and will not be used", unregistered);
+  };
+
+  if (args.has("import")) {
+    const auto report = splat::import_colmap_model(project, args.get("import", ""));
+    print_stats(report.stats, report.ingested, report.unregistered);
+    return 0;
+  }
+
+  splat::SfmOptions options;
+  options.project = project;
+  options.maxFeatures = std::max(args.number("max-features", options.maxFeatures), 16);
+  options.window = std::max(args.number("window", options.window), 1);
+  options.threads = std::max(args.number("threads", 0), 0);
+  const std::string matcher = args.get("matcher", "auto");
+  if (matcher == "exhaustive") options.matcher = splat::Matcher::Exhaustive;
+  else if (matcher == "sequential") options.matcher = splat::Matcher::Sequential;
+  else if (matcher != "auto") throw std::runtime_error(std::format("--matcher must be auto, exhaustive or sequential (got '{}')", matcher));
+
+  const auto start = std::chrono::steady_clock::now();
+  const auto report = splat::run_sfm(options);
+  const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  print_stats(report.stats, report.ingested, report.unregistered);
+  std::println("  {} of {} image pairs matched, {:.1f} s in total", report.pairsVerified, report.pairsTried, seconds);
+  return 0;
+}
+
+int cmd_make_test_views(const GlobalOptions &opts) {
+  const splat::cli::Args args(opts.rest, {});
+  args.allow_only({"count", "width", "height", "focal"});
+  if (args.positionals().size() != 1) {
+    std::println(stderr, "Usage: splat make-test-views <dir> [--count N] [--width W] [--height H] [--focal F]");
+    return 2;
+  }
+  const std::filesystem::path dir = args.positionals()[0];
+  std::filesystem::create_directories(dir);
+  const auto views = splat::make_test_views(std::max(args.number("count", 12), 2), std::clamp(args.number("width", 640), 64, 8192),
+                                            std::clamp(args.number("height", 480), 64, 8192), args.number("focal", 500.0));
+  for (std::size_t i = 0; i < views.size(); ++i) {
+    splat::write_image(views[i].image, dir / std::format("view_{:03}.png", i), 95);
+  }
+  std::println("Wrote {} images to {}", views.size(), dir.string());
+  return 0;
+}
+
 int cmd_not_yet(std::string_view command, std::string_view milestone) {
   std::println(stderr, "'splat {}' is not implemented yet (planned for milestone {}).", command, milestone);
   return 2;
@@ -316,7 +387,8 @@ int main(int argc, char **argv) {
     if (opts.command == "info") return cmd_info();
     if (opts.command == "selftest") return cmd_selftest(opts);
     if (opts.command == "ingest") return cmd_ingest(opts);
-    if (opts.command == "sfm") return cmd_not_yet(opts.command, "M3");
+    if (opts.command == "sfm") return cmd_sfm(opts);
+    if (opts.command == "make-test-views") return cmd_make_test_views(opts);
     if (opts.command == "train") return cmd_not_yet(opts.command, "M4");
     if (opts.command == "view") return cmd_view(opts);
     if (opts.command == "render") return cmd_render(opts);
