@@ -8,11 +8,30 @@
     "volk",
     "vulkan-headers",
     "vulkan-memory-allocator",
+    "glm",
+    "stb",
+    {
+      "name": "sdl3",
+      "default-features": false,
+      "features": [
+        "vulkan",
+        {
+          "name": "x11",
+          "platform": "linux"
+        },
+        {
+          "name": "wayland",
+          "platform": "linux"
+        }
+      ]
+    },
     {
       "name": "glslang",
       "host": true,
       "default-features": false,
-      "features": [ "tools" ]
+      "features": [
+        "tools"
+      ]
     },
     "catch2"
   ]

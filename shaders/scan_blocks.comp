@@ -1,0 +1,42 @@
+#version 460
+// In-place exclusive prefix sum over blocks of 1024 uints. Writes each
+// block's total to `sums`; a second level scans those and scan_add.comp adds
+// them back.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#include "workgroup_scan.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Data { uint data[]; };
+layout(std430, binding = 1) writeonly buffer Sums { uint sums[]; };
+
+layout(push_constant) uniform Push { uint count; } pc;
+
+void main() {
+  const uint lid = gl_LocalInvocationIndex;
+  const uint base = gl_WorkGroupID.x * 1024u + lid * 4u;
+
+  uint v[4];
+  uint threadTotal = 0;
+  for (uint j = 0; j < 4u; ++j) {
+    const uint i = base + j;
+    v[j] = i < pc.count ? data[i] : 0u;
+    const uint x = v[j];
+    v[j] = threadTotal; // exclusive within the thread
+    threadTotal += x;
+  }
+
+  uint blockTotal;
+  const uint offset = workgroup_exclusive_add(threadTotal, blockTotal);
+  for (uint j = 0; j < 4u; ++j) {
+    const uint i = base + j;
+    if (i < pc.count) {
+      data[i] = offset + v[j];
+    }
+  }
+  if (lid == 0u) {
+    sums[gl_WorkGroupID.x] = blockTotal;
+  }
+}

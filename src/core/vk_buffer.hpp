@@ -3,7 +3,9 @@
 #include "core/vk_context.hpp"
 
 #include <cstddef>
+#include <cstring>
 #include <span>
+#include <vector>
 
 namespace splat::vk {
 
@@ -14,6 +16,8 @@ enum class MemoryUsage {
 };
 
 // A VMA-backed VkBuffer. Move-only; destroyed with its owning Context alive.
+// Every buffer also gets TRANSFER_SRC/DST usage so it can be filled, cleared
+// and read back.
 class Buffer {
 public:
   Buffer() = default;
@@ -39,6 +43,22 @@ public:
   // on memory that is not host-coherent. No-op otherwise.
   void flush() const;
   void invalidate() const;
+
+  // Copies bytes into a buffer of any kind (uses a staging buffer when the
+  // destination is not mappable) and waits for completion.
+  void upload(Context &ctx, std::span<const std::byte> data, VkDeviceSize offset = 0) const;
+  // Reads the whole buffer back to the CPU and waits for completion.
+  [[nodiscard]] std::vector<std::byte> download(Context &ctx) const;
+
+  template <class T> void upload(Context &ctx, std::span<const T> data) const {
+    upload(ctx, std::as_bytes(data));
+  }
+  template <class T> [[nodiscard]] std::vector<T> download_as(Context &ctx) const {
+    const auto bytes = download(ctx);
+    std::vector<T> out(bytes.size() / sizeof(T));
+    std::memcpy(out.data(), bytes.data(), out.size() * sizeof(T));
+    return out;
+  }
 
 private:
   void reset() noexcept;

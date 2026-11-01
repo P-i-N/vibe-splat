@@ -44,28 +44,31 @@ bool has_layer(const char *name) {
   });
 }
 
-std::optional<std::uint32_t> find_compute_family(VkPhysicalDevice pd) {
+std::optional<std::uint32_t> find_compute_family(VkPhysicalDevice pd, VkSurfaceKHR surface = VK_NULL_HANDLE) {
   std::uint32_t count = 0;
   vkGetPhysicalDeviceQueueFamilyProperties(pd, &count, nullptr);
   std::vector<VkQueueFamilyProperties> families(count);
   vkGetPhysicalDeviceQueueFamilyProperties(pd, &count, families.data());
-  // Prefer a family with graphics + compute: the viewer and live training
-  // preview share it. Fall back to any compute family.
-  std::optional<std::uint32_t> anyCompute;
+  // One queue family that does graphics + compute (and present, when a
+  // surface is given): the viewer, trainer and live preview all share it.
   for (std::uint32_t i = 0; i < count; ++i) {
     const auto flags = families[i].queueFlags;
-    if ((flags & VK_QUEUE_COMPUTE_BIT) == 0) {
+    if ((flags & VK_QUEUE_COMPUTE_BIT) == 0 || (flags & VK_QUEUE_GRAPHICS_BIT) == 0) {
       continue;
     }
-    if (flags & VK_QUEUE_GRAPHICS_BIT) {
-      return i;
+    if (surface != VK_NULL_HANDLE) {
+      VkBool32 present = VK_FALSE;
+      vkGetPhysicalDeviceSurfaceSupportKHR(pd, i, surface, &present);
+      if (present == VK_FALSE) {
+        continue;
+      }
     }
-    anyCompute = anyCompute.value_or(i);
+    return i;
   }
-  return anyCompute;
+  return std::nullopt;
 }
 
-DeviceInfo describe(VkPhysicalDevice pd, std::uint32_t index) {
+DeviceInfo describe(VkPhysicalDevice pd, std::uint32_t index, VkSurfaceKHR surface = VK_NULL_HANDLE) {
   VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
   VkPhysicalDeviceVulkan11Properties v11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES};
   v11.pNext = &driver;
@@ -90,7 +93,7 @@ DeviceInfo describe(VkPhysicalDevice pd, std::uint32_t index) {
     }
   }
 
-  info.hasComputeQueue = find_compute_family(pd).has_value();
+  info.hasComputeQueue = find_compute_family(pd, surface).has_value();
 
   if (has_extension(pd, VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME)) {
     VkPhysicalDeviceShaderAtomicFloatFeaturesEXT af{
@@ -104,7 +107,10 @@ DeviceInfo describe(VkPhysicalDevice pd, std::uint32_t index) {
   const bool subgroupArith =
       (v11.subgroupSupportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
       (v11.subgroupSupportedOperations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) != 0;
-  info.meetsRequirements = info.apiVersion >= kRequiredApi && info.hasComputeQueue && subgroupArith;
+  const bool pushDescriptor = has_extension(pd, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+  const bool swapchain = surface == VK_NULL_HANDLE || has_extension(pd, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+  info.meetsRequirements =
+      info.apiVersion >= kRequiredApi && info.hasComputeQueue && subgroupArith && pushDescriptor && swapchain;
   return info;
 }
 
@@ -127,7 +133,8 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverityFlagBit
   return VK_FALSE;
 }
 
-VkInstance create_instance(bool validation, VkDebugUtilsMessengerEXT *messenger) {
+VkInstance create_instance(bool validation, VkDebugUtilsMessengerEXT *messenger,
+                           const std::vector<const char *> &extraExtensions = {}) {
   init_loader();
 
   std::uint32_t loaderVersion = VK_API_VERSION_1_0;
@@ -143,7 +150,7 @@ VkInstance create_instance(bool validation, VkDebugUtilsMessengerEXT *messenger)
   app.apiVersion = kRequiredApi;
 
   std::vector<const char *> layers;
-  std::vector<const char *> extensions;
+  std::vector<const char *> extensions = extraExtensions;
   const bool useValidation = validation && has_layer(kValidationLayer);
   if (validation && !useValidation) {
     std::fprintf(stderr, "warning: %s not installed, continuing without validation\n", kValidationLayer);
@@ -228,7 +235,13 @@ std::vector<DeviceInfo> Context::enumerate_devices() {
 
 Context::Context(const ContextOptions &options) {
   try {
-    instance_ = create_instance(options.validation, &messenger_);
+    instance_ = create_instance(options.validation, &messenger_, options.instanceExtensions);
+    if (options.createSurface) {
+      surface_ = options.createSurface(instance_);
+      if (surface_ == VK_NULL_HANDLE) {
+        throw Error("Could not create a window surface.");
+      }
+    }
 
     const auto devices = physical_devices(instance_);
     if (devices.empty()) {
@@ -239,15 +252,16 @@ Context::Context(const ContextOptions &options) {
       if (*options.deviceIndex >= devices.size()) {
         throw Error(std::format("Device {} does not exist ({} found).", *options.deviceIndex, devices.size()));
       }
-      info_ = describe(devices[*options.deviceIndex], *options.deviceIndex);
+      info_ = describe(devices[*options.deviceIndex], *options.deviceIndex, surface_);
       if (!info_.meetsRequirements) {
-        throw Error(std::format("Device {} ({}) lacks Vulkan 1.3, compute or subgroup arithmetic.",
+        throw Error(std::format("Device {} ({}) lacks Vulkan 1.3, a graphics+compute queue, subgroup arithmetic, "
+                                "push descriptors or presentation support.",
                                 info_.index, info_.name));
       }
     } else {
       std::optional<DeviceInfo> best;
       for (std::uint32_t i = 0; i < devices.size(); ++i) {
-        DeviceInfo d = describe(devices[i], i);
+        DeviceInfo d = describe(devices[i], i, surface_);
         if (!d.meetsRequirements) {
           continue;
         }
@@ -257,12 +271,13 @@ Context::Context(const ContextOptions &options) {
         }
       }
       if (!best) {
-        throw Error("No Vulkan 1.3 device with compute and subgroup support found.");
+        throw Error("No usable Vulkan device found (needs Vulkan 1.3, a graphics+compute queue, subgroup "
+                    "arithmetic and push descriptors). Run 'splat info' for details.");
       }
       info_ = *best;
     }
     physical_ = devices[info_.index];
-    computeFamily_ = *find_compute_family(physical_);
+    computeFamily_ = *find_compute_family(physical_, surface_);
 
     // Features: Vulkan 1.3 core bits we rely on, plus float atomics when present.
     VkPhysicalDeviceShaderAtomicFloatFeaturesEXT atomicFloat{
@@ -271,6 +286,7 @@ Context::Context(const ContextOptions &options) {
     VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     v13.synchronization2 = VK_TRUE;
     v13.maintenance4 = VK_TRUE;
+    v13.dynamicRendering = VK_TRUE;
     v13.pNext = info_.floatAtomicAdd ? &atomicFloat : nullptr;
     VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     v12.timelineSemaphore = VK_TRUE;
@@ -278,7 +294,10 @@ Context::Context(const ContextOptions &options) {
     VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     features.pNext = &v12;
 
-    std::vector<const char *> extensions;
+    std::vector<const char *> extensions{VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME};
+    if (surface_ != VK_NULL_HANDLE) {
+      extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    }
     if (info_.floatAtomicAdd) {
       extensions.push_back(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
     }
@@ -325,6 +344,7 @@ Context::~Context() { destroy(); }
 Context::Context(Context &&other) noexcept
     : instance_(std::exchange(other.instance_, VK_NULL_HANDLE)),
       messenger_(std::exchange(other.messenger_, VK_NULL_HANDLE)),
+      surface_(std::exchange(other.surface_, VK_NULL_HANDLE)),
       physical_(std::exchange(other.physical_, VK_NULL_HANDLE)),
       device_(std::exchange(other.device_, VK_NULL_HANDLE)),
       computeQueue_(std::exchange(other.computeQueue_, VK_NULL_HANDLE)),
@@ -338,6 +358,7 @@ Context &Context::operator=(Context &&other) noexcept {
     destroy();
     instance_ = std::exchange(other.instance_, VK_NULL_HANDLE);
     messenger_ = std::exchange(other.messenger_, VK_NULL_HANDLE);
+    surface_ = std::exchange(other.surface_, VK_NULL_HANDLE);
     physical_ = std::exchange(other.physical_, VK_NULL_HANDLE);
     device_ = std::exchange(other.device_, VK_NULL_HANDLE);
     computeQueue_ = std::exchange(other.computeQueue_, VK_NULL_HANDLE);
@@ -364,6 +385,10 @@ void Context::destroy() noexcept {
   if (device_ != VK_NULL_HANDLE) {
     vkDestroyDevice(device_, nullptr);
     device_ = VK_NULL_HANDLE;
+  }
+  if (surface_ != VK_NULL_HANDLE) {
+    vkDestroySurfaceKHR(instance_, surface_, nullptr);
+    surface_ = VK_NULL_HANDLE;
   }
   if (messenger_ != VK_NULL_HANDLE) {
     vkDestroyDebugUtilsMessengerEXT(instance_, messenger_, nullptr);

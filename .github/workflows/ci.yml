@@ -17,10 +17,12 @@ jobs:
         with:
           submodules: true
 
-      - name: Install build tools and Mesa lavapipe (software Vulkan for tests)
+      - name: Install build tools, SDL3 system headers and Mesa lavapipe (software Vulkan for tests)
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build g++-14 mesa-vulkan-drivers vulkan-validationlayers
+          sudo apt-get install -y ninja-build g++-14 mesa-vulkan-drivers vulkan-validationlayers \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libxfixes-dev \
+            libxtst-dev libwayland-dev libxkbcommon-dev libegl1-mesa-dev wayland-protocols
 
       - name: Restore vcpkg binary cache
         uses: actions/cache@v4
@@ -33,11 +35,15 @@ jobs:
       - run: cmake --preset linux-release
       - run: cmake --build --preset linux-release
       - run: ctest --preset linux-release
+      - name: Check the window viewer was built
+        run: ./build/linux-release/src/splat view 2>&1 | grep -q "Usage: splat view"
 
       - uses: actions/upload-artifact@v4
         with:
           name: splat-linux-x64
-          path: build/linux-release/src/splat
+          path: |
+            build/linux-release/src/splat
+            build/linux-release/tests/cli_render.png
 
   windows:
     runs-on: windows-2022

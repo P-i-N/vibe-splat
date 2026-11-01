@@ -2,23 +2,9 @@
 #include "core/vk_check.hpp"
 #include "core/vk_context.hpp"
 
+#include "test_support.hpp"
+
 #include <catch2/catch_test_macros.hpp>
-
-#include <optional>
-
-namespace {
-
-// Tests need a Vulkan device. CI uses Mesa's lavapipe (software Vulkan).
-std::optional<splat::vk::Context> try_context() {
-  try {
-    return splat::vk::Context({.validation = true});
-  } catch (const splat::vk::Error &e) {
-    WARN("No usable Vulkan device: " << e.what());
-    return std::nullopt;
-  }
-}
-
-} // namespace
 
 TEST_CASE("device enumeration reports at least one device", "[vulkan]") {
   std::vector<splat::vk::DeviceInfo> devices;
@@ -34,8 +20,8 @@ TEST_CASE("device enumeration reports at least one device", "[vulkan]") {
 }
 
 TEST_CASE("compute selftest produces correct results", "[vulkan]") {
-  auto ctx = try_context();
-  if (!ctx) {
+  splat::vk::Context *ctx = splat::test::context();
+  if (ctx == nullptr) {
     SKIP("No usable Vulkan device");
   }
   SECTION("one full workgroup") {
