@@ -1,0 +1,139 @@
+#version 460
+// Backward pass, step 2: the chain rule from the screen-space sums of the
+// previous step down to the raw parameters. The maths is mirrored and checked
+// against finite differences in src/train/reference.cpp.
+//
+// One thing is deliberately left out: colour also depends on position through
+// the view direction for SH degree above 0. The effect is tiny compared with
+// what the same point's position does to the image, and 3DGS trainers that
+// freeze this direction lose nothing measurable.
+#extension GL_GOOGLE_include_directive : require
+#include "splat_types.glsl"
+#include "train_types.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Positions { float positions[]; };
+layout(std430, binding = 1) readonly buffer Scales { float scales[]; };
+layout(std430, binding = 2) readonly buffer Rotations { float rotations[]; };
+layout(std430, binding = 3) readonly buffer Opacities { float opacities[]; };
+layout(std430, binding = 4) readonly buffer SH { float sh[]; };
+layout(std430, binding = 5) readonly buffer Camera { CameraParams cam; };
+layout(std430, binding = 6) readonly buffer Raw { float raw[]; };
+layout(std430, binding = 7) writeonly buffer GradPositions { float gradPositions[]; };
+layout(std430, binding = 8) writeonly buffer GradScales { float gradScales[]; };
+layout(std430, binding = 9) writeonly buffer GradRotations { float gradRotations[]; };
+layout(std430, binding = 10) writeonly buffer GradOpacities { float gradOpacities[]; };
+layout(std430, binding = 11) writeonly buffer GradSH { float gradSh[]; };
+
+// tr(G A X J^T) for 2x2 symmetric G, with A and J 2x3 and X 3x3.
+float trace_term(mat2 G, mat3x2 A, mat3 X, mat3x2 J) {
+  const mat2 product = G * (A * X * transpose(J));
+  return product[0][0] + product[1][1];
+}
+
+void main() {
+  const uint i = gl_GlobalInvocationID.x;
+  if (i >= cam.counts.x) {
+    return;
+  }
+  // Nothing reached this splat. The buffers were cleared, so skip the maths,
+  // which would not even be defined for a splat behind the camera.
+  bool touched = false;
+  for (uint k = 0u; k < 9u; ++k) {
+    touched = touched || raw[i * 9u + k] != 0.0;
+  }
+  if (!touched) {
+    return;
+  }
+
+  const vec3 p = vec3(positions[i * 3u], positions[i * 3u + 1u], positions[i * 3u + 2u]);
+  const vec3 logScale = vec3(scales[i * 3u], scales[i * 3u + 1u], scales[i * 3u + 2u]);
+  vec4 quat = vec4(rotations[i * 4u], rotations[i * 4u + 1u], rotations[i * 4u + 2u], rotations[i * 4u + 3u]);
+  const float quatLength = length(quat);
+  quat = quatLength > 0.0 ? quat / quatLength : vec4(1.0, 0.0, 0.0, 0.0);
+
+  const uint at = i * 9u;
+  const vec3 t = (cam.view * vec4(p, 1.0)).xyz;
+  const float fx = cam.intrinsics.x, fy = cam.intrinsics.y;
+  const float z = t.z, iz = 1.0 / z, iz2 = iz * iz;
+
+  // Screen-space sums: dL/dcentre and dL/dcovariance as a symmetric matrix.
+  const vec2 gCentre = vec2(raw[at + 1u], raw[at + 2u]);
+  const mat2 G = mat2(raw[at + 3u], raw[at + 4u], raw[at + 4u], raw[at + 5u]);
+
+  const mat3 Rv = mat3(cam.view);
+  const mat3 R = train_quat_to_mat(quat);
+  const vec3 s2 = exp(2.0 * logScale);
+  const mat3 D = mat3(s2.x, 0.0, 0.0, 0.0, s2.y, 0.0, 0.0, 0.0, s2.z);
+  const mat3 sigma = R * D * transpose(R);
+  const mat3 X = Rv * sigma * transpose(Rv);
+
+  const float limX = 1.3 * cam.viewport.z, limY = 1.3 * cam.viewport.w;
+  const float rx = t.x * iz, ry = t.y * iz;
+  const bool clampedX = abs(rx) > limX, clampedY = abs(ry) > limY;
+  const float tx = clamp(rx, -limX, limX) * z, ty = clamp(ry, -limY, limY) * z;
+  const mat3x2 J = mat3x2(vec2(fx * iz, 0.0), vec2(0.0, fy * iz), vec2(-fx * tx * iz2, -fy * ty * iz2));
+
+  // Position moves the centre, and also how the covariance projects.
+  const mat3x2 Jc = mat3x2(vec2(fx * iz, 0.0), vec2(0.0, fy * iz), vec2(-fx * t.x * iz2, -fy * t.y * iz2));
+  vec3 gT = transpose(Jc) * gCentre;
+  const mat3x2 dJx = mat3x2(vec2(0.0), vec2(0.0), vec2(clampedX ? 0.0 : -fx * iz2, 0.0));
+  const mat3x2 dJy = mat3x2(vec2(0.0), vec2(0.0), vec2(0.0, clampedY ? 0.0 : -fy * iz2));
+  const mat3x2 dJz = mat3x2(vec2(-fx * iz2, 0.0), vec2(0.0, -fy * iz2),
+                            vec2(clampedX ? fx * tx * iz2 * iz : 2.0 * fx * tx * iz2 * iz,
+                                 clampedY ? fy * ty * iz2 * iz : 2.0 * fy * ty * iz2 * iz));
+  gT += 2.0 * vec3(trace_term(G, dJx, X, J), trace_term(G, dJy, X, J), trace_term(G, dJz, X, J));
+  const vec3 gP = transpose(Rv) * gT;
+  gradPositions[i * 3u] = gP.x;
+  gradPositions[i * 3u + 1u] = gP.y;
+  gradPositions[i * 3u + 2u] = gP.z;
+
+  // The 3D covariance: dL = tr(G3 dSigma).
+  const mat3x2 T = J * Rv;
+  const mat3 G3 = transpose(T) * G * T;
+  for (int a = 0; a < 3; ++a) {
+    const vec3 axis = R[a];
+    gradScales[i * 3u + uint(a)] = 2.0 * s2[a] * dot(axis, G3 * axis);
+  }
+
+  // Rotation: dL = tr(P^T dR). The matrices are dR/dw, dR/dx, dR/dy, dR/dz of
+  // the rotation formula, written by columns.
+  const mat3 P = 2.0 * G3 * R * D;
+  const float w = quat.x, x = quat.y, y = quat.z, zq = quat.w;
+  const mat3 dRw = mat3(0.0, 2.0 * zq, -2.0 * y, -2.0 * zq, 0.0, 2.0 * x, 2.0 * y, -2.0 * x, 0.0);
+  const mat3 dRx = mat3(0.0, 2.0 * y, 2.0 * zq, 2.0 * y, -4.0 * x, 2.0 * w, 2.0 * zq, -2.0 * w, -4.0 * x);
+  const mat3 dRy = mat3(-4.0 * y, 2.0 * x, -2.0 * w, 2.0 * x, 0.0, 2.0 * zq, 2.0 * w, 2.0 * zq, -4.0 * y);
+  const mat3 dRz = mat3(-4.0 * zq, 2.0 * w, 2.0 * x, -2.0 * w, -4.0 * zq, 2.0 * y, 2.0 * x, 2.0 * y, 0.0);
+  const vec4 gq = vec4(dot(P[0], dRw[0]) + dot(P[1], dRw[1]) + dot(P[2], dRw[2]),
+                       dot(P[0], dRx[0]) + dot(P[1], dRx[1]) + dot(P[2], dRx[2]),
+                       dot(P[0], dRy[0]) + dot(P[1], dRy[1]) + dot(P[2], dRy[2]),
+                       dot(P[0], dRz[0]) + dot(P[1], dRz[1]) + dot(P[2], dRz[2]));
+  // The quaternion is normalised before use, so only its tangent part counts.
+  const vec4 tangent = (gq - quat * dot(quat, gq)) / max(quatLength, 1e-12);
+  gradRotations[i * 4u] = tangent.x;
+  gradRotations[i * 4u + 1u] = tangent.y;
+  gradRotations[i * 4u + 2u] = tangent.z;
+  gradRotations[i * 4u + 3u] = tangent.w;
+
+  const float opacity = 1.0 / (1.0 + exp(-opacities[i]));
+  gradOpacities[i] = raw[at] * opacity * (1.0 - opacity);
+
+  const vec3 gColour = vec3(raw[at + 6u], raw[at + 7u], raw[at + 8u]);
+  float basis[16];
+  sh_basis(normalize(p - cam.position.xyz), cam.counts.y, basis);
+  const uint coefficients = cam.counts.z / 3u;
+  const uint base = i * cam.counts.z;
+  vec3 colour = vec3(0.5);
+  for (uint k = 0u; k < coefficients; ++k) {
+    colour += basis[k] * vec3(sh[base + k * 3u], sh[base + k * 3u + 1u], sh[base + k * 3u + 2u]);
+  }
+  // Colour is clamped at zero, where the coefficients stop mattering.
+  const vec3 unclamped = vec3(greaterThan(colour, vec3(0.0)));
+  for (uint k = 0u; k < coefficients; ++k) {
+    const vec3 g = basis[k] * gColour * unclamped;
+    gradSh[base + k * 3u] = g.r;
+    gradSh[base + k * 3u + 1u] = g.g;
+    gradSh[base + k * 3u + 2u] = g.b;
+  }
+}

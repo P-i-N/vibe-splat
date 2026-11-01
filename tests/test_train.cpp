@@ -1,0 +1,325 @@
+#include "render/offscreen.hpp"
+#include "render/splat_renderer.hpp"
+#include "sfm/test_views.hpp"
+#include "test_support.hpp"
+#include "train/reference.hpp"
+#include "train/trainer.hpp"
+
+#include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_floating_point.hpp>
+
+#include <cmath>
+#include <print>
+#include <random>
+#include <string>
+
+using namespace splat;
+using Catch::Matchers::WithinAbs;
+
+namespace {
+
+constexpr float kShC0 = 0.28209479177387814f;
+
+GaussianCloud random_cloud(std::size_t count, int degree, std::uint32_t seed) {
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<float> u(-1.f, 1.f), unit(0.f, 1.f);
+  GaussianCloud cloud;
+  cloud.resize(count, degree);
+  const auto coefficients = static_cast<std::size_t>(cloud.shCoeffs());
+  for (std::size_t i = 0; i < count; ++i) {
+    cloud.positions[i * 3] = u(rng) * 1.4f;
+    cloud.positions[i * 3 + 1] = u(rng) * 1.1f;
+    cloud.positions[i * 3 + 2] = 3.f + unit(rng) * 3.f;
+    for (std::size_t a = 0; a < 3; ++a) cloud.scales[i * 3 + a] = std::log(0.06f + 0.2f * unit(rng));
+    for (std::size_t a = 0; a < 4; ++a) cloud.rotations[i * 4 + a] = u(rng);
+    cloud.opacities[i] = u(rng) * 1.5f;
+    for (std::size_t c = 0; c < 3; ++c) cloud.sh[i * coefficients * 3 + c] = (unit(rng) - 0.5f) / kShC0;
+    for (std::size_t k = 3; k < coefficients * 3; ++k) cloud.sh[i * coefficients * 3 + k] = u(rng) * 0.2f;
+  }
+  return cloud;
+}
+
+Camera test_camera(int width = 64, int height = 48) {
+  Camera camera;
+  camera.fx = camera.fy = 60.f;
+  camera.cx = static_cast<float>(width) * 0.5f;
+  camera.cy = static_cast<float>(height) * 0.5f;
+  camera.width = width;
+  camera.height = height;
+  return camera;
+}
+
+std::vector<std::uint8_t> noise_target(int width, int height, std::uint32_t seed) {
+  std::mt19937 rng(seed);
+  std::vector<std::uint8_t> target(static_cast<std::size_t>(width) * height * 4);
+  // Smooth rather than white, so that SSIM has structure to compare.
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      const std::size_t at = (static_cast<std::size_t>(y) * width + x) * 4;
+      target[at] = static_cast<std::uint8_t>(127.f + 100.f * std::sin(0.2f * static_cast<float>(x)) + static_cast<float>(rng() % 16));
+      target[at + 1] = static_cast<std::uint8_t>(127.f + 100.f * std::cos(0.15f * static_cast<float>(y)) + static_cast<float>(rng() % 16));
+      target[at + 2] = static_cast<std::uint8_t>(60 + (x + y) % 120);
+      target[at + 3] = 255;
+    }
+  }
+  return target;
+}
+
+// How well two gradient vectors agree: direction and length.
+void check_close(const std::vector<double> &a, const std::vector<double> &b, const char *what, double minCosine, double maxRatioError) {
+  REQUIRE(a.size() == b.size());
+  double ab = 0.0, aa = 0.0, bb = 0.0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    ab += a[i] * b[i];
+    aa += a[i] * a[i];
+    bb += b[i] * b[i];
+  }
+  INFO(what);
+  REQUIRE(aa > 0.0);
+  REQUIRE(bb > 0.0);
+  const double cosine = ab / std::sqrt(aa * bb), ratio = std::sqrt(aa / bb);
+  std::println("  {:12} cosine {:.6f}, length ratio {:.5f}", what, cosine, ratio);
+  CHECK(cosine > minCosine);
+  CHECK(std::abs(ratio - 1.0) < maxRatioError);
+}
+
+std::vector<double> to_double(const std::vector<float> &v) { return {v.begin(), v.end()}; }
+
+double functional(const GaussianCloud &cloud, const Camera &camera, const std::vector<glm::dvec3> &adjoint) {
+  ReferenceOptions options;
+  options.noCutoffs = true;
+  const ReferenceImage image = reference_render(cloud, camera, options);
+  double sum = 0.0;
+  for (std::size_t i = 0; i < adjoint.size(); ++i) sum += glm::dot(adjoint[i], image.rgb[i]);
+  return sum;
+}
+
+// Central differences of the functional over one parameter array.
+std::vector<double> finite_differences(GaussianCloud cloud, std::vector<float> GaussianCloud::*member, const Camera &camera,
+                                       const std::vector<glm::dvec3> &adjoint, float step) {
+  std::vector<float> &values = cloud.*member;
+  std::vector<double> out(values.size());
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    const float original = values[i];
+    values[i] = original + step;
+    const float up = values[i];
+    const double high = functional(cloud, camera, adjoint);
+    values[i] = original - step;
+    const float down = values[i];
+    const double low = functional(cloud, camera, adjoint);
+    values[i] = original;
+    out[i] = (high - low) / static_cast<double>(up - down);
+  }
+  return out;
+}
+
+} // namespace
+
+TEST_CASE("Analytic gradients match finite differences on the CPU", "[train][reference]") {
+  const Camera camera = test_camera(40, 32);
+  std::mt19937 rng(9);
+  std::normal_distribution<double> n(0.0, 1.0);
+  std::vector<glm::dvec3> adjoint(static_cast<std::size_t>(camera.width) * camera.height);
+  for (auto &a : adjoint) a = glm::dvec3(n(rng), n(rng), n(rng));
+
+  // Degree 0 for position: its colour has no view dependence, which the
+  // gradient leaves out on purpose.
+  const GaussianCloud cloud = random_cloud(12, 0, 3);
+  ReferenceOptions smooth;
+  smooth.noCutoffs = true;
+  const ParameterGradients g = reference_gradients(cloud, camera, adjoint, smooth);
+  check_close(g.positions, finite_differences(cloud, &GaussianCloud::positions, camera, adjoint, 2e-3f), "positions", 0.999, 0.01);
+  check_close(g.scales, finite_differences(cloud, &GaussianCloud::scales, camera, adjoint, 2e-3f), "scales", 0.999, 0.01);
+  check_close(g.rotations, finite_differences(cloud, &GaussianCloud::rotations, camera, adjoint, 2e-3f), "rotations", 0.999, 0.01);
+  check_close(g.opacities, finite_differences(cloud, &GaussianCloud::opacities, camera, adjoint, 2e-3f), "opacities", 0.999, 0.01);
+
+  const GaussianCloud degree2 = random_cloud(12, 2, 4);
+  const ParameterGradients g2 = reference_gradients(degree2, camera, adjoint, smooth);
+  check_close(g2.sh, finite_differences(degree2, &GaussianCloud::sh, camera, adjoint, 2e-3f), "sh degree 2", 0.999, 0.01);
+}
+
+TEST_CASE("The loss derivative matches finite differences", "[train][reference]") {
+  ReferenceImage image;
+  image.width = 18;
+  image.height = 14;
+  std::mt19937 rng(21);
+  std::uniform_real_distribution<double> u(0.1, 0.9);
+  image.rgb.resize(static_cast<std::size_t>(image.width) * image.height);
+  for (auto &p : image.rgb) p = glm::dvec3(u(rng), u(rng), u(rng));
+  const auto target = noise_target(image.width, image.height, 5);
+
+  for (const double lambda : {1.0, 0.2}) {
+    const ReferenceLoss base = reference_loss(image, target, lambda);
+    std::vector<double> analytic, numeric;
+    for (std::size_t i = 0; i < image.rgb.size(); i += 7) {
+      for (int c = 0; c < 3; ++c) {
+        ReferenceImage changed = image;
+        constexpr double kStep = 1e-5;
+        changed.rgb[i][c] += kStep;
+        const double high = reference_loss(changed, target, lambda).loss;
+        changed.rgb[i][c] -= 2.0 * kStep;
+        const double low = reference_loss(changed, target, lambda).loss;
+        numeric.push_back((high - low) / (2.0 * kStep));
+        analytic.push_back(base.adjoint[i][c]);
+      }
+    }
+    check_close(analytic, numeric, lambda == 1.0 ? "pure SSIM" : "L1 + SSIM", 0.9999, 0.001);
+  }
+}
+
+TEST_CASE("GPU forward matches the CPU reference and the graphics renderer", "[train][vulkan]") {
+  vk::Context *ctx = test::context();
+  if (ctx == nullptr) SKIP("No usable Vulkan device");
+  const Camera camera = test_camera(100, 75);
+  const GaussianCloud cloud = random_cloud(300, 1, 7);
+
+  Trainer trainer(*ctx, cloud);
+  const std::vector<float> gpu = trainer.render(camera);
+  const ReferenceImage cpu = reference_render(cloud, camera, {});
+  double worst = 0.0, worstLog = 0.0;
+  for (std::size_t i = 0; i < cpu.rgb.size(); ++i) {
+    for (int c = 0; c < 3; ++c) worst = std::max(worst, std::abs(gpu[i * 4 + static_cast<std::size_t>(c)] - cpu.rgb[i][c]));
+    worstLog = std::max(worstLog, std::abs(gpu[i * 4 + 3] - cpu.logTransmittance[i]));
+  }
+  std::println("  forward: worst difference from CPU {:.6f}, log transmittance {:.6f}", worst, worstLog);
+  CHECK(worst < 1e-3);
+  CHECK(worstLog < 1e-2);
+
+  // Fixed-function blending gets to the same picture, up to 8-bit rounding.
+  SplatRenderer renderer(*ctx, VK_FORMAT_R8G8B8A8_UNORM);
+  renderer.set_scene(cloud);
+  const RenderedImage graphics = render_offscreen(*ctx, renderer, camera);
+  // The graphics path rounds to 8 bits after every blend, so errors can build up
+  // with depth complexity: compare on average, with a limit on any single pixel.
+  double sum = 0.0, peak = 0.0;
+  for (std::size_t i = 0; i < cpu.rgb.size(); ++i) {
+    for (std::size_t c = 0; c < 3; ++c) {
+      const double d = std::abs(static_cast<double>(gpu[i * 4 + c]) * 255.0 - graphics.rgba[i * 4 + c]);
+      sum += d;
+      peak = std::max(peak, d);
+    }
+  }
+  const double mean = sum / (3.0 * static_cast<double>(cpu.rgb.size()));
+  std::println("  forward vs graphics: mean {:.3f}, worst {:.2f} of 255", mean, peak);
+  CHECK(mean < 1.0);
+  CHECK(peak < 8.0);
+}
+
+TEST_CASE("GPU loss and gradients match the CPU reference", "[train][vulkan]") {
+  vk::Context *ctx = test::context();
+  if (ctx == nullptr) SKIP("No usable Vulkan device");
+  const Camera camera = test_camera(72, 56);
+  const auto target = noise_target(camera.width, camera.height, 11);
+  const GaussianCloud cloud = random_cloud(60, 1, 13);
+
+  const ReferenceImage image = reference_render(cloud, camera, {});
+  const ReferenceLoss cpuLoss = reference_loss(image, target, 0.2);
+  const ParameterGradients cpu = reference_gradients(cloud, camera, cpuLoss.adjoint, {});
+
+  for (const bool fixedPoint : {false, true}) {
+    TrainerOptions options;
+    options.forceFixedPoint = fixedPoint;
+    if (!fixedPoint && !ctx->info().floatAtomicAdd) continue;
+    Trainer trainer(*ctx, cloud, options);
+    CHECK(trainer.uses_fixed_point() == fixedPoint);
+    const StepStats stats = trainer.compute_gradients(camera, target);
+    INFO("fixed point: " << fixedPoint);
+    CHECK_THAT(stats.loss, WithinAbs(cpuLoss.loss, 1e-3));
+    CHECK_THAT(stats.l1, WithinAbs(cpuLoss.l1, 1e-3));
+    CHECK_THAT(stats.ssim, WithinAbs(cpuLoss.ssim, 1e-3));
+
+    const auto gpu = trainer.gradients();
+    std::println("  {} atomics:", fixedPoint ? "fixed-point" : "float");
+    const double cosine = fixedPoint ? 0.97 : 0.999, ratio = fixedPoint ? 0.1 : 0.02;
+    check_close(to_double(gpu.positions), cpu.positions, "positions", cosine, ratio);
+    check_close(to_double(gpu.scales), cpu.scales, "scales", cosine, ratio);
+    check_close(to_double(gpu.rotations), cpu.rotations, "rotations", cosine, ratio);
+    check_close(to_double(gpu.opacities), cpu.opacities, "opacities", cosine, ratio);
+    check_close(to_double(gpu.sh), cpu.sh, "sh", cosine, ratio);
+  }
+}
+
+TEST_CASE("Adam matches a hand-computed step", "[train][vulkan]") {
+  vk::Context *ctx = test::context();
+  if (ctx == nullptr) SKIP("No usable Vulkan device");
+  const Camera camera = test_camera(40, 32);
+  const auto target = noise_target(camera.width, camera.height, 2);
+  const GaussianCloud cloud = random_cloud(8, 1, 5);
+
+  Trainer trainer(*ctx, cloud);
+  trainer.compute_gradients(camera, target);
+  const auto g = trainer.gradients();
+  LearningRates rates;
+  rates.sh = 0.02f;
+  rates.shRestScale = 0.05f;
+  trainer.apply_gradients(rates);
+  const GaussianCloud after = trainer.cloud();
+
+  // In the first step m / (1 - beta1) = g and sqrt(v / (1 - beta2)) = |g|, so
+  // every parameter moves by exactly its rate, against the gradient's sign.
+  for (std::size_t i = 0; i < cloud.sh.size(); ++i) {
+    if (g.sh[i] == 0.f) continue;
+    const float rate = i % 12 < 3 ? rates.sh : rates.sh * rates.shRestScale;
+    CHECK_THAT(after.sh[i], WithinAbs(cloud.sh[i] - (g.sh[i] > 0.f ? rate : -rate), 2e-5));
+  }
+  for (std::size_t i = 0; i < cloud.opacities.size(); ++i) {
+    if (g.opacities[i] == 0.f) continue;
+    CHECK_THAT(after.opacities[i], WithinAbs(cloud.opacities[i] - (g.opacities[i] > 0.f ? rates.opacity : -rates.opacity), 2e-5));
+  }
+}
+
+TEST_CASE("Training overfits a single rendered view", "[train][vulkan]") {
+  vk::Context *ctx = test::context();
+  if (ctx == nullptr) SKIP("No usable Vulkan device");
+
+  const auto views = make_test_views(1, 128, 96, 100.0);
+  Camera camera = test_camera(128, 96);
+  camera.fx = camera.fy = 100.f;
+  glm::dmat4 view(views[0].pose.R(0, 0));
+  for (int r = 0; r < 3; ++r) {
+    for (int c = 0; c < 3; ++c) view[c][r] = views[0].pose.R(r, c);
+    view[3][r] = views[0].pose.t(r);
+    view[r][3] = 0.0;
+  }
+  view[3][3] = 1.0;
+  camera.view = glm::mat4(view);
+  const Eigen::Vector3d center = views[0].pose.center();
+  camera.position = glm::vec3(center.x(), center.y(), center.z());
+
+  std::vector<std::uint8_t> target(static_cast<std::size_t>(128) * 96 * 4, 255);
+  for (std::size_t i = 0; i < 128u * 96u; ++i) std::copy_n(views[0].image.pixels.data() + i * 3, 3, target.data() + i * 4);
+
+  // A grid of grey Gaussians in front of the camera.
+  GaussianCloud cloud;
+  constexpr std::size_t kSide = 40;
+  cloud.resize(kSide * kSide, 0);
+  const glm::mat3 toWorld = glm::transpose(glm::mat3(camera.view));
+  for (std::size_t i = 0; i < cloud.size(); ++i) {
+    const float x = (static_cast<float>(i % kSide) + 0.5f - kSide * 0.5f) / kSide * 2.6f;
+    const float y = (static_cast<float>(i / kSide) + 0.5f - kSide * 0.5f) / kSide * 2.0f;
+    const glm::vec3 world = camera.position + toWorld * glm::vec3(x, y, 2.f);
+    for (std::size_t a = 0; a < 3; ++a) {
+      cloud.positions[i * 3 + a] = world[static_cast<int>(a)];
+      cloud.scales[i * 3 + a] = std::log(0.05f);
+    }
+    cloud.rotations[i * 4] = 1.f;
+    cloud.opacities[i] = 0.f;
+  }
+
+  Trainer trainer(*ctx, cloud);
+  LearningRates rates;
+  rates.position = 1e-3f;
+  float first = 0.f, last = 0.f;
+  for (int iteration = 0; iteration < 400; ++iteration) {
+    const StepStats stats = trainer.step(camera, target, rates);
+    REQUIRE(std::isfinite(stats.loss));
+    if (iteration == 0) first = stats.loss;
+    last = stats.loss;
+  }
+  std::println("  overfitting one view: loss {:.4f} -> {:.4f}", first, last);
+  CHECK(last < first * 0.5f);
+  const GaussianCloud trained = trainer.cloud();
+  CHECK(trained.size() == cloud.size());
+  CHECK(trained.positions != cloud.positions);
+  CHECK(trained.sh != cloud.sh);
+}

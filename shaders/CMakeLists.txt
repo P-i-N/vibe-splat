@@ -8,4 +8,16 @@ splat_add_shader_library(splat_shaders
     preprocess.comp
     splat.vert
     splat.frag
+    train_preprocess.comp
+    train_bin_count.comp
+    train_bin_emit.comp
+    train_tile_ranges.comp
+    train_forward.comp
+    train_ssim.comp
+    train_loss.comp
+    train_backward_float.comp
+    train_backward_fixed.comp
+    train_fixed_to_float.comp
+    train_gradient.comp
+    train_adam.comp
 )

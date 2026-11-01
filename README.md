@@ -10,7 +10,7 @@ from EXIF or given by hand. Output is a standard 3D Gaussian splatting `.ply`.
 
 ## Status
 
-Milestones M1 (viewer), M2 (ingest) and M3 (camera poses) are done:
+Milestones M1 (viewer), M2 (ingest), M3 (camera poses) and M4 (trainer core) are done:
 
 - `splat view scene.ply` opens a window and renders a 3DGS `.ply` in real time.
   Controls: left-drag orbits, right- or middle-drag pans, the wheel zooms,
@@ -26,7 +26,8 @@ Milestones M1 (viewer), M2 (ingest) and M3 (camera poses) are done:
 - `splat sfm project/` estimates camera poses and a sparse point cloud (see
   below).
 - `splat make-test-views dir/` renders images with known poses to try it on.
-- `train` is a placeholder for a later milestone.
+- `splat train project/` trains Gaussians from those poses and writes
+  `project/splat.ply` (see below). Gaussians do not split or multiply yet.
 
 Any `.ply` in the standard 3DGS layout should work, with SH degree 0 to 3.
 That is the layout written by the original implementation and most trainers.
@@ -97,6 +98,31 @@ splat ingest views/ -o project/ --focal-px 500
 splat sfm project/
 splat view project/sparse/0/preview.ply
 ```
+
+## How training works
+
+`splat train` is a differentiable renderer in Vulkan compute shaders. Nothing
+does automatic differentiation: each pass has a hand-derived counterpart.
+
+- **Forward.** Parameters become screen-space splats, which are sorted by depth.
+  Each splat then adds one entry per 16x16 pixel tile it covers, and a stable
+  sort by tile leaves every tile with its own depth-sorted list. Tiles do not
+  share pixels, so they composite in parallel with no blending hardware.
+- **Loss.** 0.8 L1 + 0.2 D-SSIM, and its derivative at every pixel.
+- **Backward.** At a pixel `C = F + T (alpha c + (1 - alpha) B)`, with `B` what
+  lies behind a splat and `T` the transmittance in front of it. So
+  `dC/dalpha = T (c - B)` and `dC/dc = T alpha`. These add up per splat in
+  screen space, using float atomics, or fixed-point integer atomics on GPUs
+  without them. A last pass applies the chain rule down to position, scale,
+  rotation, opacity and SH.
+- **Optimiser.** Adam, with the learning rates of the 3DGS paper.
+
+Images are undistorted when loaded, since the renderer is a pinhole camera.
+`src/train/reference.cpp` has every kernel again on the CPU: the tests check it
+against finite differences, and the GPU against it.
+
+`--holdout 8` keeps every 8th view out of training and reports PSNR on those,
+which says more about quality than PSNR on images it has seen.
 
 ## How rendering works
 
