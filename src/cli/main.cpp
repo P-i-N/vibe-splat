@@ -7,6 +7,7 @@
 #include "core/selftest.hpp"
 #include "core/vk_check.hpp"
 #include "core/vk_context.hpp"
+#include "ingest/ingest.hpp"
 #include "render/offscreen.hpp"
 #include "render/splat_renderer.hpp"
 #include "splat/gaussian_cloud.hpp"
@@ -38,7 +39,7 @@ Commands:
   make-test-scene <out.ply>     Write a synthetic scene for trying things out
   info                          List Vulkan devices and whether splat can use them
   selftest                      Run a compute kernel on the GPU and check the result
-  ingest                        Import photos or a video        (milestone M2)
+  ingest <inputs...> -o <dir>   Import photos and videos into a project folder
   sfm                           Estimate camera poses           (milestone M3)
   train                         Train Gaussian splats           (milestone M4)
 
@@ -54,6 +55,24 @@ render options:
 
 make-test-scene options:
   --count <n>             Number of Gaussians (default 200000)
+
+ingest options (inputs are image files, video files or folders of them):
+  -o, --out <dir>         Project folder (required); gets images/ and ingest.json
+  --max-size <px>         Longest side of stored images, 0 keeps it (default 1600)
+  --png                   Store PNG instead of JPEG
+  --jpeg-quality <1-100>  Default 95
+  --fps <n>               Video frames kept per second, 0 keeps all (default 2)
+  --max-frames <n>        Frames kept per video, lowering --fps to fit
+  --threads <n>           Photo threads, 0 uses all cores (default 0)
+  --force                 Replace a previous ingest in this project
+Camera information, overriding EXIF for every input (video has no EXIF, so give
+it here for a better start; sizes are for the input after rotation):
+  --focal-35mm <mm>       35 mm equivalent focal length
+  --focal-px <px>         Focal length in pixels
+  --focal-mm <mm>         Real focal length, needs --sensor-width-mm
+  --sensor-width-mm <mm>  Sensor size along the image's longer side
+  --fov <deg>             Horizontal field of view
+  --cx <px>, --cy <px>    Principal point (default: image centre)
 
 view options:
   --up <axis>             As for render
@@ -196,6 +215,60 @@ int cmd_view([[maybe_unused]] const GlobalOptions &opts) {
 #endif
 }
 
+int cmd_ingest(const GlobalOptions &opts) {
+  std::vector<std::string_view> rest = opts.rest;
+  for (auto &a : rest) {
+    if (a == "-o") a = "--out";
+  }
+  const splat::cli::Args args(rest, {"--png", "--force"});
+  args.allow_only({"out", "max-size", "png", "jpeg-quality", "fps", "max-frames", "threads", "force", "focal-35mm",
+                   "focal-px", "focal-mm", "sensor-width-mm", "fov", "cx", "cy"});
+  if (args.positionals().empty() || !args.has("out")) {
+    std::println(stderr, "Usage: splat ingest <images, videos or folders...> -o <project folder> [options]  (see splat --help)");
+    return 2;
+  }
+
+  const auto optional_number = [&](const std::string &name) -> std::optional<double> {
+    if (!args.has(name)) return std::nullopt;
+    const double value = args.number(name, 0.0);
+    if (!(value > 0.0)) throw std::runtime_error(std::format("--{} must be positive", name));
+    return value;
+  };
+
+  splat::IngestOptions options;
+  options.inputs.assign(args.positionals().begin(), args.positionals().end());
+  options.project = args.get("out", "");
+  options.maxSize = std::max(args.number("max-size", options.maxSize), 0);
+  options.jpegQuality = std::clamp(args.number("jpeg-quality", options.jpegQuality), 1, 100);
+  options.png = args.has("png");
+  options.force = args.has("force");
+  options.threads = std::max(args.number("threads", 0), 0);
+  options.video.fps = std::max(args.number("fps", options.video.fps), 0.0);
+  options.video.maxFrames = std::max(args.number("max-frames", 0), 0);
+  options.manual.focal35mm = optional_number("focal-35mm");
+  options.manual.focalPx = optional_number("focal-px");
+  options.manual.focalMm = optional_number("focal-mm");
+  options.manual.sensorWidthMm = optional_number("sensor-width-mm");
+  options.manual.fovDeg = optional_number("fov");
+  if (options.manual.fovDeg && *options.manual.fovDeg >= 180.0) throw std::runtime_error("--fov must be below 180");
+  options.manual.cx = optional_number("cx");
+  options.manual.cy = optional_number("cy");
+
+  const auto start = std::chrono::steady_clock::now();
+  const auto report = splat::run_ingest(options);
+  const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  std::println("Ingested {} photos and {} video frames ({} cameras, {} skipped) in {:.1f} s -> {}", report.images,
+               report.videoFrames, report.cameras, report.failed, seconds, options.project.string());
+
+  const auto manifest = splat::load_manifest(options.project / "ingest.json");
+  for (const auto &camera : manifest.cameras) {
+    std::println("  camera {}: {}x{}, focal {:.1f} px ({}){}{}", camera.id, camera.width, camera.height, camera.fx,
+                 splat::to_string(camera.focalSource), camera.make.empty() ? "" : ", ",
+                 camera.make.empty() ? "" : camera.make + " " + camera.model);
+  }
+  return 0;
+}
+
 int cmd_not_yet(std::string_view command, std::string_view milestone) {
   std::println(stderr, "'splat {}' is not implemented yet (planned for milestone {}).", command, milestone);
   return 2;
@@ -242,7 +315,7 @@ int main(int argc, char **argv) {
   try {
     if (opts.command == "info") return cmd_info();
     if (opts.command == "selftest") return cmd_selftest(opts);
-    if (opts.command == "ingest") return cmd_not_yet(opts.command, "M2");
+    if (opts.command == "ingest") return cmd_ingest(opts);
     if (opts.command == "sfm") return cmd_not_yet(opts.command, "M3");
     if (opts.command == "train") return cmd_not_yet(opts.command, "M4");
     if (opts.command == "view") return cmd_view(opts);

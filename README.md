@@ -10,7 +10,7 @@ from EXIF or given by hand. Output is a standard 3D Gaussian splatting `.ply`.
 
 ## Status
 
-Milestone M1 (viewer) is done:
+Milestones M1 (viewer) and M2 (ingest) are done:
 
 - `splat view scene.ply` opens a window and renders a 3DGS `.ply` in real time.
   Controls: left-drag orbits, right- or middle-drag pans, the wheel zooms,
@@ -21,7 +21,9 @@ Milestone M1 (viewer) is done:
 - `splat make-test-scene out.ply` writes a synthetic scene, so you can try
   everything without a trained splat.
 - `splat info` lists Vulkan devices; `splat selftest` checks the GPU works.
-- `ingest`, `sfm` and `train` are placeholders for later milestones.
+- `splat ingest photos/ clip.mp4 -o project/` imports photos and videos into a
+  project folder (see below).
+- `sfm` and `train` are placeholders for later milestones.
 
 Any `.ply` in the standard 3DGS layout should work, with SH degree 0 to 3.
 That is the layout written by the original implementation and most trainers.
@@ -35,6 +37,27 @@ That is the layout written by the original implementation and most trainers.
 | M4 Trainer core | Vulkan forward, loss, backward, Adam |
 | M5 Full training | Densification, SH degree 3, 8 GB VRAM budget |
 | M6 Polish | GUI, live preview, gamepad, AppImage and Windows zip |
+
+## How ingest works
+
+`splat ingest` writes `images/` and `ingest.json` into the project folder, for
+the later stages to read. Rerun it with `--force` to replace them.
+
+- **Photos** can be JPEG, PNG, BMP or TGA. HEIC and raw files need converting
+  first. EXIF orientation is applied, so stored images are always upright.
+- **Videos** (needs a build with FFmpeg) keep the sharpest frame of each interval
+  of 1/`--fps` seconds, since motion blur ruins training images. Rotation
+  metadata is applied.
+- **Size**: the longest side is reduced to `--max-size` (default 1600).
+- **Cameras**: images with the same size and focal length share a camera in
+  `ingest.json`. The focal length comes from the first of these available,
+  and `focal_source` records which:
+  1. `manual`: `--focal-35mm`, `--focal-px`, `--focal-mm` with
+     `--sensor-width-mm`, or `--fov`
+  2. `exif-35mm`: EXIF FocalLengthIn35mmFilm
+  3. `exif-focal-plane`: EXIF FocalLength and FocalPlaneResolution
+  4. `default`: a guess of 1.2 x the longest side, for camera-pose estimation
+     to refine. Video always lands here unless given by hand.
 
 ## How rendering works
 
@@ -72,7 +95,9 @@ appears upside down, pass `--up +y` (or `+z`/`-z`).
 ## Building
 
 Requirements: CMake 3.28+, Ninja, git, and a C++23 compiler (GCC 14+,
-Clang 18+ or Visual Studio 2022 17.10+). Everything else, including the
+Clang 18+ or Visual Studio 2022 17.10+). Video input uses the system's FFmpeg
+6.1 or newer, found through pkg-config (Ubuntu: `libavformat-dev libavcodec-dev
+libswscale-dev`); without it, `splat ingest` handles photos only. Everything else, including the
 shader compiler, is fetched and built by vcpkg, which is a git submodule.
 
 ```
@@ -88,9 +113,9 @@ builds reuse vcpkg's binary cache.
 
 On Linux you can skip vcpkg for a quick local build if your distribution has
 the packages (Ubuntu 24.04: `libvulkan-dev libvulkan-volk-dev
-libvulkan-memory-allocator-dev glslang-tools catch2 libglm-dev libstb-dev`).
-Without SDL3 the window viewer is left out, but everything else, including
-`splat render`, still builds:
+libvulkan-memory-allocator-dev glslang-tools catch2 libglm-dev libstb-dev
+nlohmann-json3-dev`). Without SDL3 the window viewer is left out, and without
+FFmpeg's development packages video input is, but everything else still builds:
 
 ```
 cmake -G Ninja -B build/sys -DCMAKE_BUILD_TYPE=Debug
