@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    env:
+      CC: gcc-14
+      CXX: g++-14
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-cache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install build tools and Mesa lavapipe (software Vulkan for tests)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++-14 mesa-vulkan-drivers vulkan-validationlayers
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-linux-${{ hashFiles('vcpkg.json', '.gitmodules') }}-${{ github.sha }}
+          restore-keys: vcpkg-linux-${{ hashFiles('vcpkg.json', '.gitmodules') }}-
+
+      - run: mkdir -p .vcpkg-cache
+      - run: cmake --preset linux-release
+      - run: cmake --build --preset linux-release
+      - run: ctest --preset linux-release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: splat-linux-x64
+          path: build/linux-release/src/splat
+
+  windows:
+    runs-on: windows-2022
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\.vcpkg-cache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-windows-${{ hashFiles('vcpkg.json', '.gitmodules') }}-${{ github.sha }}
+          restore-keys: vcpkg-windows-${{ hashFiles('vcpkg.json', '.gitmodules') }}-
+
+      - run: New-Item -ItemType Directory -Force .vcpkg-cache
+      - run: cmake --preset windows-release
+      - run: cmake --build --preset windows-release
+      # Hosted Windows runners have no Vulkan driver: GPU tests skip themselves,
+      # and the CLI selftest is excluded.
+      - run: ctest --preset windows-release -E cli_selftest
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: splat-windows-x64
+          path: build/windows-release/src/splat.exe
