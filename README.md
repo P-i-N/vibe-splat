@@ -10,7 +10,7 @@ from EXIF or given by hand. Output is a standard 3D Gaussian splatting `.ply`.
 
 ## Status
 
-Milestones M1 (viewer) and M2 (ingest) are done:
+Milestones M1 (viewer), M2 (ingest) and M3 (camera poses) are done:
 
 - `splat view scene.ply` opens a window and renders a 3DGS `.ply` in real time.
   Controls: left-drag orbits, right- or middle-drag pans, the wheel zooms,
@@ -23,7 +23,10 @@ Milestones M1 (viewer) and M2 (ingest) are done:
 - `splat info` lists Vulkan devices; `splat selftest` checks the GPU works.
 - `splat ingest photos/ clip.mp4 -o project/` imports photos and videos into a
   project folder (see below).
-- `sfm` and `train` are placeholders for later milestones.
+- `splat sfm project/` estimates camera poses and a sparse point cloud (see
+  below).
+- `splat make-test-views dir/` renders images with known poses to try it on.
+- `train` is a placeholder for a later milestone.
 
 Any `.ply` in the standard 3DGS layout should work, with SH degree 0 to 3.
 That is the layout written by the original implementation and most trainers.
@@ -33,7 +36,7 @@ That is the layout written by the original implementation and most trainers.
 | M0 Foundation | CMake + vcpkg, Vulkan core, CI on Linux and Windows |
 | M1 Viewer | Load `.ply` splats, GPU sort, render, window and controls |
 | M2 Ingest | Photos, video frames, EXIF and manual intrinsics |
-| M3 Camera poses | COLMAP (CPU only) linked in, sparse model import |
+| M3 Camera poses | Our own structure from motion (CPU), COLMAP model import |
 | M4 Trainer core | Vulkan forward, loss, backward, Adam |
 | M5 Full training | Densification, SH degree 3, 8 GB VRAM budget |
 | M6 Polish | GUI, live preview, gamepad, AppImage and Windows zip |
@@ -58,6 +61,42 @@ the later stages to read. Rerun it with `--force` to replace them.
   3. `exif-focal-plane`: EXIF FocalLength and FocalPlaneResolution
   4. `default`: a guess of 1.2 x the longest side, for camera-pose estimation
      to refine. Video always lands here unless given by hand.
+
+## How pose estimation works
+
+`splat sfm` is a small incremental structure-from-motion pipeline written from
+scratch, needing only Eigen. It runs on the CPU:
+
+1. **Features.** SIFT: extrema of a difference-of-Gaussians pyramid, described
+   by gradient histograms (RootSIFT).
+2. **Matching.** Brute-force mutual nearest neighbours with Lowe's ratio test.
+   Every pair for up to 150 photos; for videos and larger sets, neighbours in
+   input order plus a few at growing distances (`--matcher` overrides this).
+3. **Verification.** RANSAC around the five-point essential matrix solver,
+   using ingest's intrinsics. Pairs that do not fit a rigid camera motion go.
+4. **Tracks.** Matches are chained into tracks that follow one 3D point.
+5. **Start.** The best-matched pair with a wide enough baseline is triangulated.
+6. **Growth.** The image seeing the most known points is registered with P3P
+   RANSAC, what it newly sees is triangulated, and the model is bundle adjusted
+   as it grows. Bundle adjustment is Levenberg-Marquardt with a Huber loss and
+   the points eliminated through the Schur complement.
+7. **Finish.** A final bundle adjustment refines focal length and radial
+   distortion (a focal length given by hand stays fixed), and points missing by
+   more than 1.5 pixels are dropped.
+
+The result goes to `project/sparse/0` in COLMAP's binary format, with a
+`SIMPLE_RADIAL` camera, so other tools can read it. `preview.ply` next to it
+shows the points in `splat view`. `splat sfm project/ --import dir/` takes an
+existing COLMAP model instead.
+
+Try it with images whose true poses are known to the tests:
+
+```
+splat make-test-views views/
+splat ingest views/ -o project/ --focal-px 500
+splat sfm project/
+splat view project/sparse/0/preview.ply
+```
 
 ## How rendering works
 
@@ -114,7 +153,7 @@ builds reuse vcpkg's binary cache.
 On Linux you can skip vcpkg for a quick local build if your distribution has
 the packages (Ubuntu 24.04: `libvulkan-dev libvulkan-volk-dev
 libvulkan-memory-allocator-dev glslang-tools catch2 libglm-dev libstb-dev
-nlohmann-json3-dev`). Without SDL3 the window viewer is left out, and without
+nlohmann-json3-dev libeigen3-dev`). Without SDL3 the window viewer is left out, and without
 FFmpeg's development packages video input is, but everything else still builds:
 
 ```

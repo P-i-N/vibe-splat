@@ -15,11 +15,18 @@ add_library(splat_core STATIC
   ingest/image.cpp
   ingest/ingest.cpp
   ingest/video.cpp
+  sfm/colmap_model.cpp
+  sfm/sfm.cpp
+  sfm/features.cpp
+  sfm/geometry.cpp
+  sfm/bundle.cpp
+  sfm/reconstruct.cpp
+  sfm/test_views.cpp
 )
 target_include_directories(splat_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_include_directories(splat_core PRIVATE "${STB_INCLUDE_DIR}")
 target_link_libraries(splat_core
-  PUBLIC volk::volk Vulkan::Headers GPUOpen::VulkanMemoryAllocator glm::glm
+  PUBLIC volk::volk Vulkan::Headers GPUOpen::VulkanMemoryAllocator glm::glm Eigen3::Eigen
   PRIVATE splat_shaders nlohmann_json::nlohmann_json)
 target_compile_definitions(splat_core PUBLIC VK_NO_PROTOTYPES)
 if(FFMPEG_FOUND)
