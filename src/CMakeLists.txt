@@ -11,13 +11,24 @@ add_library(splat_core STATIC
   render/camera.cpp
   render/splat_renderer.cpp
   render/offscreen.cpp
+  ingest/exif.cpp
+  ingest/image.cpp
+  ingest/ingest.cpp
+  ingest/video.cpp
 )
 target_include_directories(splat_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_include_directories(splat_core PRIVATE "${STB_INCLUDE_DIR}")
 target_link_libraries(splat_core
   PUBLIC volk::volk Vulkan::Headers GPUOpen::VulkanMemoryAllocator glm::glm
-  PRIVATE splat_shaders)
+  PRIVATE splat_shaders nlohmann_json::nlohmann_json)
 target_compile_definitions(splat_core PUBLIC VK_NO_PROTOTYPES)
+if(FFMPEG_FOUND)
+  target_link_libraries(splat_core PUBLIC PkgConfig::FFMPEG)
+  target_compile_definitions(splat_core PUBLIC SPLAT_WITH_VIDEO)
+  message(STATUS "Video input: enabled (FFmpeg libavformat ${FFMPEG_libavformat_VERSION})")
+else()
+  message(STATUS "Video input: disabled (FFmpeg not found)")
+endif()
 splat_target_defaults(splat_core)
 
 add_executable(splat cli/main.cpp)
