@@ -22,6 +22,9 @@ add_library(splat_core STATIC
   sfm/bundle.cpp
   sfm/reconstruct.cpp
   sfm/test_views.cpp
+  train/reference.cpp
+  train/trainer.cpp
+  train/train.cpp
 )
 target_include_directories(splat_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_include_directories(splat_core PRIVATE "${STB_INCLUDE_DIR}")

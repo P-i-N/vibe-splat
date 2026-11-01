@@ -1,0 +1,23 @@
+#version 460
+// Forward pass, step 4: finds where each tile's run starts and ends in the
+// sorted entries. Each write belongs to exactly one invocation.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer EntryKeys { uint entryKeys[]; };
+layout(std430, binding = 1) buffer Ranges { uvec2 ranges[]; };
+
+layout(push_constant) uniform Push { uint count; } pc;
+
+void main() {
+  const uint k = gl_GlobalInvocationID.x;
+  if (k >= pc.count) {
+    return;
+  }
+  const uint tile = entryKeys[k];
+  if (k == 0u || entryKeys[k - 1u] != tile) {
+    ranges[tile].x = k;
+  }
+  if (k + 1u == pc.count || entryKeys[k + 1u] != tile) {
+    ranges[tile].y = k + 1u;
+  }
+}

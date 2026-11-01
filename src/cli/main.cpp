@@ -13,6 +13,7 @@
 #include "sfm/sfm.hpp"
 #include "sfm/test_views.hpp"
 #include "splat/gaussian_cloud.hpp"
+#include "train/train.hpp"
 #ifdef SPLAT_WITH_VIEWER
 #include "viewer/viewer.hpp"
 #endif
@@ -44,7 +45,7 @@ Commands:
   ingest <inputs...> -o <dir>   Import photos and videos into a project folder
   sfm <project>                 Estimate camera poses from an ingested project
   make-test-views <dir>         Render images with known poses, for trying sfm
-  train                         Train Gaussian splats           (milestone M4)
+  train <project>               Train Gaussians from a project with camera poses
 
 render options:
   -o, --out <file.png>    Output image (required)
@@ -83,6 +84,17 @@ sfm options (writes project/sparse/0 in COLMAP's format, plus preview.ply):
   --max-features <n>      Per image (default 4000)
   --threads <n>           0 uses all cores (default 0)
   --import <dir>          Instead of estimating, import a COLMAP sparse model
+
+train options (writes project/splat.ply and project/preview_*.png):
+  -o, --out <file.ply>    Output file
+  --iterations <n>        Default 7000
+  --lambda-ssim <x>       Weight of D-SSIM against L1 (default 0.2)
+  --sh-degree <0-3>       Default 0
+  --max-size <px>         Shrink training images to this (default: keep size)
+  --max-views <n>         Use only the first n views
+  --holdout <n>           Keep every nth view out of training, to measure quality
+  --seed <n>              Default 1
+  --report-every <n>      Default 500
 
 make-test-views options:
   --count <n>             Number of images (default 12)
@@ -322,6 +334,34 @@ int cmd_sfm(const GlobalOptions &opts) {
   return 0;
 }
 
+int cmd_train(const GlobalOptions &opts) {
+  std::vector<std::string_view> rest = opts.rest;
+  for (auto &a : rest) {
+    if (a == "-o") a = "--out";
+  }
+  const splat::cli::Args args(rest, {});
+  args.allow_only({"out", "iterations", "lambda-ssim", "sh-degree", "max-size", "max-views", "holdout", "seed", "report-every"});
+  if (args.positionals().size() != 1) {
+    std::println(stderr, "Usage: splat train <project> [options]  (see splat --help)");
+    return 2;
+  }
+  splat::TrainOptions options;
+  options.project = args.positionals()[0];
+  options.out = args.get("out", (options.project / "splat.ply").string());
+  options.iterations = std::max(args.number("iterations", options.iterations), 1);
+  options.lambdaSsim = std::clamp(args.number("lambda-ssim", options.lambdaSsim), 0.f, 1.f);
+  options.shDegree = std::clamp(args.number("sh-degree", options.shDegree), 0, 3);
+  options.maxSize = std::max(args.number("max-size", 0), 0);
+  options.maxViews = std::max(args.number("max-views", 0), 0);
+  options.holdout = std::max(args.number("holdout", 0), 0);
+  options.seed = args.number("seed", options.seed);
+  options.reportEvery = std::max(args.number("report-every", options.reportEvery), 1);
+  splat::vk::Context ctx(opts.context);
+  std::println("Device: {}", ctx.info().name);
+  splat::run_train(ctx, options);
+  return 0;
+}
+
 int cmd_make_test_views(const GlobalOptions &opts) {
   const splat::cli::Args args(opts.rest, {});
   args.allow_only({"count", "width", "height", "focal"});
@@ -338,11 +378,6 @@ int cmd_make_test_views(const GlobalOptions &opts) {
   }
   std::println("Wrote {} images to {}", views.size(), dir.string());
   return 0;
-}
-
-int cmd_not_yet(std::string_view command, std::string_view milestone) {
-  std::println(stderr, "'splat {}' is not implemented yet (planned for milestone {}).", command, milestone);
-  return 2;
 }
 
 } // namespace
@@ -389,7 +424,7 @@ int main(int argc, char **argv) {
     if (opts.command == "ingest") return cmd_ingest(opts);
     if (opts.command == "sfm") return cmd_sfm(opts);
     if (opts.command == "make-test-views") return cmd_make_test_views(opts);
-    if (opts.command == "train") return cmd_not_yet(opts.command, "M4");
+    if (opts.command == "train") return cmd_train(opts);
     if (opts.command == "view") return cmd_view(opts);
     if (opts.command == "render") return cmd_render(opts);
     if (opts.command == "make-test-scene") return cmd_make_test_scene(opts);

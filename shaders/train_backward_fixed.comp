@@ -1,0 +1,14 @@
+#version 460
+// The backward pass for GPUs without float atomics: the same sums in 32-bit
+// fixed point, converted to floats afterwards by train_fixed_to_float.comp.
+#extension GL_GOOGLE_include_directive : require
+
+layout(std430, binding = 5) buffer Gradients { int gradients[]; };
+
+layout(std430, binding = 6) readonly buffer FixedScale { float fixedScale; };
+
+void add_gradient(uint at, float value) {
+  atomicAdd(gradients[at], int(clamp(value * fixedScale, -1.0e9, 1.0e9)));
+}
+
+#include "train_backward.glsl"

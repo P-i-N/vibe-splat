@@ -1,0 +1,32 @@
+#version 460
+// Forward pass, step 2: after the depth sort, how many tile entries each splat
+// needs, in depth order. An exclusive scan of this then gives every splat a
+// slot range, so entries can be written in parallel and still be in depth order.
+#extension GL_GOOGLE_include_directive : require
+#include "train_types.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Keys { uint keys[]; };
+layout(std430, binding = 1) readonly buffer Values { uint values[]; };
+layout(std430, binding = 2) readonly buffer Splats { TrainSplat splats[]; };
+layout(std430, binding = 3) writeonly buffer Coverage { uint coverage[]; };
+layout(std430, binding = 4) buffer Counters { uint visible; uint total; } counters;
+
+layout(push_constant) uniform Push { uint count; } pc;
+
+void main() {
+  const uint r = gl_GlobalInvocationID.x;
+  if (r >= pc.count) {
+    return;
+  }
+  if (keys[r] == INVISIBLE) {
+    coverage[r] = 0u;
+    return;
+  }
+  const uvec4 t = splats[values[r]].tiles;
+  const uint n = (t.z - t.x + 1u) * (t.w - t.y + 1u);
+  coverage[r] = n;
+  atomicAdd(counters.visible, 1u);
+  atomicAdd(counters.total, n);
+}

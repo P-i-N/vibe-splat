@@ -1,0 +1,32 @@
+#version 460
+// One Adam step (Kingma and Ba 2015) over a flat array of parameters.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Parameters { float parameters[]; };
+layout(std430, binding = 1) readonly buffer Gradients { float gradients[]; };
+layout(std430, binding = 2) buffer FirstMoment { float m[]; };
+layout(std430, binding = 3) buffer SecondMoment { float v[]; };
+
+layout(push_constant) uniform Push {
+  uint count;
+  float learningRate;
+  float beta1;
+  float beta2;
+  float epsilon;
+  float correction1; // 1 - beta1^t
+  float correction2; // 1 - beta2^t
+  uint dcStride;     // SH only: floats per Gaussian, whose first 3 use the full rate
+  float restScale;   // The other coefficients' rate, relative to that
+} pc;
+
+void main() {
+  const uint i = gl_GlobalInvocationID.x;
+  if (i >= pc.count) {
+    return;
+  }
+  const float g = gradients[i];
+  m[i] = pc.beta1 * m[i] + (1.0 - pc.beta1) * g;
+  v[i] = pc.beta2 * v[i] + (1.0 - pc.beta2) * g * g;
+  const float rate = pc.dcStride > 0u && i % pc.dcStride >= 3u ? pc.learningRate * pc.restScale : pc.learningRate;
+  parameters[i] -= rate * (m[i] / pc.correction1) / (sqrt(v[i] / pc.correction2) + pc.epsilon);
+}

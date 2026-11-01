@@ -24,6 +24,9 @@ public:
   void record(VkCommandBuffer cmd, const Buffer &keys, const Buffer &values, const Buffer &tmpKeys,
               const Buffer &tmpValues, std::uint32_t count, std::uint32_t keyBits = 32);
 
+  // Records an in-place exclusive scan (prefix sum) of `data[0..count)`.
+  void record_scan(VkCommandBuffer cmd, const Buffer &data, std::uint32_t count) { record_scan(cmd, data, count, 0); }
+
   static constexpr std::uint32_t kTile = 4096;
   static constexpr std::uint32_t kScanBlock = 1024;
 

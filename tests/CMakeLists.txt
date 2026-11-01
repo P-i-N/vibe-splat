@@ -8,6 +8,7 @@ add_executable(splat_tests
   test_render.cpp
   test_ingest.cpp
   test_sfm.cpp
+  test_train.cpp
 )
 target_link_libraries(splat_tests PRIVATE splat_core Catch2::Catch2WithMain)
 splat_target_defaults(splat_tests)
@@ -35,3 +36,5 @@ add_test(NAME cli_sfm_render COMMAND splat render "${SFM_DIR}/project/sparse/0/p
 set_tests_properties(cli_sfm_ingest PROPERTIES DEPENDS cli_make_test_views)
 set_tests_properties(cli_sfm PROPERTIES DEPENDS cli_sfm_ingest)
 set_tests_properties(cli_sfm_render PROPERTIES DEPENDS cli_sfm)
+add_test(NAME cli_train COMMAND splat train "${SFM_DIR}/project" --iterations 30)
+set_tests_properties(cli_train PROPERTIES DEPENDS cli_sfm)
