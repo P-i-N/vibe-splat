@@ -83,3 +83,9 @@ external/vcpkg  Package manager (submodule)
   Clang and MSVC all ship them.
 - Dependencies must be open source with permissive or LGPL licences.
 - Every GPU kernel gets a CPU reference and a test.
+
+## Licence
+
+[0BSD](LICENSE): use it for anything, no conditions, no attribution needed.
+Third-party libraries keep their own licences; release packages include
+their notices (FFmpeg, for example, is LGPL and ships as shared libraries).

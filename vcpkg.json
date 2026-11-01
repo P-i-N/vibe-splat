@@ -1,6 +1,7 @@
 {
   "name": "vibe-splat",
   "version-string": "0.1.0",
+  "license": "0BSD",
   "description": "Gaussian splat generator and viewer built on Vulkan.",
   "builtin-baseline": "9a5dfef5d1a0438a7d24856a85bd60f309d355e9",
   "dependencies": [
