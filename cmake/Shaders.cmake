@@ -8,10 +8,22 @@
 #   namespace splat::shaders { extern const std::span<const uint32_t> <name>; }
 # where <name> is the file name with '.' replaced by '_' (e.g. selftest_comp).
 
+# glslang is a host dependency: vcpkg installs it for the host triplet, which
+# differs from the target triplet on Windows (x64-windows vs x64-windows-static).
+set(_glslang_hints "")
+if(DEFINED VCPKG_INSTALLED_DIR)
+  if(VCPKG_HOST_TRIPLET)
+    list(APPEND _glslang_hints "${VCPKG_INSTALLED_DIR}/${VCPKG_HOST_TRIPLET}/tools/glslang")
+  endif()
+  file(GLOB _glslang_tool_dirs LIST_DIRECTORIES true "${VCPKG_INSTALLED_DIR}/*/tools/glslang")
+  list(APPEND _glslang_hints ${_glslang_tool_dirs})
+endif()
+
 find_program(GLSLANG_VALIDATOR
   NAMES glslang glslangValidator
-  HINTS "${VCPKG_INSTALLED_DIR}/${VCPKG_HOST_TRIPLET}/tools/glslang"
+  HINTS ${_glslang_hints}
   REQUIRED)
+message(STATUS "Shader compiler: ${GLSLANG_VALIDATOR}")
 
 set(SPLAT_SHADER_EMBED_SCRIPT "${CMAKE_CURRENT_LIST_DIR}/EmbedSpirv.cmake")
 
