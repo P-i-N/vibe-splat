@@ -557,6 +557,11 @@ TEST_CASE("Poses are recovered from rendered images", "[sfm][pipeline]") {
     const ColmapModel model = load_colmap_model(project / "sparse" / "0");
     check_against_truth(model, views);
     CHECK(model.cameras.at(1).params[0] == kFocal);
+    REQUIRE(report.cameras.size() == 1);
+    CHECK(report.cameras[0].id == 1);
+    CHECK(report.cameras[0].focalSource == FocalSource::Manual);
+    CHECK(report.cameras[0].initialFocal == kFocal);
+    CHECK(report.cameras[0].focal == kFocal);
     fs::remove_all(project);
   }
 
@@ -573,6 +578,11 @@ TEST_CASE("Poses are recovered from rendered images", "[sfm][pipeline]") {
     const double focal = model.cameras.at(1).params[0];
     std::println("  focal length refined from {:.1f} to {:.1f}, true value {:.1f}", kFocal * 1.15, focal, kFocal);
     CHECK(std::abs(focal - kFocal) < kFocal * 0.02);
+    REQUIRE(report.cameras.size() == 1);
+    CHECK(report.cameras[0].focalSource == FocalSource::Default);
+    CHECK_THAT(report.cameras[0].initialFocal, Catch::Matchers::WithinRel(kFocal * 1.15, 1e-9));
+    CHECK(report.cameras[0].focal == focal);
+    CHECK(report.cameras[0].width == model.cameras.at(1).width);
     CHECK(load_ply(project / "sparse" / "0" / "preview.ply").size() == model.points.size());
     fs::remove_all(project);
   }

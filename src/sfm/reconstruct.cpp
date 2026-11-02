@@ -599,6 +599,17 @@ SfmReport run_sfm(const SfmOptions &options) {
   save_ply(preview_cloud(model), output / "preview.ply");
 
   SfmReport report;
+  for (std::size_t i = 0; i < manifest.cameras.size(); ++i) {
+    const IngestCamera &source = manifest.cameras[i];
+    const Lens &lens = mapper.lenses()[i];
+    report.cameras.push_back({.id = source.id,
+                              .width = source.width,
+                              .height = source.height,
+                              .focalSource = source.focalSource,
+                              .initialFocal = 0.5 * (source.fx + source.fy),
+                              .focal = lens.f,
+                              .radial = lens.k});
+  }
   report.stats = compute_stats(model);
   report.ingested = count;
   report.unregistered = count - model.images.size();

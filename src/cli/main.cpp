@@ -21,11 +21,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 
 #include <charconv>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
+#include <numbers>
 #include <optional>
 #include <print>
 #include <span>
@@ -324,10 +326,16 @@ int cmd_ingest(const GlobalOptions &opts) {
                report.videoFrames, report.cameras, report.failed, seconds, options.project.string());
 
   const auto manifest = splat::load_manifest(options.project / "ingest.json");
+  bool guessed = false;
   for (const auto &camera : manifest.cameras) {
     std::println("  camera {}: {}x{}, focal {:.1f} px ({}){}{}", camera.id, camera.width, camera.height, camera.fx,
                  splat::to_string(camera.focalSource), camera.make.empty() ? "" : ", ",
                  camera.make.empty() ? "" : camera.make + " " + camera.model);
+    guessed = guessed || camera.focalSource == splat::FocalSource::Default;
+  }
+  if (guessed) {
+    std::println("  default: no EXIF focal length in the files, so the focal is guessed as 1.2 x the longest side.");
+    std::println("  splat sfm refines it; pass --focal-35mm, --focal-px or --fov to start from the real value.");
   }
   return 0;
 }
@@ -368,6 +376,16 @@ int cmd_sfm(const GlobalOptions &opts) {
   const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
   print_stats(report.stats, report.ingested, report.unregistered);
   std::println("  {} of {} image pairs matched, {:.1f} s in total", report.pairsVerified, report.pairsTried, seconds);
+  for (const auto &camera : report.cameras) {
+    constexpr double kRadToDeg = 180.0 / std::numbers::pi;
+    const double fovDeg = 2.0 * std::atan(0.5 * camera.width / camera.focal) * kRadToDeg;
+    if (camera.focalSource == splat::FocalSource::Manual) {
+      std::println("  camera {}: focal {:.1f} px kept as given, {:.1f} degree horizontal field of view", camera.id, camera.focal, fovDeg);
+    } else {
+      std::println("  camera {}: focal refined {:.1f} -> {:.1f} px ({} start), {:.1f} degree horizontal field of view", camera.id,
+                   camera.initialFocal, camera.focal, splat::to_string(camera.focalSource), fovDeg);
+    }
+  }
   return 0;
 }
 
