@@ -134,6 +134,13 @@ does automatic differentiation: each pass has a hand-derived counterpart.
   whose screen position keeps wanting to move is cloned if small and split in
   two if large, and nearly transparent ones are removed. Opacity is capped every
   3000 iterations, so that those no longer needed fade away.
+- **Pruning.** At the end of densification and again halfway through the
+  rest, every training view is rendered once without a
+  step, adding up each Gaussian's blending weight over all their pixels. The
+  70% adding least are removed (`--prune` sets the share, 0 turns it off),
+  and the rest keep training to fill in. On the 194-photo test set at 10000
+  iterations this ends with 193k Gaussians instead of 2.2M, for 0.1 dB less
+  PSNR on held-out views, and the run takes 36% less time.
 - **View dependence.** SH starts at degree 0 and gains a degree every 1000
   iterations, up to `--sh-degree`.
 - **Memory.** A hard budget, by default 90% of the GPU's free memory

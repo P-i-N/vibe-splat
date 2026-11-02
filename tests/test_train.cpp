@@ -243,6 +243,8 @@ TEST_CASE("GPU forward and gradients match the CPU reference where pixels stop e
     const auto g = gradients.gradients();
     std::println("  {} atomics:", fixedPoint ? "fixed-point" : "float");
     const double cosine = fixedPoint ? 0.97 : 0.999, ratio = fixedPoint ? 0.1 : 0.02;
+    const DensifyStats densifyStats = gradients.densify_stats();
+    check_close(to_double(densifyStats.contribution), reference_contributions(cloud, camera, {}), "contribution", cosine, ratio);
     check_close(to_double(g.positions), cpu.positions, "positions", cosine, ratio);
     check_close(to_double(g.scales), cpu.scales, "scales", cosine, ratio);
     check_close(to_double(g.rotations), cpu.rotations, "rotations", cosine, ratio);

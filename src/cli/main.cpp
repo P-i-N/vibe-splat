@@ -116,6 +116,9 @@ train options (writes project/splat.ply and project/preview_*.png):
   --gradient-threshold <x>  Lower adds more Gaussians (default 0.0002)
   --vram-budget <GiB>     Default: 90% of the GPU's free memory
   --max-gaussians <n>     Default: what the budget allows
+  --prune <share>         Remove this share of Gaussians, those adding least, at the
+                          end of densification and again halfway to the end
+                          (default 0.7, which leaves a tenth; 0 keeps all)
 
 make-test-views options:
   --count <n>             Number of images (default 12)
@@ -436,7 +439,7 @@ int cmd_train(const GlobalOptions &opts) {
   }
   const splat::cli::Args args(rest, {"--no-densify"});
   args.allow_only({"out", "iterations", "lambda-ssim", "sh-degree", "max-size", "max-views", "holdout", "seed", "report-every", "save-every",
-                   "no-densify", "gradient-threshold", "vram-budget", "max-gaussians"});
+                   "no-densify", "gradient-threshold", "vram-budget", "max-gaussians", "prune"});
   if (args.positionals().size() != 1) {
     std::println(stderr, "Usage: splat train <project> [options]  (see splat --help)");
     return 2;
@@ -457,6 +460,7 @@ int cmd_train(const GlobalOptions &opts) {
   options.gradientThreshold = args.number("gradient-threshold", options.gradientThreshold);
   options.vramBudgetGiB = args.number("vram-budget", 0.0);
   options.maxGaussians = args.number<std::size_t>("max-gaussians", 0);
+  options.pruneShare = std::clamp(args.number("prune", options.pruneShare), 0.0, 0.95);
   splat::vk::Context ctx(opts.context);
   std::println("Device: {}", ctx.info().name);
   splat::run_train(ctx, options);

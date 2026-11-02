@@ -59,16 +59,14 @@ void sample_position(const GaussianCloud &cloud, std::size_t i, std::mt19937 &rn
   }
 }
 
-} // namespace
-
-DensifyResult remove_largest(const GaussianCloud &cloud, double share) {
+// Removes the given share of Gaussians, those with the highest keys first,
+// always keeping at least one.
+DensifyResult remove_highest(const GaussianCloud &cloud, const std::vector<float> &keys, double share) {
   const std::size_t n = cloud.size();
   const auto removed = std::min(n - 1, static_cast<std::size_t>(std::ceil(static_cast<double>(n) * share)));
-  std::vector<float> sizes(n);
-  for (std::size_t i = 0; i < n; ++i) sizes[i] = std::max({cloud.scales[i * 3], cloud.scales[i * 3 + 1], cloud.scales[i * 3 + 2]});
   std::vector<std::size_t> order(n);
   std::iota(order.begin(), order.end(), std::size_t{0});
-  std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) { return sizes[a] > sizes[b]; });
+  std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) { return keys[a] > keys[b]; });
   std::vector<char> gone(n, 0);
   for (std::size_t i = 0; i < removed; ++i) gone[order[i]] = 1;
 
@@ -81,6 +79,22 @@ DensifyResult remove_largest(const GaussianCloud &cloud, double share) {
     result.source.push_back(static_cast<std::int64_t>(i));
   }
   return result;
+}
+
+} // namespace
+
+DensifyResult remove_largest(const GaussianCloud &cloud, double share) {
+  const std::size_t n = cloud.size();
+  std::vector<float> sizes(n);
+  for (std::size_t i = 0; i < n; ++i) sizes[i] = std::max({cloud.scales[i * 3], cloud.scales[i * 3 + 1], cloud.scales[i * 3 + 2]});
+  return remove_highest(cloud, sizes, share);
+}
+
+DensifyResult remove_least_contributing(const GaussianCloud &cloud, const std::vector<float> &contribution, double share) {
+  if (contribution.size() != cloud.size()) throw std::runtime_error("prune: contributions do not match the cloud");
+  std::vector<float> keys(contribution.size());
+  for (std::size_t i = 0; i < keys.size(); ++i) keys[i] = -contribution[i];
+  return remove_highest(cloud, keys, share);
 }
 
 DensifyResult densify_cloud(const GaussianCloud &cloud, const DensifyStats &stats, const DensifyOptions &options, std::mt19937 &rng) {

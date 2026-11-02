@@ -345,6 +345,16 @@ TEST_CASE("Removing the largest keeps the rest and their state", "[densify]") {
   CHECK(remove_largest(line_of(1, 0.1f), 0.5).cloud.size() == 1); // Never down to nothing
 }
 
+TEST_CASE("Pruning by contribution removes those adding least", "[densify]") {
+  const GaussianCloud cloud = line_of(10, 0.1f);
+  std::vector<float> contribution{5.f, 0.f, 9.f, 0.5f, 7.f, 3.f, 0.1f, 8.f, 2.f, 6.f};
+  const DensifyResult r = remove_least_contributing(cloud, contribution, 0.3);
+  CHECK(r.pruned == 3);
+  CHECK(r.source == std::vector<std::int64_t>{0, 2, 4, 5, 7, 8, 9});
+  CHECK(r.cloud.size() == 7);
+  CHECK_THROWS(remove_least_contributing(cloud, std::vector<float>(3, 1.f), 0.3));
+}
+
 TEST_CASE("Densification improves a fit that is short of Gaussians", "[densify][vulkan]") {
   vk::Context *ctx = test::context();
   if (ctx == nullptr) SKIP("No usable Vulkan device");

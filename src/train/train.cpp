@@ -317,6 +317,7 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
   // The schedule of the paper for 30000 iterations, proportional when shorter.
   const int densifyFrom = std::min(500, options.iterations / 20 + 1);
   const int densifyUntil = options.iterations / 2;
+  const int pruneAgainAt = (densifyUntil + options.iterations) / 2;
   const int shInterval = std::max(1, std::min(1000, options.iterations / 10));
   trainer.set_active_sh_degree(0);
   std::mt19937 densifyRng(options.seed + 1);
@@ -337,6 +338,7 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
   bool checkpointDue = false;
   double densifySeconds = 0.0;
   int densifyRounds = 0;
+  double pruneSeconds = 0.0;
   // CGC refuses NaN and infinity, which a few Gaussians can pick up after
   // densification has stopped pruning them, so those are left out of CGC files.
   const auto save_output = [&](const fs::path &path, const CgcOptions &cgcOptions) {
@@ -380,6 +382,19 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
       entriesPerVisible = 0.98 * entriesPerVisible + 0.02 * stats.tileEntries / stats.visibleSplats;
     }
     report.peakGpuBytes = std::max(report.peakGpuBytes, trainer.gpu_bytes());
+
+    // Before densification, which may cap the opacities the ranking depends on.
+    if (options.pruneShare > 0.0 && (iteration == densifyUntil || iteration == pruneAgainAt)) {
+      const auto pruneStart = std::chrono::steady_clock::now();
+      const std::size_t before = trainer.gaussian_count();
+      trainer.reset_densify_stats();
+      for (const View &scored : trainViews) fitting([&] { return trainer.compute_gradients(scored.camera, scored.rgba); });
+      const std::size_t removed = trainer.remove_least_contributing_gaussians(options.pruneShare);
+      const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - pruneStart).count();
+      pruneSeconds += seconds;
+      bar.message(std::format("  iteration {}: removed {} of {} Gaussians, those adding least to the views ({:.1f} s)", iteration, removed,
+                              before, seconds));
+    }
 
     if (options.densify && iteration >= densifyFrom && iteration <= densifyUntil && iteration % kDensifyInterval == 0) {
       // What a Gaussian costs, with the tile entries it brings and room for them to grow.
@@ -466,6 +481,7 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
   if (densifyRounds > 0) {
     std::println("Densification: {} rounds, {:.1f} s in total ({:.0f} ms each)", densifyRounds, densifySeconds, 1000.0 * densifySeconds / densifyRounds);
   }
+  if (pruneSeconds > 0.0) std::println("Pruning: {:.1f} s in total", pruneSeconds);
   std::println("Finished in {:.1f} s ({:.1f} it/s) -> {}", seconds, report.iterationsPerSecond, options.out.string());
   return report;
 }

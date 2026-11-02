@@ -36,6 +36,10 @@ struct ReferenceImage {
 
 [[nodiscard]] ReferenceImage reference_render(const GaussianCloud &cloud, const Camera &camera, const ReferenceOptions &options);
 
+// Per Gaussian, its blending weight T alpha summed over the pixels, which the
+// backward pass adds up for pruning.
+[[nodiscard]] std::vector<double> reference_contributions(const GaussianCloud &cloud, const Camera &camera, const ReferenceOptions &options);
+
 struct ReferenceLoss {
   double loss = 0.0;
   double l1 = 0.0;   // Mean absolute difference

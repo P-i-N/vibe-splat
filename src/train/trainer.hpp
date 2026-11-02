@@ -111,6 +111,11 @@ public:
   std::size_t remove_largest_gaussians(double share);
 
   [[nodiscard]] DensifyStats densify_stats() const;
+  // Starts the statistics again, which otherwise run from the last change to the cloud.
+  void reset_densify_stats();
+  // Removes the given share of Gaussians that contributed least since the
+  // statistics started. See remove_least_contributing().
+  std::size_t remove_least_contributing_gaussians(double share);
 
   // Average GPU time per iteration in milliseconds, by stage, in order.
   [[nodiscard]] std::vector<std::pair<std::string, double>> timings() const;

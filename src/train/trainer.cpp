@@ -21,7 +21,7 @@ using vk::MemoryUsage;
 constexpr VkBufferUsageFlags kStorage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
 constexpr std::uint32_t kTileSize = 16;
 constexpr float kBeta1 = 0.9f, kBeta2 = 0.999f, kEpsilon = 1e-15f;
-constexpr std::size_t kRawGradientsPerSplat = 9;
+constexpr std::size_t kRawGradientsPerSplat = 10; // RAW_PER_SPLAT in train_types.glsl
 constexpr std::uint32_t kMaxMarks = 16;
 
 // Must match shaders/splat_types.glsl and train_types.glsl (std430).
@@ -494,10 +494,12 @@ DensifyStats Trainer::densify_stats() const {
   stats.gradientSum.resize(count_);
   stats.visits.resize(count_);
   stats.maxRadius.resize(count_);
+  stats.contribution.resize(count_);
   for (std::size_t i = 0; i < count_; ++i) {
     stats.gradientSum[i] = raw[i * 4];
     stats.visits[i] = raw[i * 4 + 1];
     stats.maxRadius[i] = raw[i * 4 + 2];
+    stats.contribution[i] = raw[i * 4 + 3];
   }
   return stats;
 }
@@ -507,6 +509,19 @@ DensifyResult Trainer::densify(DensifyOptions options, std::mt19937 &rng) {
   if (result.cloud.empty()) throw std::runtime_error("densification removed every Gaussian");
   apply_changes(result);
   return result;
+}
+
+void Trainer::reset_densify_stats() {
+  ctx_.submit_and_wait([&](VkCommandBuffer cmd) {
+    clear(cmd, *stats_);
+    vk::compute_barrier(cmd);
+  });
+}
+
+std::size_t Trainer::remove_least_contributing_gaussians(double share) {
+  const DensifyResult result = remove_least_contributing(cloud(), densify_stats().contribution, share);
+  apply_changes(result);
+  return result.pruned;
 }
 
 std::size_t Trainer::remove_largest_gaussians(double share) {

@@ -175,9 +175,8 @@ double trace_term(const dmat2 &G, const dmat3x2 &A, const dmat3 &X, const dmat3x
   return product[0][0] + product[1][1];
 }
 
-} // namespace
-
-ReferenceImage reference_render(const GaussianCloud &cloud, const Camera &camera, const ReferenceOptions &options) {
+// train_forward.comp. Adds each splat's weight in each pixel to `contributions`, if given.
+ReferenceImage composite(const GaussianCloud &cloud, const Camera &camera, const ReferenceOptions &options, std::vector<double> *contributions) {
   ReferenceImage image;
   image.width = camera.width;
   image.height = camera.height;
@@ -186,7 +185,7 @@ ReferenceImage reference_render(const GaussianCloud &cloud, const Camera &camera
   image.logTransmittance.assign(pixels, 0.0);
   image.stop.assign(pixels, 0);
   std::vector<bool> done(pixels, false);
-  // train_forward.comp: front to back, so from the end of the sorted list.
+  // Front to back, so from the end of the sorted list.
   const std::vector<Splat> splats = prepare(cloud, camera, options);
   for (std::size_t j = splats.size(); j-- > 0;) {
     const Splat &s = splats[j];
@@ -209,6 +208,7 @@ ReferenceImage reference_render(const GaussianCloud &cloud, const Camera &camera
           continue;
         }
         image.rgb[at] += std::exp(image.logTransmittance[at]) * alpha * s.color;
+        if (contributions != nullptr) (*contributions)[s.index] += std::exp(image.logTransmittance[at]) * alpha;
         image.logTransmittance[at] += logRest;
       }
     }
@@ -216,6 +216,18 @@ ReferenceImage reference_render(const GaussianCloud &cloud, const Camera &camera
   const dvec3 background(options.background[0], options.background[1], options.background[2]);
   for (std::size_t at = 0; at < pixels; ++at) image.rgb[at] += std::exp(image.logTransmittance[at]) * background;
   return image;
+}
+
+} // namespace
+
+ReferenceImage reference_render(const GaussianCloud &cloud, const Camera &camera, const ReferenceOptions &options) {
+  return composite(cloud, camera, options, nullptr);
+}
+
+std::vector<double> reference_contributions(const GaussianCloud &cloud, const Camera &camera, const ReferenceOptions &options) {
+  std::vector<double> contributions(cloud.size(), 0.0);
+  (void)composite(cloud, camera, options, &contributions);
+  return contributions;
 }
 
 ReferenceLoss reference_loss(const ReferenceImage &image, const std::vector<std::uint8_t> &target, double lambda) {

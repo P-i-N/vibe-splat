@@ -11,8 +11,10 @@
 // Each splat's sums over the tile's pixels are reduced within each subgroup,
 // and one lane per subgroup adds them to the splat's totals.
 //
-// Each splat collects 9 values, indexed as in train_gradient.comp:
+// Each splat collects RAW_PER_SPLAT values, indexed as in train_gradient.comp:
 //   0: dL/dopacity, 1-2: dL/dcentre, 3-5: dL/dcov (xx, xy, yy), 6-8: dL/dcolour
+//   9: T alpha, its weight in the pixel, over 3 pixels of the image like the
+//      derivatives, which keeps all ten within the range of the fixed point
 #include "train_types.glsl"
 
 layout(local_size_x = 16, local_size_y = 16) in; // TILE_SIZE
@@ -36,14 +38,14 @@ shared TrainSplat batch[TILE_BATCH];
 shared uint batchIndex[TILE_BATCH];
 shared uint tileStop; // The lowest stop of the tile's pixels
 
-// Sums the 9 values over the subgroup and adds them to the splat's totals.
+// Sums the 10 values over the subgroup and adds them to the splat's totals.
 // A butterfly over the lanes that halves the number of values per lane at
 // each step (padded to 16), so that it costs 16 shuffles for 32 lanes rather
-// than the 45 of nine separate reductions. At the end lane l holds the total
-// of value bitreverse(l), and up to 9 lanes add their totals at once. Every
+// than the 50 of ten separate reductions. At the end lane l holds the total
+// of value bitreverse(l), and up to 10 lanes add their totals at once. Every
 // lane of the subgroup must take part.
-void reduce_and_add(uint base, float g[9]) {
-  float v[16] = float[16](g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7], g[8], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+void reduce_and_add(uint base, float g[RAW_PER_SPLAT]) {
+  float v[16] = float[16](g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7], g[8], g[9], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
   const uint lane = gl_SubgroupInvocationID;
   // Lanes with the bit clear keep the lower half of the list and receive the
   // partner's lower half; the others keep and receive the upper half.
@@ -64,7 +66,7 @@ void reduce_and_add(uint base, float g[9]) {
   if (lane < 16u) {
     const uint first = (bitfieldReverse(lane) >> (32u - steps)) << (4u - steps);
     for (uint i = 0u; i < 16u; ++i) {
-      if (i < perLane && first + i < 9u) add_gradient(base + first + i, v[i]);
+      if (i < perLane && first + i < RAW_PER_SPLAT) add_gradient(base + first + i, v[i]);
     }
   }
 }
@@ -79,6 +81,7 @@ void main() {
   const uint at = inside ? y * pc.width + x : 0u;
   const float logTotal = inside ? image[at].a : 0.0;
   const vec3 A = inside ? adjoint[at].rgb : vec3(0.0);
+  const float perPixel = 1.0 / (3.0 * float(pc.width) * float(pc.height));
   const uvec2 range = ranges[tile];
   const uint stop = inside ? stops[at] : range.y;
   if (gl_LocalInvocationIndex == 0u) {
@@ -103,7 +106,7 @@ void main() {
     barrier();
     for (uint k = 0u; k < count; ++k) {
       const TrainSplat s = batch[k];
-      float g[9] = float[9](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+      float g[RAW_PER_SPLAT] = float[RAW_PER_SPLAT](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
       bool any = false;
       vec2 d;
       float power, alpha;
@@ -117,6 +120,7 @@ void main() {
         g[6] = dColour.r;
         g[7] = dColour.g;
         g[8] = dColour.b;
+        g[9] = T * alpha * perPixel;
 
         // At the 0.99 clamp, alpha no longer depends on the parameters.
         if (s.conicOpacity.w * exp(power) < 0.99) {
@@ -137,7 +141,7 @@ void main() {
       }
       // Uniform within the subgroup, as the reduction must be.
       if (subgroupAny(any)) {
-        reduce_and_add(batchIndex[k] * 9u, g);
+        reduce_and_add(batchIndex[k] * RAW_PER_SPLAT, g);
       }
     }
   }
