@@ -14,6 +14,8 @@ splat_add_shader_library(splat_shaders
     train_tile_ranges.comp
     train_forward.comp
     train_ssim.comp
+    train_exposure.comp
+    train_exposure_backward.comp
     train_loss.comp
     train_backward_float.comp
     train_backward_fixed.comp

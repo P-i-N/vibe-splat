@@ -53,6 +53,10 @@ struct TilePush {
 struct SsimPush {
   std::uint32_t width, height, gridW;
 };
+struct ExposurePush {
+  float transform[12];
+  std::uint32_t pixels;
+};
 struct LossPush {
   std::uint32_t width, height, gridW;
   float lambda;
@@ -104,8 +108,10 @@ Trainer::Trainer(vk::Context &ctx, const GaussianCloud &initial, const TrainerOp
       binEmit_(ctx, shaders::train_bin_emit_comp, 6, sizeof(EmitPush)),
       tileRanges_(ctx, shaders::train_tile_ranges_comp, 2, sizeof(CountPush)),
       forward_(ctx, shaders::train_forward_comp, 5, sizeof(TilePush)),
+      exposure_(ctx, shaders::train_exposure_comp, 2, sizeof(ExposurePush)),
       ssim_(ctx, shaders::train_ssim_comp, 4, sizeof(SsimPush)),
       loss_(ctx, shaders::train_loss_comp, 5, sizeof(LossPush)),
+      exposureBackward_(ctx, shaders::train_exposure_backward_comp, 3, sizeof(ExposurePush)),
       gradient_(ctx, shaders::train_gradient_comp, 14),
       adam_(ctx, shaders::train_adam_comp, 4, sizeof(AdamPush)), gather_(ctx, shaders::train_gather_comp, 3, sizeof(GatherPush)),
       sorter_(ctx) {
@@ -214,6 +220,8 @@ void Trainer::ensure_size(int width, int height) {
   if (!image_ || image_->size() < pixels * 16) {
     image_ = gpu_buffer(ctx_, pixels * 16);
     stops_ = gpu_buffer(ctx_, pixels * 4);
+    exposed_ = gpu_buffer(ctx_, pixels * 16);
+    exposureTotals_ = std::make_unique<Buffer>(ctx_, (pixels + 255) / 256 * 12 * sizeof(float), kStorage, MemoryUsage::Readback);
     adjoint_ = gpu_buffer(ctx_, pixels * 16);
     fields_ = gpu_buffer(ctx_, pixels * 48);
     // The target is written by the CPU into staging memory and copied to the
@@ -324,11 +332,25 @@ void Trainer::record_forward(VkCommandBuffer cmd, std::uint32_t entries) {
 
 void Trainer::record_backward(VkCommandBuffer cmd) {
   const auto w = static_cast<std::uint32_t>(width_), h = static_cast<std::uint32_t>(height_);
-  ssim_.dispatch(cmd, {image_.get(), target_.get(), fields_.get(), groupTotals_.get()}, SsimPush{w, h, gridW_}, tileCount_);
+  // A neutral exposure changes nothing, so its passes are left out.
+  exposing_ = exposureValues_ != kNeutralExposure;
+  ExposurePush exposure{};
+  std::copy(exposureValues_.begin(), exposureValues_.end(), exposure.transform);
+  exposure.pixels = w * h;
+  if (exposing_) {
+    exposure_.dispatch(cmd, {image_.get(), exposed_.get()}, exposure, vk::div_up(w * h, 256));
+    vk::compute_barrier(cmd);
+  }
+  const vk::Buffer *seen = exposing_ ? exposed_.get() : image_.get();
+  ssim_.dispatch(cmd, {seen, target_.get(), fields_.get(), groupTotals_.get()}, SsimPush{w, h, gridW_}, tileCount_);
   vk::compute_barrier(cmd);
-  loss_.dispatch(cmd, {image_.get(), target_.get(), fields_.get(), adjoint_.get(), groupTotals_.get()},
+  loss_.dispatch(cmd, {seen, target_.get(), fields_.get(), adjoint_.get(), groupTotals_.get()},
                  LossPush{w, h, gridW_, options_.lambdaSsim}, tileCount_);
   vk::compute_barrier(cmd);
+  if (exposing_) {
+    exposureBackward_.dispatch(cmd, {image_.get(), adjoint_.get(), exposureTotals_.get()}, exposure, vk::div_up(w * h, 256));
+    vk::compute_barrier(cmd);
+  }
   mark(cmd, "loss");
 
   clear(cmd, *rawGradients_);
@@ -454,6 +476,15 @@ StepStats Trainer::run(const Camera &camera, std::span<const std::uint8_t> targe
   stats.loss = (1.f - options_.lambdaSsim) * stats.l1 + options_.lambdaSsim * (1.f - stats.ssim);
   stats.visibleSplats = counters_->as<std::uint32_t>()[0];
   stats.tileEntries = entries;
+  if (exposing_) {
+    exposureTotals_->invalidate();
+    const auto exposureTotals = exposureTotals_->as<float>();
+    std::array<double, 12> exposureSums{};
+    for (std::uint32_t g = 0; g < vk::div_up(static_cast<std::uint32_t>(width_ * height_), 256u); ++g) {
+      for (std::size_t k = 0; k < 12; ++k) exposureSums[k] += exposureTotals[g * 12 + k];
+    }
+    for (std::size_t k = 0; k < 12; ++k) stats.exposureGradient[k] = static_cast<float>(exposureSums[k]);
+  }
   return stats;
 }
 
@@ -590,7 +621,7 @@ std::uint64_t Trainer::bytes_per_gaussian() const noexcept {
 
 std::uint64_t Trainer::gpu_bytes() const {
   std::uint64_t total = bytes_per_gaussian() * count_;
-  for (const auto *buffer : {image_.get(), stops_.get(), adjoint_.get(), fields_.get(), targetStaging_.get(), target_.get(), ranges_.get(), entryKeys_.get(),
+  for (const auto *buffer : {image_.get(), stops_.get(), exposed_.get(), adjoint_.get(), fields_.get(), targetStaging_.get(), target_.get(), ranges_.get(), entryKeys_.get(),
                              entryValues_.get(), tmpEntryKeys_.get(), tmpEntryValues_.get()}) {
     if (buffer != nullptr) total += buffer->size();
   }

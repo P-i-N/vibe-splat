@@ -51,7 +51,13 @@ struct StepStats {
   float ssim = 0.f;
   std::uint32_t visibleSplats = 0;
   std::uint32_t tileEntries = 0;
+  // dL/d(exposure transform), as set_exposure() takes it.
+  std::array<float, 12> exposureGradient{};
 };
+
+// rgb' = A rgb + b for a view's camera, as rows (A row, b): identity by default.
+using Exposure = std::array<float, 12>;
+inline constexpr Exposure kNeutralExposure{1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f};
 
 // Trains Gaussians with Vulkan compute only:
 //   forward   parameters -> splats -> depth sort -> per-tile lists -> composite
@@ -99,6 +105,9 @@ public:
   // starts low and raises this, so that view dependence does not soak up what
   // geometry should explain.
   void set_active_sh_degree(int degree);
+  // How the camera of the next compute_gradients() or step() exposed its
+  // photo: the loss compares the photo with the render through it.
+  void set_exposure(const Exposure &exposure) { exposureValues_ = exposure; }
 
   // Replaces Gaussians by densify_cloud() from what has been collected, keeping
   // the optimiser state of survivors, and starts collecting anew.
@@ -125,7 +134,9 @@ public:
   [[nodiscard]] std::uint64_t gpu_bytes() const;
   [[nodiscard]] std::uint64_t bytes_per_gaussian() const noexcept;
   static constexpr std::uint64_t kBytesPerTileEntry = 16;
-  static constexpr std::uint64_t kBytesPerPixel = 96;
+  // Image, exposed image and adjoint 16 each, SSIM fields 48, stops 4, and
+  // the target three times (device, staging, prefetch) at 4.
+  static constexpr std::uint64_t kBytesPerPixel = 112;
 
 private:
   struct Group; // A flat parameter array with its gradient and Adam state
@@ -155,7 +166,10 @@ private:
   int width_ = 0, height_ = 0;
   std::uint32_t gridW_ = 0, tileCount_ = 0;
 
-  vk::ComputePipeline preprocess_, binCount_, binEmit_, tileRanges_, forward_, ssim_, loss_, gradient_, adam_, gather_;
+  vk::ComputePipeline preprocess_, binCount_, binEmit_, tileRanges_, forward_, exposure_, ssim_, loss_, exposureBackward_, gradient_, adam_,
+      gather_;
+  Exposure exposureValues_ = kNeutralExposure;
+  bool exposing_ = false; // The last iteration ran the exposure passes
   std::optional<vk::ComputePipeline> backward_, fixedToFloat_;
   vk::RadixSorter sorter_;
 
@@ -164,7 +178,7 @@ private:
   std::unique_ptr<vk::Buffer> camera_, counters_, fixedScale_;
   std::unique_ptr<vk::Buffer> splats_, keys_, values_, tmpKeys_, tmpValues_, coverage_, rawGradients_, stats_;
   std::unique_ptr<vk::Buffer> entryKeys_, entryValues_, tmpEntryKeys_, tmpEntryValues_;
-  std::unique_ptr<vk::Buffer> ranges_, image_, stops_, adjoint_, fields_, targetStaging_, target_, groupTotals_;
+  std::unique_ptr<vk::Buffer> ranges_, image_, stops_, exposed_, exposureTotals_, adjoint_, fields_, targetStaging_, target_, groupTotals_;
   // prefetch_target() hands one copy at a time to a worker thread that lives
   // as long as the trainer, so that no thread is started per iteration.
   std::unique_ptr<vk::Buffer> targetNext_;

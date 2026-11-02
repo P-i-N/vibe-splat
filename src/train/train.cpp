@@ -43,6 +43,7 @@ constexpr int kOpacityResetInterval = 3000;
 constexpr int kCheckpointRecovery = 1000;
 constexpr std::uint64_t kBudgetReserve = 256ull * 1024 * 1024; // Sort scratch, staging, the driver's share
 constexpr float kShC0 = 0.28209479177387814f;
+constexpr float kExposureRate = 5e-3f; // Adam's step for the per-view exposure transforms
 // Coarse to fine: training starts at a quarter of the image size and is at
 // half size until kCoarseUntil[0] of the way through, full size after.
 constexpr std::size_t kCoarseLevels = 2;
@@ -251,6 +252,26 @@ void write_preview(const std::vector<float> &render, const View &view, const fs:
   write_image(out, path, 95);
 }
 
+// How a training view's camera exposed its photo, learned with its own Adam:
+// a view comes round only once per pass over all of them, too seldom to share
+// the Gaussians' optimiser.
+struct ViewExposure {
+  Exposure value = kNeutralExposure;
+  std::array<float, 12> first{}, second{};
+  int steps = 0;
+
+  void step(const std::array<float, 12> &gradient) {
+    ++steps;
+    const float correction1 = 1.f - std::pow(0.9f, static_cast<float>(steps));
+    const float correction2 = 1.f - std::pow(0.999f, static_cast<float>(steps));
+    for (std::size_t k = 0; k < 12; ++k) {
+      first[k] = 0.9f * first[k] + 0.1f * gradient[k];
+      second[k] = 0.999f * second[k] + 0.001f * gradient[k] * gradient[k];
+      value[k] -= kExposureRate * (first[k] / correction1) / (std::sqrt(second[k] / correction2) + 1e-15f);
+    }
+  }
+};
+
 // Half the size, each pixel the mean of four. Pixel x of the result covers
 // pixels 2x and 2x + 1, so the focal length and principal point just halve.
 View half_size(const View &view) {
@@ -376,6 +397,7 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
                options.iterations, options.shDegree, budgetGiB,
                trainer.uses_fixed_point() ? " (fixed-point gradients: this GPU has no float atomics)" : "");
 
+  std::vector<ViewExposure> exposures(trainViews.size());
   std::mt19937 rng(options.seed);
   std::vector<std::size_t> order;
   TrainReport report;
@@ -408,7 +430,8 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
       std::iota(order.begin(), order.end(), std::size_t{0});
       std::shuffle(order.begin(), order.end(), rng);
     }
-    const View &view = view_at(order.back(), iteration);
+    const std::size_t viewIndex = order.back();
+    const View &view = view_at(viewIndex, iteration);
     order.pop_back();
     if (order.empty()) {
       order.resize(trainViews.size());
@@ -421,7 +444,9 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
     const double progress = static_cast<double>(iteration - 1) / std::max(options.iterations - 1, 1);
     rates.position = static_cast<float>(positionStart * std::pow(positionEnd / positionStart, progress));
     trainer.set_active_sh_degree((iteration - 1) / shInterval);
+    trainer.set_exposure(exposures[viewIndex].value);
     const StepStats stats = fitting([&] { return trainer.step(view.camera, view.rgba, rates); });
+    if (options.exposure) exposures[viewIndex].step(stats.exposureGradient);
     if (!std::isfinite(stats.loss)) throw std::runtime_error(std::format("the loss became {} at iteration {}", stats.loss, iteration));
     if (iteration == 1) report.firstLoss = stats.loss;
     report.lastLoss = stats.loss;
@@ -441,7 +466,10 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
       // time, they have run since the first and seen every view many times.
       if (iteration == densifyUntil) {
         trainer.reset_densify_stats();
-        for (const View &scored : trainViews) fitting([&] { return trainer.compute_gradients(scored.camera, scored.rgba); });
+        for (std::size_t i = 0; i < trainViews.size(); ++i) {
+          trainer.set_exposure(exposures[i].value);
+          fitting([&] { return trainer.compute_gradients(trainViews[i].camera, trainViews[i].rgba); });
+        }
       }
       const std::size_t removed = trainer.remove_least_contributing_gaussians(options.pruneShare);
       const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - pruneStart).count();

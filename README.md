@@ -134,6 +134,10 @@ does automatic differentiation: each pass has a hand-derived counterpart.
   quarter of their size and the next 20% at half, made by averaging 2x2
   pixels, as the early iterations only need the broad shapes
   (`--full-resolution` turns this off).
+- **Exposure.** With `--exposure`, each training view also learns a 3x4
+  colour transform that the loss compares its photo through, so that
+  changes in exposure and white balance between photos, as auto exposure
+  makes in video, do not end up in the Gaussians. The output stays neutral.
 - **Optimiser.** Adam, with the learning rates of the 3DGS paper. It only
   updates Gaussians the current view sees: the rest keep their values and
   moments, which also spares most of its memory traffic.

@@ -114,6 +114,8 @@ train options (writes project/splat.ply and project/preview_*.png):
   --save-every <n>        Save the output this often, 0 only at the end (default 5000)
   --no-densify            Keep the initial Gaussians, without adding or removing any
   --full-resolution       Train at full size from the start, rather than coarse to fine
+  --exposure              Learn each photo's exposure and white balance, for
+                          photos or video whose exposure varies
   --gradient-threshold <x>  Lower adds more Gaussians (default 0.0002)
   --vram-budget <GiB>     Default: 90% of the GPU's free memory
   --max-gaussians <n>     Default: what the budget allows
@@ -438,9 +440,9 @@ int cmd_train(const GlobalOptions &opts) {
   for (auto &a : rest) {
     if (a == "-o") a = "--out";
   }
-  const splat::cli::Args args(rest, {"--no-densify", "--full-resolution"});
+  const splat::cli::Args args(rest, {"--no-densify", "--full-resolution", "--exposure"});
   args.allow_only({"out", "iterations", "lambda-ssim", "sh-degree", "max-size", "max-views", "holdout", "seed", "report-every", "save-every",
-                   "no-densify", "gradient-threshold", "vram-budget", "max-gaussians", "prune", "full-resolution"});
+                   "no-densify", "gradient-threshold", "vram-budget", "max-gaussians", "prune", "full-resolution", "exposure"});
   if (args.positionals().size() != 1) {
     std::println(stderr, "Usage: splat train <project> [options]  (see splat --help)");
     return 2;
@@ -459,6 +461,7 @@ int cmd_train(const GlobalOptions &opts) {
   options.saveEvery = std::max(args.number("save-every", options.saveEvery), 0);
   options.densify = !args.has("no-densify");
   options.fullResolution = args.has("full-resolution");
+  options.exposure = args.has("exposure");
   options.gradientThreshold = args.number("gradient-threshold", options.gradientThreshold);
   options.vramBudgetGiB = args.number("vram-budget", 0.0);
   options.maxGaussians = args.number<std::size_t>("max-gaussians", 0);

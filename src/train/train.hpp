@@ -21,6 +21,10 @@ struct TrainOptions {
   int saveEvery = 5000; // 0 only saves at the end
 
   bool densify = true;
+  // Learn each view's exposure, so that the Gaussians need not take it up.
+  // For photos whose exposure varies, as auto exposure in video does; on
+  // evenly exposed photos it costs about 0.5 dB on held-out views.
+  bool exposure = false;
   bool fullResolution = false; // Train at full size throughout, without the coarse start
   float gradientThreshold = 2e-4f;
   double vramBudgetGiB = 0.0; // 0: 90% of the GPU's free memory
