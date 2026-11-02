@@ -26,10 +26,13 @@
 #include <cstdint>
 #include <exception>
 #include <filesystem>
+#include <format>
 #include <optional>
 #include <print>
 #include <span>
+#include <stdexcept>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -62,6 +65,12 @@ render options:
 
 make-test-scene options:
   --count <n>             Number of Gaussians (default 200000)
+
+convert options (both pruning tests are off unless given; either enables it):
+  --prune-sigma <units>   Drop floaters: Gaussians whose largest axis (one standard
+                          deviation) is longer than this many world units
+  --prune-radius <factor> Drop Gaussians farther from the scene centre than this times
+                          the radius that holds 90% of them
 
 ingest options (inputs are image files, video files or folders of them):
   -o, --out <dir>         Project folder (required); gets images/ and ingest.json
@@ -231,19 +240,37 @@ int cmd_make_test_scene(const GlobalOptions &opts) {
 
 int cmd_convert(const GlobalOptions &opts) {
   const splat::cli::Args args(opts.rest, {});
-  args.allow_only({});
+  args.allow_only({"prune-sigma", "prune-radius"});
   if (args.positionals().size() != 2) {
-    std::println(stderr, "Usage: splat convert <in.ply|cgc> <out.ply|cgc>");
+    std::println(stderr, "Usage: splat convert <in.ply|cgc> <out.ply|cgc> [--prune-sigma <units>] [--prune-radius <factor>]");
     return 2;
   }
   const std::filesystem::path in(args.positionals()[0]);
   const std::filesystem::path out(args.positionals()[1]);
+  splat::PruneOptions prune;
+  prune.maxSigma = args.number("prune-sigma", 0.f);
+  prune.maxRadiusFactor = args.number("prune-radius", 0.f);
+  for (const auto [name, value] : {std::pair{"prune-sigma", prune.maxSigma}, std::pair{"prune-radius", prune.maxRadiusFactor}}) {
+    if (args.has(name) && !(value > 0.f)) {
+      throw std::runtime_error(std::format("--{} must be greater than 0", name));
+    }
+  }
+  const bool pruning = prune.maxSigma > 0.f || prune.maxRadiusFactor > 0.f;
+  const bool toCgc = splat::cloud_format(out) == splat::CloudFormat::Cgc;
+
   auto cloud = load_scene(in.string());
   const auto start = std::chrono::steady_clock::now();
-  if (splat::cloud_format(out) == splat::CloudFormat::Cgc) {
+  // CGC cannot store NaNs, and the floater tests need finite values to compare.
+  if (toCgc || pruning) {
     if (const std::size_t removed = splat::remove_non_finite(cloud); removed > 0) {
       std::println("Left out {} Gaussians with NaN or infinite values", removed);
     }
+  }
+  if (pruning) {
+    const std::size_t removed = splat::prune_floaters(cloud, prune);
+    std::println("Pruned {} floaters, {} Gaussians left", removed, cloud.size());
+  }
+  if (toCgc) {
     const auto stats = splat::save_cgc(cloud, out);
     std::println("SH degree per Gaussian: 0: {}, 1: {}, 2: {}, 3: {}", stats.degreeCounts[0], stats.degreeCounts[1],
                  stats.degreeCounts[2], stats.degreeCounts[3]);

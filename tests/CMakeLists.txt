@@ -31,6 +31,10 @@ set_tests_properties(cli_convert_cgc PROPERTIES DEPENDS cli_make_test_scene)
 add_test(NAME cli_render_cgc COMMAND splat render "${CMAKE_CURRENT_BINARY_DIR}/cli_scene.cgc"
          -o "${CMAKE_CURRENT_BINARY_DIR}/cli_render_cgc.png" --width 320 --height 180)
 set_tests_properties(cli_render_cgc PROPERTIES DEPENDS cli_convert_cgc)
+# The floater filter options must be accepted (the test scene has nothing to prune).
+add_test(NAME cli_convert_prune COMMAND splat convert "${CMAKE_CURRENT_BINARY_DIR}/cli_scene.ply" "${CMAKE_CURRENT_BINARY_DIR}/cli_scene_pruned.ply"
+         --prune-sigma 1 --prune-radius 4)
+set_tests_properties(cli_convert_prune PROPERTIES DEPENDS cli_make_test_scene)
 # Ingesting the image cli_render wrote checks the whole command line path.
 add_test(NAME cli_ingest COMMAND splat ingest "${CMAKE_CURRENT_BINARY_DIR}/cli_render.png"
          -o "${CMAKE_CURRENT_BINARY_DIR}/cli_project" --force --focal-35mm 28)

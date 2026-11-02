@@ -6,6 +6,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -434,6 +435,99 @@ TEST_CASE("remove_non_finite drops only the broken Gaussians", "[cgc]") {
   CHECK_NOTHROW(save_cgc(cloud, temp_file("splat_cgc_cleaned.cgc")));
   std::filesystem::remove(temp_file("splat_cgc_cleaned.cgc"));
   CHECK(remove_non_finite(cloud) == 0);
+}
+
+namespace {
+
+bool same_gaussian(const GaussianCloud &a, std::size_t i, const GaussianCloud &b, std::size_t j) {
+  const std::size_t floats = static_cast<std::size_t>(3 * a.shCoeffs());
+  for (int k = 0; k < 3; ++k) {
+    if (a.positions[i * 3 + k] != b.positions[j * 3 + k] || a.scales[i * 3 + k] != b.scales[j * 3 + k]) return false;
+  }
+  for (int k = 0; k < 4; ++k) {
+    if (a.rotations[i * 4 + k] != b.rotations[j * 4 + k]) return false;
+  }
+  if (a.opacities[i] != b.opacities[j]) return false;
+  for (std::size_t k = 0; k < floats; ++k) {
+    if (a.sh[i * floats + k] != b.sh[j * floats + k]) return false;
+  }
+  return true;
+}
+
+// Checks that `pruned` is exactly `original` with the Gaussians in `removed` taken out, in the original order.
+void check_pruned(const GaussianCloud &original, const GaussianCloud &pruned, std::vector<std::size_t> removed) {
+  REQUIRE(pruned.size() + removed.size() == original.size());
+  pruned.validate();
+  std::size_t j = 0;
+  for (std::size_t i = 0; i < original.size(); ++i) {
+    if (std::ranges::find(removed, i) != removed.end()) continue;
+    INFO("original Gaussian " << i << " should be pruned Gaussian " << j);
+    CHECK(same_gaussian(original, i, pruned, j));
+    ++j;
+  }
+}
+
+} // namespace
+
+TEST_CASE("prune_floaters removes Gaussians whose largest axis is too long", "[prune]") {
+  // random_cloud scales are log-uniform in [-6, -1], so every axis is below exp(-1) = 0.37.
+  GaussianCloud cloud = random_cloud(8, 1, 92);
+  cloud.scales[2 * 3 + 1] = std::log(2.0f);
+  cloud.scales[5 * 3 + 0] = std::log(0.8f);
+  cloud.scales[6 * 3 + 2] = std::log(0.45f); // below the limit: stays
+  const GaussianCloud original = cloud;
+
+  PruneOptions options;
+  options.maxSigma = 0.5f;
+  CHECK(prune_floaters(cloud, options) == 2);
+  check_pruned(original, cloud, {2, 5});
+}
+
+TEST_CASE("prune_floaters removes Gaussians far from the scene centre", "[prune]") {
+  // random_cloud positions lie in [0, 10]^3: the centre is near (5, 5, 5) and the 90% radius below 9.
+  GaussianCloud cloud = random_cloud(100, 2, 93);
+  cloud.positions[1 * 3 + 0] = 500.f;
+  cloud.positions[60 * 3 + 0] = -300.f;
+  cloud.positions[60 * 3 + 1] = -300.f;
+  cloud.positions[60 * 3 + 2] = -300.f;
+  const GaussianCloud original = cloud;
+
+  PruneOptions options;
+  options.maxRadiusFactor = 3.f;
+  CHECK(prune_floaters(cloud, options) == 2);
+  check_pruned(original, cloud, {1, 60});
+}
+
+TEST_CASE("prune_floaters applies both tests and counts a Gaussian once", "[prune]") {
+  GaussianCloud cloud = random_cloud(100, 1, 94);
+  cloud.positions[7 * 3 + 2] = 400.f;   // far away
+  cloud.scales[7 * 3 + 0] = std::log(3.f); // and oversized
+  cloud.scales[42 * 3 + 1] = std::log(3.f); // oversized only
+  cloud.positions[90 * 3 + 1] = -400.f; // far away only
+  const GaussianCloud original = cloud;
+
+  PruneOptions options;
+  options.maxSigma = 1.f;
+  options.maxRadiusFactor = 3.f;
+  CHECK(prune_floaters(cloud, options) == 3);
+  check_pruned(original, cloud, {7, 42, 90});
+}
+
+TEST_CASE("prune_floaters leaves a cloud with nothing to prune untouched", "[prune]") {
+  GaussianCloud cloud = random_cloud(50, 3, 95);
+  const GaussianCloud original = cloud;
+
+  PruneOptions options;
+  options.maxSigma = 1.f;
+  options.maxRadiusFactor = 3.f;
+  CHECK(prune_floaters(cloud, options) == 0);
+  check_pruned(original, cloud, {});
+
+  // Neither limit set: nothing is tested, even for an outlandish cloud.
+  cloud.positions[0] = 1e6f;
+  cloud.scales[0] = std::log(1e3f);
+  CHECK(prune_floaters(cloud, PruneOptions{}) == 0);
+  CHECK(cloud.size() == 50);
 }
 
 namespace {

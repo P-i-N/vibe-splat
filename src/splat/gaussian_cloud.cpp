@@ -370,15 +370,16 @@ void save_ply(const GaussianCloud &cloud, const std::filesystem::path &path) {
   }
 }
 
-std::size_t remove_non_finite(GaussianCloud &cloud) {
+namespace {
+
+// Keeps the Gaussians for which keep(i) is true, in their current order, and
+// returns how many were dropped.
+template <class Keep> std::size_t compact(GaussianCloud &cloud, Keep keep) {
   const std::size_t n = cloud.size();
   const std::size_t floats = static_cast<std::size_t>(3 * cloud.shCoeffs());
-  const auto finite = [](std::span<const float> values) { return std::ranges::all_of(values, [](float v) { return std::isfinite(v); }); };
   std::size_t kept = 0;
   for (std::size_t i = 0; i < n; ++i) {
-    if (!finite(std::span(cloud.positions).subspan(i * 3, 3)) || !finite(std::span(cloud.scales).subspan(i * 3, 3)) ||
-        !finite(std::span(cloud.rotations).subspan(i * 4, 4)) || !std::isfinite(cloud.opacities[i]) ||
-        !finite(std::span(cloud.sh).subspan(i * floats, floats))) {
+    if (!keep(i)) {
       continue;
     }
     if (kept != i) {
@@ -396,6 +397,47 @@ std::size_t remove_non_finite(GaussianCloud &cloud) {
   cloud.opacities.resize(kept);
   cloud.sh.resize(kept * floats);
   return n - kept;
+}
+
+} // namespace
+
+std::size_t remove_non_finite(GaussianCloud &cloud) {
+  const std::size_t floats = static_cast<std::size_t>(3 * cloud.shCoeffs());
+  const auto finite = [](std::span<const float> values) { return std::ranges::all_of(values, [](float v) { return std::isfinite(v); }); };
+  return compact(cloud, [&](std::size_t i) {
+    return finite(std::span(cloud.positions).subspan(i * 3, 3)) && finite(std::span(cloud.scales).subspan(i * 3, 3)) &&
+           finite(std::span(cloud.rotations).subspan(i * 4, 4)) && std::isfinite(cloud.opacities[i]) &&
+           finite(std::span(cloud.sh).subspan(i * floats, floats));
+  });
+}
+
+std::size_t prune_floaters(GaussianCloud &cloud, const PruneOptions &options) {
+  const bool bySize = options.maxSigma > 0.f;
+  const bool byDistance = options.maxRadiusFactor > 0.f;
+  if (!bySize && !byDistance) {
+    return 0;
+  }
+  // Scales are logs, so compare in log space and skip the exp per Gaussian.
+  const float maxLogScale = bySize ? std::log(options.maxSigma) : 0.f;
+  const Bounds bounds = byDistance ? compute_bounds(cloud) : Bounds{};
+  const float maxDistanceSq = byDistance ? (options.maxRadiusFactor * bounds.radius) * (options.maxRadiusFactor * bounds.radius) : 0.f;
+  return compact(cloud, [&](std::size_t i) {
+    if (bySize) {
+      const float *s = &cloud.scales[i * 3];
+      if (std::max({s[0], s[1], s[2]}) > maxLogScale) {
+        return false;
+      }
+    }
+    if (byDistance) {
+      const float dx = cloud.positions[i * 3 + 0] - bounds.center[0];
+      const float dy = cloud.positions[i * 3 + 1] - bounds.center[1];
+      const float dz = cloud.positions[i * 3 + 2] - bounds.center[2];
+      if (dx * dx + dy * dy + dz * dz > maxDistanceSq) {
+        return false;
+      }
+    }
+    return true;
+  });
 }
 
 CloudFormat cloud_format(const std::filesystem::path &path) {
