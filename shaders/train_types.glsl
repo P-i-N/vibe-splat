@@ -6,6 +6,9 @@
 const uint TILE_SIZE = 16u;
 const uint TILE_BATCH = TILE_SIZE * TILE_SIZE; // Splats staged through shared memory at a time
 const uint INVISIBLE = 0xFFFFFFFFu;
+// A pixel takes no more splats once its transmittance would fall below
+// 1e-4, as in the 3DGS paper. Compared as logarithms: this is log(1e-4).
+const float LOG_MIN_TRANSMITTANCE = -9.210340372;
 
 struct TrainSplat {
   vec4 centerRadius; // xy pixel centre, z radius in pixels, w view depth

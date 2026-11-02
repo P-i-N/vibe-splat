@@ -9,6 +9,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <print>
 #include <random>
@@ -202,6 +203,51 @@ TEST_CASE("GPU loss and gradients match the CPU reference", "[train][vulkan]") {
     check_close(to_double(gpu.rotations), cpu.rotations, "rotations", cosine, ratio);
     check_close(to_double(gpu.opacities), cpu.opacities, "opacities", cosine, ratio);
     check_close(to_double(gpu.sh), cpu.sh, "sh", cosine, ratio);
+  }
+}
+
+TEST_CASE("GPU forward and gradients match the CPU reference where pixels stop early", "[train][vulkan]") {
+  vk::Context *ctx = test::context();
+  if (ctx == nullptr) SKIP("No usable Vulkan device");
+  const Camera camera = test_camera(80, 60);
+  const auto target = noise_target(camera.width, camera.height, 19);
+  GaussianCloud cloud = random_cloud(400, 1, 17);
+  for (float &opacity : cloud.opacities) opacity = 5.f; // Nearly opaque, so most pixels stop early
+
+  const ReferenceImage image = reference_render(cloud, camera, {});
+  const auto stopped = std::count_if(image.stop.begin(), image.stop.end(), [](std::size_t stop) { return stop > 0; });
+  std::println("  {} of {} pixels stop early", stopped, image.stop.size());
+  REQUIRE(stopped > static_cast<std::ptrdiff_t>(image.stop.size() / 10));
+
+  Trainer trainer(*ctx, cloud);
+  const std::vector<float> gpu = trainer.render(camera);
+  double worst = 0.0, worstLog = 0.0;
+  for (std::size_t i = 0; i < image.rgb.size(); ++i) {
+    for (int c = 0; c < 3; ++c) worst = std::max(worst, std::abs(gpu[i * 4 + static_cast<std::size_t>(c)] - image.rgb[i][c]));
+    worstLog = std::max(worstLog, std::abs(gpu[i * 4 + 3] - image.logTransmittance[i]));
+  }
+  std::println("  forward: worst difference from CPU {:.6f}, log transmittance {:.6f}", worst, worstLog);
+  CHECK(worst < 1e-3);
+  CHECK(worstLog < 1e-2);
+
+  const ReferenceLoss cpuLoss = reference_loss(image, target, 0.2);
+  const ParameterGradients cpu = reference_gradients(cloud, camera, cpuLoss.adjoint, {});
+  for (const bool fixedPoint : {false, true}) {
+    TrainerOptions options;
+    options.forceFixedPoint = fixedPoint;
+    if (!fixedPoint && !ctx->info().floatAtomicAdd) continue;
+    Trainer gradients(*ctx, cloud, options);
+    const StepStats stats = gradients.compute_gradients(camera, target);
+    INFO("fixed point: " << fixedPoint);
+    CHECK_THAT(stats.loss, WithinAbs(cpuLoss.loss, 1e-3));
+    const auto g = gradients.gradients();
+    std::println("  {} atomics:", fixedPoint ? "fixed-point" : "float");
+    const double cosine = fixedPoint ? 0.97 : 0.999, ratio = fixedPoint ? 0.1 : 0.02;
+    check_close(to_double(g.positions), cpu.positions, "positions", cosine, ratio);
+    check_close(to_double(g.scales), cpu.scales, "scales", cosine, ratio);
+    check_close(to_double(g.rotations), cpu.rotations, "rotations", cosine, ratio);
+    check_close(to_double(g.opacities), cpu.opacities, "opacities", cosine, ratio);
+    check_close(to_double(g.sh), cpu.sh, "sh", cosine, ratio);
   }
 }
 

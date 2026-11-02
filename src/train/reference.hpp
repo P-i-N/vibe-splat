@@ -18,9 +18,9 @@ namespace splat {
 struct ReferenceOptions {
   std::array<float, 3> background{0.f, 0.f, 0.f};
   float nearPlane = 0.01f;
-  // Leaves out the cutoffs at 3 sigma and alpha 1/255. They are steps, which
-  // finite differences see and true derivatives do not, so checking gradients
-  // needs them gone.
+  // Leaves out the cutoffs at 3 sigma and alpha 1/255, and the early stop at
+  // transmittance 1e-4. They are steps, which finite differences see and true
+  // derivatives do not, so checking gradients needs them gone.
   bool noCutoffs = false;
 };
 
@@ -29,6 +29,9 @@ struct ReferenceImage {
   int height = 0;
   std::vector<glm::dvec3> rgb;
   std::vector<double> logTransmittance;
+  // Per pixel, the splats of the back-to-front list below this index were left
+  // out by the early stop.
+  std::vector<std::size_t> stop;
 };
 
 [[nodiscard]] ReferenceImage reference_render(const GaussianCloud &cloud, const Camera &camera, const ReferenceOptions &options);

@@ -1,11 +1,18 @@
 #version 460
-// Forward pass, step 5: composites each tile's splats back to front. One
+// Forward pass, step 5: composites each tile's splats front to back. One
 // workgroup per tile and one thread per pixel: the tile's splats are staged
 // through shared memory in batches, and every thread blends its own pixel in
 // registers, writing it once at the end. Tiles do not share pixels, so tiles
 // run in parallel without blending hardware, which is what makes the result
 // available to the following compute passes.
-// Output: rgb, and in a the log of the transmittance through all splats.
+//
+// The tile lists are sorted back to front, so they are read from the end. A
+// pixel stops once its transmittance would fall below 1e-4, and a
+// tile once all its pixels have, which skips everything hidden behind opaque
+// surfaces. The backward pass starts where each pixel stopped.
+// Output: rgb, and in a the log of the transmittance through the splats that
+// were blended. In stops, where the pixel stopped: the entries of the tile
+// list below this index were left out.
 #extension GL_GOOGLE_include_directive : require
 #include "train_types.glsl"
 
@@ -15,6 +22,7 @@ layout(std430, binding = 0) readonly buffer Splats { TrainSplat splats[]; };
 layout(std430, binding = 1) readonly buffer EntryValues { uint entryValues[]; };
 layout(std430, binding = 2) readonly buffer Ranges { uvec2 ranges[]; };
 layout(std430, binding = 3) writeonly buffer Image { vec4 image[]; };
+layout(std430, binding = 4) writeonly buffer Stops { uint stops[]; };
 
 layout(push_constant) uniform Push {
   uint width;
@@ -25,6 +33,7 @@ layout(push_constant) uniform Push {
 } pc;
 
 shared TrainSplat batch[TILE_BATCH];
+shared uint doneCount; // Pixels of the tile that have stopped
 
 void main() {
   const uint tile = gl_WorkGroupID.x;
@@ -34,20 +43,34 @@ void main() {
   const uint x = tilePixels.x + gl_LocalInvocationID.x, y = tilePixels.y + gl_LocalInvocationID.y;
   const bool inside = x < pc.width && y < pc.height;
 
-  vec3 rgb = pc.background.rgb;
-  float logTransmittance = 0.0;
   const uvec2 range = ranges[tile];
-  for (uint start = range.x; start < range.y; start += TILE_BATCH) {
-    const uint count = min(TILE_BATCH, range.y - start);
+  vec3 rgb = vec3(0.0);
+  float transmittance = 1.0, logTransmittance = 0.0;
+  uint stop = range.x;
+  bool done = !inside;
+  if (gl_LocalInvocationIndex == 0u) {
+    doneCount = 0u;
+  }
+  barrier();
+  if (done) {
+    atomicAdd(doneCount, 1u);
+  }
+  for (uint end = range.y; end > range.x;) {
+    const uint count = min(TILE_BATCH, end - range.x);
+    end -= count;
     barrier();
+    // Read by every thread between the same two barriers, so all agree.
+    if (doneCount == TILE_BATCH) {
+      break;
+    }
     if (gl_LocalInvocationIndex < count) {
-      batch[gl_LocalInvocationIndex] = splats[entryValues[start + gl_LocalInvocationIndex]];
+      batch[gl_LocalInvocationIndex] = splats[entryValues[end + gl_LocalInvocationIndex]];
     }
     barrier();
-    if (!inside) {
+    if (done) {
       continue;
     }
-    for (uint k = 0u; k < count; ++k) {
+    for (uint k = count; k-- > 0u;) {
       const TrainSplat s = batch[k];
       const uvec4 area = splat_pixels(s, tilePixels);
       if (x < area.x || x >= area.z || y < area.y || y >= area.w) {
@@ -58,11 +81,20 @@ void main() {
       if (!splat_at(s, x, y, d, power, alpha)) {
         continue;
       }
-      rgb = mix(rgb, s.color.rgb, alpha);
-      logTransmittance += log(1.0 - alpha);
+      const float logRest = log(1.0 - alpha);
+      if (logTransmittance + logRest < LOG_MIN_TRANSMITTANCE) {
+        stop = end + k + 1u;
+        done = true;
+        atomicAdd(doneCount, 1u);
+        break;
+      }
+      rgb += transmittance * alpha * s.color.rgb;
+      transmittance *= 1.0 - alpha;
+      logTransmittance += logRest;
     }
   }
   if (inside) {
-    image[y * pc.width + x] = vec4(rgb, logTransmittance);
+    image[y * pc.width + x] = vec4(rgb + transmittance * pc.background.rgb, logTransmittance);
+    stops[y * pc.width + x] = stop;
   }
 }

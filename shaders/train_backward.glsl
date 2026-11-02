@@ -1,5 +1,5 @@
-// Backward pass, step 1: for each tile, in the same back-to-front order as the
-// forward pass, adds up what each splat contributes to dL. At a pixel,
+// Backward pass, step 1: for each tile, back to front from where the forward
+// pass stopped, adds up what each splat contributes to dL. At a pixel,
 //   C = F + T (alpha c + (1 - alpha) B)
 // where B is the composite behind this splat and T the transmittance in front
 // of it, which gives
@@ -22,6 +22,7 @@ layout(std430, binding = 1) readonly buffer EntryValues { uint entryValues[]; };
 layout(std430, binding = 2) readonly buffer Ranges { uvec2 ranges[]; };
 layout(std430, binding = 3) readonly buffer Image { vec4 image[]; };
 layout(std430, binding = 4) readonly buffer Adjoint { vec4 adjoint[]; };
+layout(std430, binding = 5) readonly buffer Stops { uint stops[]; };
 
 layout(push_constant) uniform Push {
   uint width;
@@ -33,6 +34,7 @@ layout(push_constant) uniform Push {
 
 shared TrainSplat batch[TILE_BATCH];
 shared uint batchIndex[TILE_BATCH];
+shared uint tileStop; // The lowest stop of the tile's pixels
 
 // Sums the 9 values over the subgroup and adds them to the splat's totals.
 // A butterfly over the lanes that halves the number of values per lane at
@@ -77,13 +79,20 @@ void main() {
   const uint at = inside ? y * pc.width + x : 0u;
   const float logTotal = inside ? image[at].a : 0.0;
   const vec3 A = inside ? adjoint[at].rgb : vec3(0.0);
+  const uvec2 range = ranges[tile];
+  const uint stop = inside ? stops[at] : range.y;
+  if (gl_LocalInvocationIndex == 0u) {
+    tileStop = range.y;
+  }
+  barrier();
+  atomicMin(tileStop, stop);
+  barrier();
 
   // The composite behind the current splat, and its log transmittance.
   vec3 B = pc.background.rgb;
   float logBehind = 0.0;
 
-  const uvec2 range = ranges[tile];
-  for (uint start = range.x; start < range.y; start += TILE_BATCH) {
+  for (uint start = tileStop; start < range.y; start += TILE_BATCH) {
     const uint count = min(TILE_BATCH, range.y - start);
     barrier();
     if (gl_LocalInvocationIndex < count) {
@@ -99,7 +108,7 @@ void main() {
       vec2 d;
       float power, alpha;
       const uvec4 area = splat_pixels(s, tilePixels);
-      if (inside && x >= area.x && x < area.z && y >= area.y && y < area.w && splat_at(s, x, y, d, power, alpha)) {
+      if (start + k >= stop && x >= area.x && x < area.z && y >= area.y && y < area.w && splat_at(s, x, y, d, power, alpha)) {
         const vec3 q = s.conicOpacity.xyz;
         const float logRest = log(1.0 - alpha);
         const float T = exp(logTotal - logBehind - logRest);

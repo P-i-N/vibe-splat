@@ -159,7 +159,7 @@ private:
   std::unique_ptr<vk::Buffer> camera_, counters_, fixedScale_;
   std::unique_ptr<vk::Buffer> splats_, keys_, values_, tmpKeys_, tmpValues_, coverage_, rawGradients_, stats_;
   std::unique_ptr<vk::Buffer> entryKeys_, entryValues_, tmpEntryKeys_, tmpEntryValues_;
-  std::unique_ptr<vk::Buffer> ranges_, image_, adjoint_, fields_, targetStaging_, target_, groupTotals_;
+  std::unique_ptr<vk::Buffer> ranges_, image_, stops_, adjoint_, fields_, targetStaging_, target_, groupTotals_;
   // prefetch_target() hands one copy at a time to a worker thread that lives
   // as long as the trainer, so that no thread is started per iteration.
   std::unique_ptr<vk::Buffer> targetNext_;

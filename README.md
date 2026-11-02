@@ -111,14 +111,17 @@ does automatic differentiation: each pass has a hand-derived counterpart.
   Each splat then adds one entry per 16x16 pixel tile it covers, and a stable
   sort by tile leaves every tile with its own depth-sorted list. One workgroup
   per tile, one thread per pixel: the tile's splats are staged through shared
-  memory and every thread blends its own pixel in registers. Tiles do not
-  share pixels, so they composite in parallel with no blending hardware.
+  memory and every thread blends its own pixel in registers, front to back.
+  A pixel stops once its transmittance falls below 1e-4, and a tile once all
+  its pixels have, so splats hidden behind opaque surfaces cost nothing. Tiles
+  do not share pixels, so they composite in parallel with no blending hardware.
 - **Loss.** 0.8 L1 + 0.2 D-SSIM, and its derivative at every pixel. The 11x11
   SSIM window is separable: a horizontal pass into shared memory and a
   vertical pass out of it, per tile.
 - **Backward.** At a pixel `C = F + T (alpha c + (1 - alpha) B)`, with `B` what
   lies behind a splat and `T` the transmittance in front of it. So
-  `dC/dalpha = T (c - B)` and `dC/dc = T alpha`. Each pixel's share is reduced
+  `dC/dalpha = T (c - B)` and `dC/dc = T alpha`, worked out back to front
+  from where the forward pass stopped. Each pixel's share is reduced
   over its subgroup with one butterfly for all nine values, then added per
   splat with float atomics, or fixed-point integer atomics on GPUs without
   them. A last pass applies the chain rule down to position, scale, rotation,

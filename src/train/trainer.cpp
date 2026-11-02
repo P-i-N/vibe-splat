@@ -103,7 +103,7 @@ Trainer::Trainer(vk::Context &ctx, const GaussianCloud &initial, const TrainerOp
       binCount_(ctx, shaders::train_bin_count_comp, 5, sizeof(CountPush)),
       binEmit_(ctx, shaders::train_bin_emit_comp, 6, sizeof(EmitPush)),
       tileRanges_(ctx, shaders::train_tile_ranges_comp, 2, sizeof(CountPush)),
-      forward_(ctx, shaders::train_forward_comp, 4, sizeof(TilePush)),
+      forward_(ctx, shaders::train_forward_comp, 5, sizeof(TilePush)),
       ssim_(ctx, shaders::train_ssim_comp, 4, sizeof(SsimPush)),
       loss_(ctx, shaders::train_loss_comp, 5, sizeof(LossPush)),
       gradient_(ctx, shaders::train_gradient_comp, 14),
@@ -118,11 +118,11 @@ Trainer::Trainer(vk::Context &ctx, const GaussianCloud &initial, const TrainerOp
 
   fixedPoint_ = options.forceFixedPoint || !ctx.info().floatAtomicAdd;
   if (fixedPoint_) {
-    backward_.emplace(ctx, shaders::train_backward_fixed_comp, 7, sizeof(TilePush));
+    backward_.emplace(ctx, shaders::train_backward_fixed_comp, 8, sizeof(TilePush));
     fixedToFloat_.emplace(ctx, shaders::train_fixed_to_float_comp, 1, sizeof(FixedPush));
     fixedScale_ = std::make_unique<Buffer>(ctx, sizeof(float), kStorage, MemoryUsage::Upload);
   } else {
-    backward_.emplace(ctx, shaders::train_backward_float_comp, 6, sizeof(TilePush));
+    backward_.emplace(ctx, shaders::train_backward_float_comp, 7, sizeof(TilePush));
   }
 
   groups_.push_back(std::make_unique<Group>(ctx, initial.positions));
@@ -213,6 +213,7 @@ void Trainer::ensure_size(int width, int height) {
   const VkDeviceSize pixels = VkDeviceSize{static_cast<std::uint32_t>(width)} * static_cast<std::uint32_t>(height);
   if (!image_ || image_->size() < pixels * 16) {
     image_ = gpu_buffer(ctx_, pixels * 16);
+    stops_ = gpu_buffer(ctx_, pixels * 4);
     adjoint_ = gpu_buffer(ctx_, pixels * 16);
     fields_ = gpu_buffer(ctx_, pixels * 48);
     // The target is written by the CPU into staging memory and copied to the
@@ -316,7 +317,7 @@ void Trainer::record_forward(VkCommandBuffer cmd, std::uint32_t entries) {
   const TilePush push{static_cast<std::uint32_t>(width_), static_cast<std::uint32_t>(height_), gridW_, tileCount_,
                       {options_.background[0], options_.background[1], options_.background[2], 0.f}};
   mark(cmd, "tile lists");
-  forward_.dispatch(cmd, {splats_.get(), entryValues_.get(), ranges_.get(), image_.get()}, push, tileCount_);
+  forward_.dispatch(cmd, {splats_.get(), entryValues_.get(), ranges_.get(), image_.get(), stops_.get()}, push, tileCount_);
   vk::compute_barrier(cmd);
   mark(cmd, "composite");
 }
@@ -335,13 +336,13 @@ void Trainer::record_backward(VkCommandBuffer cmd) {
   vk::compute_barrier(cmd);
   const TilePush push{w, h, gridW_, tileCount_, {options_.background[0], options_.background[1], options_.background[2], 0.f}};
   if (fixedPoint_) {
-    backward_->dispatch(cmd, {splats_.get(), entryValues_.get(), ranges_.get(), image_.get(), adjoint_.get(), rawGradients_.get(), fixedScale_.get()},
+    backward_->dispatch(cmd, {splats_.get(), entryValues_.get(), ranges_.get(), image_.get(), adjoint_.get(), stops_.get(), rawGradients_.get(), fixedScale_.get()},
                         push, tileCount_);
     vk::compute_barrier(cmd);
     const auto rawCount = static_cast<std::uint32_t>(count_ * kRawGradientsPerSplat);
     fixedToFloat_->dispatch(cmd, {rawGradients_.get()}, FixedPush{rawCount, fixedScale_->as<float>()[0]}, vk::div_up(rawCount, 256));
   } else {
-    backward_->dispatch(cmd, {splats_.get(), entryValues_.get(), ranges_.get(), image_.get(), adjoint_.get(), rawGradients_.get()},
+    backward_->dispatch(cmd, {splats_.get(), entryValues_.get(), ranges_.get(), image_.get(), adjoint_.get(), stops_.get(), rawGradients_.get()},
                         push, tileCount_);
   }
   vk::compute_barrier(cmd);
@@ -574,7 +575,7 @@ std::uint64_t Trainer::bytes_per_gaussian() const noexcept {
 
 std::uint64_t Trainer::gpu_bytes() const {
   std::uint64_t total = bytes_per_gaussian() * count_;
-  for (const auto *buffer : {image_.get(), adjoint_.get(), fields_.get(), targetStaging_.get(), target_.get(), ranges_.get(), entryKeys_.get(),
+  for (const auto *buffer : {image_.get(), stops_.get(), adjoint_.get(), fields_.get(), targetStaging_.get(), target_.get(), ranges_.get(), entryKeys_.get(),
                              entryValues_.get(), tmpEntryKeys_.get(), tmpEntryValues_.get()}) {
     if (buffer != nullptr) total += buffer->size();
   }
