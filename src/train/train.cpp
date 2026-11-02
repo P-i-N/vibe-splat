@@ -10,6 +10,7 @@
 #include "train/trainer.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <format>
@@ -42,6 +43,10 @@ constexpr int kOpacityResetInterval = 3000;
 constexpr int kCheckpointRecovery = 1000;
 constexpr std::uint64_t kBudgetReserve = 256ull * 1024 * 1024; // Sort scratch, staging, the driver's share
 constexpr float kShC0 = 0.28209479177387814f;
+// Coarse to fine: training starts at a quarter of the image size and is at
+// half size until kCoarseUntil[0] of the way through, full size after.
+constexpr std::size_t kCoarseLevels = 2;
+constexpr double kCoarseUntil[kCoarseLevels] = {0.35, 0.15};
 
 struct View {
   Camera camera;
@@ -246,6 +251,32 @@ void write_preview(const std::vector<float> &render, const View &view, const fs:
   write_image(out, path, 95);
 }
 
+// Half the size, each pixel the mean of four. Pixel x of the result covers
+// pixels 2x and 2x + 1, so the focal length and principal point just halve.
+View half_size(const View &view) {
+  View out;
+  out.name = view.name;
+  out.camera = view.camera;
+  out.camera.width = view.camera.width / 2;
+  out.camera.height = view.camera.height / 2;
+  out.camera.fx *= 0.5f;
+  out.camera.fy *= 0.5f;
+  out.camera.cx *= 0.5f;
+  out.camera.cy *= 0.5f;
+  const auto w = static_cast<std::size_t>(out.camera.width), h = static_cast<std::size_t>(out.camera.height);
+  const auto stride = static_cast<std::size_t>(view.camera.width) * 4;
+  out.rgba.resize(w * h * 4);
+  for (std::size_t y = 0; y < h; ++y) {
+    for (std::size_t x = 0; x < w; ++x) {
+      const std::uint8_t *p = view.rgba.data() + 2 * y * stride + 2 * x * 4;
+      for (std::size_t k = 0; k < 4; ++k) {
+        out.rgba[(y * w + x) * 4 + k] = static_cast<std::uint8_t>((p[k] + p[k + 4] + p[stride + k] + p[stride + k + 4] + 2) / 4);
+      }
+    }
+  }
+  return out;
+}
+
 } // namespace
 
 TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
@@ -265,6 +296,24 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
     ++number;
   }
   if (trainViews.empty()) throw std::runtime_error("no training views");
+
+  // Coarse to fine, as in DashGaussian: the first iterations only need the
+  // broad shapes, which smaller images show as well for far fewer pixels.
+  // smaller[l][i] is view i at 1 / 2^(l + 1) of its size.
+  std::array<std::vector<View>, kCoarseLevels> smaller;
+  if (!options.fullResolution) {
+    for (std::size_t level = 0; level < kCoarseLevels; ++level) {
+      for (const View &view : level == 0 ? trainViews : smaller[level - 1]) smaller[level].push_back(half_size(view));
+    }
+  }
+  const auto view_at = [&](std::size_t index, int iteration) -> const View & {
+    if (options.fullResolution) return trainViews[index];
+    const double progress = static_cast<double>(iteration - 1) / std::max(options.iterations - 1, 1);
+    for (std::size_t level = kCoarseLevels; level-- > 0;) {
+      if (progress < kCoarseUntil[level]) return smaller[level][index];
+    }
+    return trainViews[index];
+  };
 
   // The scene's size sets the position learning rate and the near plane.
   glm::dvec3 middle(0.0);
@@ -359,7 +408,7 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
       std::iota(order.begin(), order.end(), std::size_t{0});
       std::shuffle(order.begin(), order.end(), rng);
     }
-    const View &view = trainViews[order.back()];
+    const View &view = view_at(order.back(), iteration);
     order.pop_back();
     if (order.empty()) {
       order.resize(trainViews.size());
@@ -367,7 +416,7 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
       std::shuffle(order.begin(), order.end(), rng);
     }
     // The next view's image goes to the GPU while this one trains.
-    trainer.prefetch_target(trainViews[order.back()].rgba);
+    trainer.prefetch_target(view_at(order.back(), iteration + 1).rgba);
 
     const double progress = static_cast<double>(iteration - 1) / std::max(options.iterations - 1, 1);
     rates.position = static_cast<float>(positionStart * std::pow(positionEnd / positionStart, progress));

@@ -21,6 +21,7 @@ struct TrainOptions {
   int saveEvery = 5000; // 0 only saves at the end
 
   bool densify = true;
+  bool fullResolution = false; // Train at full size throughout, without the coarse start
   float gradientThreshold = 2e-4f;
   double vramBudgetGiB = 0.0; // 0: 90% of the GPU's free memory
   std::size_t maxGaussians = 0; // 0: as many as the budget allows

@@ -130,6 +130,10 @@ does automatic differentiation: each pass has a hand-derived counterpart.
 - **Overlap.** One submission per iteration (forward, loss, backward, Adam),
   and the next view's image is copied to staging memory on a worker thread
   while the GPU works on the current one.
+- **Coarse to fine.** The first 15% of iterations train on images at a
+  quarter of their size and the next 20% at half, made by averaging 2x2
+  pixels, as the early iterations only need the broad shapes
+  (`--full-resolution` turns this off).
 - **Optimiser.** Adam, with the learning rates of the 3DGS paper. It only
   updates Gaussians the current view sees: the rest keep their values and
   moments, which also spares most of its memory traffic.
