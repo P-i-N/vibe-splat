@@ -11,7 +11,7 @@ layout(local_size_x = 16) in;
 layout(std430, binding = 0) readonly buffer Splats { TrainSplat splats[]; };
 layout(std430, binding = 1) readonly buffer EntryValues { uint entryValues[]; };
 layout(std430, binding = 2) readonly buffer Ranges { uvec2 ranges[]; };
-layout(std430, binding = 3) writeonly buffer Image { vec4 image[]; };
+layout(std430, binding = 3) buffer Image { vec4 image[]; };
 
 layout(push_constant) uniform Push {
   uint width;
@@ -30,28 +30,28 @@ void main() {
   const uint x0 = tx * TILE_SIZE, y0 = ty * TILE_SIZE;
   const uint x1 = min(x0 + TILE_SIZE, pc.width), y1 = min(y0 + TILE_SIZE, pc.height);
 
-  vec4 local[TILE_SIZE * TILE_SIZE];
-  for (uint i = 0u; i < TILE_SIZE * TILE_SIZE; ++i) {
-    local[i] = vec4(pc.background.rgb, 0.0);
+  // Working in the buffer itself: a local array this size would live in scratch
+  // memory on many GPUs, which is several times slower. Tiles do not share pixels.
+  for (uint y = y0; y < y1; ++y) {
+    for (uint x = x0; x < x1; ++x) {
+      image[y * pc.width + x] = vec4(pc.background.rgb, 0.0);
+    }
   }
   const uvec2 range = ranges[tile];
   for (uint e = range.x; e < range.y; ++e) {
     const TrainSplat s = splats[entryValues[e]];
-    for (uint y = y0; y < y1; ++y) {
-      for (uint x = x0; x < x1; ++x) {
+    const uvec4 area = splat_pixels(s, uvec4(x0, y0, x1, y1));
+    for (uint y = area.y; y < area.w; ++y) {
+      for (uint x = area.x; x < area.z; ++x) {
         vec2 d;
         float power, alpha;
         if (!splat_at(s, x, y, d, power, alpha)) {
           continue;
         }
-        const uint at = (y - y0) * TILE_SIZE + (x - x0);
-        local[at] = vec4(mix(local[at].rgb, s.color.rgb, alpha), local[at].a + log(1.0 - alpha));
+        const uint at = y * pc.width + x;
+        const vec4 current = image[at];
+        image[at] = vec4(mix(current.rgb, s.color.rgb, alpha), current.a + log(1.0 - alpha));
       }
-    }
-  }
-  for (uint y = y0; y < y1; ++y) {
-    for (uint x = x0; x < x1; ++x) {
-      image[y * pc.width + x] = local[(y - y0) * TILE_SIZE + (x - x0)];
     }
   }
 }

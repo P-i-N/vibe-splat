@@ -7,4 +7,5 @@ layout(std430, binding = 5) buffer Gradients { float gradients[]; };
 
 void add_gradient(uint at, float value) { atomicAdd(gradients[at], value); }
 
+#define BEHIND_BINDING 6
 #include "train_backward.glsl"

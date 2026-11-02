@@ -87,14 +87,19 @@ sfm options (writes project/sparse/0 in COLMAP's format, plus preview.ply):
 
 train options (writes project/splat.ply and project/preview_*.png):
   -o, --out <file.ply>    Output file
-  --iterations <n>        Default 7000
+  --iterations <n>        Default 30000
   --lambda-ssim <x>       Weight of D-SSIM against L1 (default 0.2)
-  --sh-degree <0-3>       Default 0
+  --sh-degree <0-3>       Default 3
   --max-size <px>         Shrink training images to this (default: keep size)
   --max-views <n>         Use only the first n views
   --holdout <n>           Keep every nth view out of training, to measure quality
   --seed <n>              Default 1
   --report-every <n>      Default 500
+  --save-every <n>        Save the output this often, 0 only at the end (default 5000)
+  --no-densify            Keep the initial Gaussians, without adding or removing any
+  --gradient-threshold <x>  Lower adds more Gaussians (default 0.0002)
+  --vram-budget <GiB>     Default: 90% of the GPU's free memory
+  --max-gaussians <n>     Default: what the budget allows
 
 make-test-views options:
   --count <n>             Number of images (default 12)
@@ -339,8 +344,9 @@ int cmd_train(const GlobalOptions &opts) {
   for (auto &a : rest) {
     if (a == "-o") a = "--out";
   }
-  const splat::cli::Args args(rest, {});
-  args.allow_only({"out", "iterations", "lambda-ssim", "sh-degree", "max-size", "max-views", "holdout", "seed", "report-every"});
+  const splat::cli::Args args(rest, {"--no-densify"});
+  args.allow_only({"out", "iterations", "lambda-ssim", "sh-degree", "max-size", "max-views", "holdout", "seed", "report-every", "save-every",
+                   "no-densify", "gradient-threshold", "vram-budget", "max-gaussians"});
   if (args.positionals().size() != 1) {
     std::println(stderr, "Usage: splat train <project> [options]  (see splat --help)");
     return 2;
@@ -356,6 +362,11 @@ int cmd_train(const GlobalOptions &opts) {
   options.holdout = std::max(args.number("holdout", 0), 0);
   options.seed = args.number("seed", options.seed);
   options.reportEvery = std::max(args.number("report-every", options.reportEvery), 1);
+  options.saveEvery = std::max(args.number("save-every", options.saveEvery), 0);
+  options.densify = !args.has("no-densify");
+  options.gradientThreshold = args.number("gradient-threshold", options.gradientThreshold);
+  options.vramBudgetGiB = args.number("vram-budget", 0.0);
+  options.maxGaussians = args.number<std::size_t>("max-gaussians", 0);
   splat::vk::Context ctx(opts.context);
   std::println("Device: {}", ctx.info().name);
   splat::run_train(ctx, options);

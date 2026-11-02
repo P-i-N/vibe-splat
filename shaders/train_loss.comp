@@ -1,13 +1,12 @@
 #version 460
-// Loss, part 2: per-pixel adjoint dL/dImage for
+// Loss, part 4: per-pixel adjoint dL/dImage for
 //   L = (1 - lambda) mean|image - target| + lambda (1 - mean SSIM)
 // with means over pixels and channels.
-
 layout(local_size_x = 16) in;
 
 layout(std430, binding = 0) readonly buffer Image { vec4 image[]; };
 layout(std430, binding = 1) readonly buffer Target { uint target[]; };
-layout(std430, binding = 2) readonly buffer Fields { vec4 fields[]; };
+layout(std430, binding = 2) readonly buffer Moments { vec4 moments[]; };
 layout(std430, binding = 3) writeonly buffer Adjoint { vec4 adjoint[]; };
 layout(std430, binding = 4) writeonly buffer RowTotals { vec2 rowTotals[]; }; // x: SSIM, y: L1
 
@@ -30,23 +29,16 @@ void main() {
     const vec3 difference = x - y;
     rowSum += abs(difference.r) + abs(difference.g) + abs(difference.b);
 
-    vec3 result = (1.0 - pc.lambda) * sign(difference);
-    if (pc.lambda > 0.0) {
-      vec3 p = vec3(0.0), q = vec3(0.0), r = vec3(0.0);
-      const int y0 = max(int(row) - 5, 0), y1 = min(int(row) + 5, int(pc.height) - 1);
-      const int x0 = max(int(px) - 5, 0), x1 = min(int(px) + 5, int(pc.width) - 1);
-      for (int v = y0; v <= y1; ++v) {
-        const float wy = WEIGHTS[v - int(row) + 5];
-        for (int u = x0; u <= x1; ++u) {
-          const float w = wy * WEIGHTS[u - int(px) + 5];
-          const uint other = (uint(v) * pc.width + uint(u)) * 3u;
-          p += w * fields[other].rgb;
-          q += w * fields[other + 1u].rgb;
-          r += w * fields[other + 2u].rgb;
-        }
-      }
-      result -= pc.lambda * (p + 2.0 * x * q + y * r);
+    vec3 p = vec3(0.0), q = vec3(0.0), r = vec3(0.0);
+    const int y0 = max(int(row) - 5, 0), y1 = min(int(row) + 5, int(pc.height) - 1);
+    for (int v = y0; v <= y1; ++v) {
+      const float w = WEIGHTS[v - int(row) + 5];
+      const uint other = (uint(v) * pc.width + px) * 5u;
+      p += w * moments[other].rgb;
+      q += w * moments[other + 1u].rgb;
+      r += w * moments[other + 2u].rgb;
     }
+    const vec3 result = (1.0 - pc.lambda) * sign(difference) - pc.lambda * (p + 2.0 * x * q + y * r);
     adjoint[at] = vec4(result * perValue, 0.0);
   }
   rowTotals[row].y = rowSum;

@@ -68,6 +68,11 @@ public:
   [[nodiscard]] VkCommandPool command_pool() const noexcept { return commandPool_; }
   [[nodiscard]] const DeviceInfo &info() const noexcept { return info_; }
 
+  // Device-local memory this process may still allocate. Accurate if the driver
+  // has VK_EXT_memory_budget, which accounts for other programs; otherwise 80%
+  // of the largest heap, minus nothing, as there is no way to know more.
+  [[nodiscard]] std::uint64_t free_device_memory() const;
+
   // Records commands via `record`, submits them on the compute queue and
   // waits for completion. Fine for setup work and tests; the trainer will use
   // its own frame-based submission.
@@ -92,6 +97,7 @@ private:
   VkCommandPool commandPool_ = VK_NULL_HANDLE;
   VmaAllocator allocator_ = VK_NULL_HANDLE;
   DeviceInfo info_;
+  bool hasMemoryBudget_ = false;
 };
 
 } // namespace splat::vk
