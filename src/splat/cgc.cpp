@@ -1,4 +1,4 @@
-#include "splat/cgc.hpp"
+﻿#include "splat/cgc.hpp"
 
 #include "splat/lzma.hpp"
 
@@ -25,6 +25,10 @@ constexpr std::size_t kChunkSize = 256;
 constexpr float kShC0 = 0.28209479177387814f;
 constexpr float kRotationRange = 0.70710678f; // 1/sqrt(2): bound of the three smallest components
 constexpr std::array<int, 4> kShBits = {0, 5, 4, 4}; // per band
+// Log scales below this (0.12 mm) are stored as this. Training leaves many
+// splats with an axis only microns thin; it looks the same at any width below
+// a pixel, but would stretch the chunk's 8-bit scale range over its neighbours.
+constexpr float kMinLogScale = -9.f;
 
 float sigmoid(float x) { return 1.f / (1.f + std::exp(-x)); }
 
@@ -118,15 +122,14 @@ std::array<float, 4> unpack_rotation(std::uint32_t packed) {
   return q;
 }
 
-int choose_sh_degree(std::span<const float> sh, int degree, float opacityLogit, float threshold) {
-  const float alpha = sigmoid(opacityLogit);
+int choose_sh_degree(std::span<const float> sh, int degree, float threshold) {
   constexpr float kInvFourPi = 1.f / (4.f * std::numbers::pi_v<float>);
   for (int band = degree; band > 0; --band) {
     float worst = 0.f;
     for (int c = 0; c < 3; ++c) {
       float sum = 0.f;
       for (int k = band * band; k < (band + 1) * (band + 1); ++k) sum += sh[k * 3 + c] * sh[k * 3 + c];
-      worst = std::max(worst, std::sqrt(sum * kInvFourPi) * alpha);
+      worst = std::max(worst, std::sqrt(sum * kInvFourPi));
     }
     if (worst >= threshold) return band;
   }
@@ -204,11 +207,12 @@ CgcStats save_cgc(const GaussianCloud &cloud, const std::filesystem::path &path,
   if (n > UINT32_MAX) throw std::runtime_error(std::format("{}: too many Gaussians for CGC", path.string()));
   const std::size_t coeffs = static_cast<std::size_t>(cloud.shCoeffs());
   const auto sh_of = [&](std::size_t i) { return std::span(cloud.sh).subspan(i * coeffs * 3, coeffs * 3); };
+  const auto scale_of = [&](std::size_t i, int a) { return std::max(cloud.scales[i * 3 + a], kMinLogScale); };
 
   CgcStats stats;
   std::vector<std::uint8_t> degrees(n);
   for (std::size_t i = 0; i < n; ++i) {
-    degrees[i] = static_cast<std::uint8_t>(choose_sh_degree(sh_of(i), cloud.shDegree, cloud.opacities[i], options.shThreshold));
+    degrees[i] = static_cast<std::uint8_t>(choose_sh_degree(sh_of(i), cloud.shDegree, options.shThreshold));
     ++stats.degreeCounts[degrees[i]];
   }
 
@@ -278,8 +282,8 @@ CgcStats save_cgc(const GaussianCloud &cloud, const std::filesystem::path &path,
       for (int a = 0; a < 3; ++a) {
         t[a] = std::min(t[a], cloud.positions[i * 3 + a]);
         t[3 + a] = std::max(t[3 + a], cloud.positions[i * 3 + a]);
-        t[6 + a] = std::min(t[6 + a], cloud.scales[i * 3 + a]);
-        t[9 + a] = std::max(t[9 + a], cloud.scales[i * 3 + a]);
+        t[6 + a] = std::min(t[6 + a], scale_of(i, a));
+        t[9 + a] = std::max(t[9 + a], scale_of(i, a));
       }
     }
   }
@@ -301,7 +305,7 @@ CgcStats save_cgc(const GaussianCloud &cloud, const std::filesystem::path &path,
     rotations[j] = pack_rotation({cloud.rotations[i * 4], cloud.rotations[i * 4 + 1], cloud.rotations[i * 4 + 2],
                                   cloud.rotations[i * 4 + 3]});
     for (int a = 0; a < 3; ++a) {
-      scales[a][j] = static_cast<std::uint8_t>(quantize_unsigned(cloud.scales[i * 3 + a], t[6 + a], t[9 + a], 8));
+      scales[a][j] = static_cast<std::uint8_t>(quantize_unsigned(scale_of(i, a), t[6 + a], t[9 + a], 8));
     }
     for (int c = 0; c < 3; ++c) {
       const float colour = kShC0 * cloud.sh[i * coeffs * 3 + c] + 0.5f;

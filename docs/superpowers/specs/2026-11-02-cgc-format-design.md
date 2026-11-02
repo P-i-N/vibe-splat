@@ -116,7 +116,9 @@ Quantization rules, used by every field below:
    in w, x, y, z order, in bits 0–9, 10–19 and 20–29, each symmetric 10-bit
    over ±1/√2. Planes of 4 bytes.
 5. **Scales**, 3 × u8 per splat: log scale, unsigned 8-bit within the chunk's
-   log-scale range. Stored as three arrays (all x, all y, all z).
+   log-scale range. Stored as three arrays (all x, all y, all z). The encoder
+   raises any log scale below −9 (0.12 mm) to −9 before computing the range
+   and quantizing; the decoder needs no change.
 6. **Colour and opacity**, 4 × u8 per splat, stored as four arrays (R, G, B, A):
    - colour = `0.28209479 · sh0 + 0.5`, unsigned 8-bit within
      `colorMin..colorMax` for that channel. The encoder sets that range to the
@@ -136,18 +138,33 @@ Quantization rules, used by every field below:
 1. **Choose the SH degree per splat.** Real SH are orthonormal, so the RMS
    colour change a band ℓ adds over all view directions is
    `sqrt(Σ c² / 4π)` per channel, where the sum runs over that band's
-   coefficients. Multiply by `sigmoid(opacity)` so faint splats are judged by
-   what they actually contribute. Starting from the top band, drop band ℓ while
-   the largest of the three channel values is below a threshold, default
-   `1.5 / 255`, and every higher band has already been dropped. The threshold is
-   a field in a `CgcOptions` struct.
+   coefficients. Starting from the top band, drop band ℓ while the largest of
+   the three channel values is below a threshold, default `1.5 / 255`, and
+   every higher band has already been dropped. The threshold is a field in a
+   `CgcOptions` struct.
+
+   Opacity is not part of the test. The first version multiplied the RMS by
+   `sigmoid(opacity)`, on the idea that faint splats contribute little. On a
+   Brush export (1.7 M splats, median opacity 0.08) that stripped the SH from
+   two thirds of the splats, and because faint splats are stacked many deep,
+   their lost colour showed: renders of the CGC against the original PLY fell
+   from about 50 dB to 32 dB, with every other quantization stage above 44 dB.
+   Without the weighting the same scene keeps degree 3 on 97 % of its splats.
 2. **Morton order.** Quantize positions to 21 bits per axis within the scene's
    bounding box, interleave into a 63-bit code, and sort splats by it (stable
    sort).
 3. **Chunks.** Consecutive runs of 256 splats in Morton order. The last chunk
-   may be shorter. Compute the position and log-scale min/max per chunk. A
-   chunk whose box is flat on one axis (min = max) must decode without dividing
-   by zero.
+   may be shorter. Compute the position and log-scale min/max per chunk, with
+   log scales clamped to at least −9 first. A chunk whose box is flat on one
+   axis (min = max) must decode without dividing by zero.
+
+   The clamp exists because training leaves many splats with an axis only
+   microns thin: in the Brush export used for measuring, 41 % of splats have an
+   axis below 0.12 mm and 10 % below 6 µm, which stretched a typical chunk's
+   log-scale range to 11.5 units (nearly the scene-wide 18.9) and the 8-bit step
+   to 4.5 % of size per code. Clamping at −9 halves the step, and rendering the
+   original with the same clamp applied is indistinguishable from it (above
+   56 dB), while a clamp at −7 already changes close views visibly.
 4. **Quantize** each column as described above. For the SH
    range r of band ℓ, take the 99.9th percentile of |c| over all coefficients of
    splats that keep band ℓ, and clamp values outside it.
@@ -200,8 +217,8 @@ Decompress, check the magic, version and sizes, then rebuild a `GaussianCloud`:
     product above 0.999 in absolute value), including ones where w is not the
     largest component, and sign-flipped inputs.
   - SH degree choice: zero higher bands give degree 0; a strong band 3 keeps
-    degree 3; a strong band 1 with weak bands 2 and 3 gives degree 1; low
-    opacity lowers the degree.
+    degree 3; a strong band 1 with weak bands 2 and 3 gives degree 1; a faint
+    splat with a strong band keeps it.
   - Round trip on a synthetic cloud for SH degrees 0 to 3: same count; each
     attribute within its quantization step; decoded quaternions are unit
     length.
@@ -231,7 +248,8 @@ Decompress, check the magic, version and sizes, then rebuild a `GaussianCloud`:
 - Per-chunk ranges for position and scale; scene-wide range for colour.
 - 10-bit smallest-three rotations; 8-bit scale, colour and opacity; 5/4/4-bit
   SH; SH range at the 99.9th percentile.
-- SH degree threshold of 1.5/255 RMS, weighted by opacity.
+- SH degree threshold of 1.5/255 RMS, not weighted by opacity (see Encoding
+  steps for why the weighting was removed).
 - The `splat convert` command.
 - Checkpoints follow the output file's format, but are compressed with a fast
   LZMA preset (a `CgcOptions` field), so they don't stall training. Only the

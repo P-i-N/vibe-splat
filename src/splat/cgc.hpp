@@ -19,7 +19,9 @@ namespace splat {
 
 struct CgcOptions {
   // A band is dropped when it changes the colour by less than this (RMS over
-  // view directions, scaled by opacity, in 0..1 colour units).
+  // view directions, in 0..1 colour units). Opacity is deliberately not taken
+  // into account: scenes made of many faint, stacked splats still show their
+  // colour, and weighting by opacity stripped the SH from most of them.
   float shThreshold = 1.5f / 255.f;
   int lzmaLevel = 9; // liblzma preset 0..9
   bool lzmaExtreme = true;
@@ -53,10 +55,10 @@ namespace cgc_detail {
 [[nodiscard]] std::array<float, 4> unpack_rotation(std::uint32_t packed);
 
 // The lowest SH degree whose dropped bands each change the colour by less
-// than `threshold` (RMS over all view directions, scaled by opacity).
+// than `threshold` (RMS over all view directions, worst colour channel).
 // `sh` holds one Gaussian's 3 * (degree + 1)^2 coefficients in
 // GaussianCloud order.
-[[nodiscard]] int choose_sh_degree(std::span<const float> sh, int degree, float opacityLogit, float threshold);
+[[nodiscard]] int choose_sh_degree(std::span<const float> sh, int degree, float threshold);
 
 // Appends 32-bit values as four byte planes, least significant first.
 void append_planes(std::vector<std::byte> &out, std::span<const std::uint32_t> values);

@@ -114,12 +114,33 @@ TEST_CASE("SH degree drops bands that barely change the colour", "[cgc]") {
     }
     return sh;
   };
-  CHECK(choose_sh_degree(cloud_sh(0.f, 0.f, 0.f), 3, 5.f, threshold) == 0);
-  CHECK(choose_sh_degree(cloud_sh(0.f, 0.f, 0.5f), 3, 5.f, threshold) == 3);
-  CHECK(choose_sh_degree(cloud_sh(0.5f, 1e-4f, 1e-4f), 3, 5.f, threshold) == 1);
-  CHECK(choose_sh_degree(cloud_sh(0.05f, 0.f, 0.f), 3, 5.f, threshold) == 1);
-  CHECK(choose_sh_degree(cloud_sh(0.05f, 0.f, 0.f), 3, -8.f, threshold) == 0);
-  CHECK(choose_sh_degree(std::vector<float>{0.1f, 0.2f, 0.3f}, 0, 5.f, threshold) == 0);
+  CHECK(choose_sh_degree(cloud_sh(0.f, 0.f, 0.f), 3, threshold) == 0);
+  CHECK(choose_sh_degree(cloud_sh(0.f, 0.f, 0.5f), 3, threshold) == 3);
+  CHECK(choose_sh_degree(cloud_sh(0.5f, 1e-4f, 1e-4f), 3, threshold) == 1);
+  CHECK(choose_sh_degree(cloud_sh(0.05f, 0.f, 0.f), 3, threshold) == 1);
+  CHECK(choose_sh_degree(cloud_sh(0.002f, 0.f, 0.f), 3, threshold) == 0);
+  CHECK(choose_sh_degree(std::vector<float>{0.1f, 0.2f, 0.3f}, 0, threshold) == 0);
+}
+
+TEST_CASE("Faint splats keep their SH bands", "[cgc]") {
+  // Scenes trained with many low-opacity splats stacked on top of each other
+  // (a Brush export has a median opacity around 0.08) still show the colour
+  // of those splats, so opacity must not lower the degree: with it, two
+  // thirds of such a scene lost all view dependence and renders fell from
+  // about 50 dB to 32 dB against the original.
+  GaussianCloud cloud;
+  cloud.resize(1024, 3);
+  for (std::size_t i = 0; i < cloud.size(); ++i) {
+    cloud.positions[i * 3] = static_cast<float>(i % 32) * 0.1f;
+    cloud.positions[i * 3 + 1] = static_cast<float>(i / 32) * 0.1f;
+    cloud.rotations[i * 4] = 1.f;
+    for (int a = 0; a < 3; ++a) cloud.scales[i * 3 + a] = std::log(0.05f);
+    cloud.opacities[i] = -2.5f; // sigmoid(-2.5) ~= 0.076
+    for (int c = 0; c < 3; ++c) cloud.sh[(i * 16 + 3) * 3 + c] = 0.2f; // a strong band 1
+  }
+  const CgcStats stats = save_cgc(cloud, "splat_cgc_faint.cgc");
+  std::filesystem::remove("splat_cgc_faint.cgc");
+  CHECK(stats.degreeCounts[1] == cloud.size());
 }
 
 TEST_CASE("Byte planes split 32-bit values by byte", "[cgc]") {
@@ -210,8 +231,7 @@ std::array<int, 3> check_round_trip(const GaussianCloud &original, const Gaussia
       const float got = kShC0 * loaded.sh[j * loadedCoeffs * 3 + c] + 0.5f;
       if (std::abs(want - got) > 0.004f) ++colourMisses[c];
     }
-    const int kept = cgc_detail::choose_sh_degree(std::span(&original.sh[i * coeffs * 3], coeffs * 3), degree,
-                                                  original.opacities[i], 1.5f / 255.f);
+    const int kept = cgc_detail::choose_sh_degree(std::span(&original.sh[i * coeffs * 3], coeffs * 3), degree, 1.5f / 255.f);
     for (int band = 1; band <= degree; ++band) {
       const float tolerance = band == 1 ? 0.3f / 15.f : 0.3f / 7.f;
       for (std::size_t k = static_cast<std::size_t>(band * band); k < static_cast<std::size_t>((band + 1) * (band + 1)); ++k) {
@@ -292,6 +312,24 @@ TEST_CASE("CGC handles small, chunk-boundary and degenerate clouds", "[cgc]") {
     CHECK(loaded.positions[i * 3 + 1] == 2.f);
     CHECK(loaded.positions[i * 3 + 2] == 3.f);
     CHECK(loaded.scales[i * 3] == -2.f);
+  }
+}
+
+TEST_CASE("A degenerate thin axis does not coarsen its chunk's scales", "[cgc]") {
+  // Trained scenes leave many splats with an axis a few microns thin. Such an
+  // axis is invisible whether it is 6 um or 0.1 mm, but left alone it would
+  // stretch the chunk's 8-bit log-scale range over everyone else.
+  GaussianCloud cloud = random_cloud(200, 0, 71);
+  for (std::size_t i = 0; i < cloud.size(); ++i) {
+    cloud.positions[i * 3] = cloud.positions[i * 3 + 1] = cloud.positions[i * 3 + 2] = 0.f; // keep the order
+    cloud.scales[i * 3] = -4.f + 2.f * static_cast<float>(i) / static_cast<float>(cloud.size());
+  }
+  cloud.scales[0] = -30.f;
+  const GaussianCloud loaded = round_trip(cloud, "splat_cgc_thin.cgc");
+  REQUIRE(loaded.size() == cloud.size());
+  CHECK(std::abs(loaded.scales[0] - -9.f) <= 0.02f);
+  for (std::size_t i = 1; i < loaded.size(); ++i) {
+    CHECK(std::abs(loaded.scales[i * 3] - cloud.scales[i * 3]) <= 0.02f);
   }
 }
 
