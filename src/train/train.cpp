@@ -484,8 +484,7 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
       std::iota(order.begin(), order.end(), std::size_t{0});
       std::shuffle(order.begin(), order.end(), rng);
     }
-    // The next view's image goes to the GPU while this one trains.
-    trainer.prefetch_target(view_at(order.back(), iteration + 1).rgba);
+    const View &nextView = view_at(order.back(), iteration + 1);
 
     const double progress = static_cast<double>(iteration - 1) / std::max(options.iterations - 1, 1);
     // With the adaptive schedule, held while the image is still growing.
@@ -499,7 +498,7 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
       const double rest = static_cast<double>(iteration - densifyUntil) / std::max(options.iterations - densifyUntil, 1);
       rates.trustRegion = static_cast<float>(kTrustStart * std::pow(kTrustEnd / kTrustStart, rest));
     }
-    const StepStats stats = fitting([&] { return trainer.step(view.camera, view.rgba, rates); });
+    const StepStats stats = fitting([&] { return trainer.step(view.camera, view.rgba, rates, nextView.rgba); });
     if (rates.trustRegion > 0.f && (iteration - densifyUntil) % kCurvatureInterval == 1) trainer.update_curvature();
     if (options.exposure) exposures[viewIndex].step(stats.exposureGradient);
     if (options.refinePoses && progress >= kPoseStart) {

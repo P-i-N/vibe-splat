@@ -107,12 +107,12 @@ public:
   // One Adam step from the current gradients.
   void apply_gradients(const LearningRates &rates);
 
-  // Both of the above.
-  StepStats step(const Camera &camera, std::span<const std::uint8_t> target, const LearningRates &rates);
+  // Both of the above. A nextTarget, the image of the step after this one, is
+  // copied into staging memory on a worker thread while the GPU works on this one.
+  StepStats step(const Camera &camera, std::span<const std::uint8_t> target, const LearningRates &rates,
+                 std::span<const std::uint8_t> nextTarget = {});
 
-  // Copies the next iteration's target into staging memory on a worker thread,
-  // so that the copy overlaps the GPU's work on this iteration. A following
-  // step() or compute_gradients() with the same span uses it.
+  // Starts that copy on its own. A later step() or compute_gradients() with the same span uses it.
   void prefetch_target(std::span<const std::uint8_t> target);
 
   [[nodiscard]] GaussianCloud cloud() const;
@@ -177,7 +177,8 @@ private:
   void record_backward_from_adjoint(VkCommandBuffer cmd);
   void record_adam(VkCommandBuffer cmd, const LearningRates &rates);
   // Forward, loss, backward and, when rates are given, the Adam step, in one submission.
-  StepStats run(const Camera &camera, std::span<const std::uint8_t> target, const LearningRates *rates);
+  StepStats run(const Camera &camera, std::span<const std::uint8_t> target, const LearningRates *rates,
+                std::span<const std::uint8_t> nextTarget = {});
 
   vk::Context &ctx_;
   TrainerOptions options_;

@@ -503,7 +503,7 @@ void Trainer::prefetch_target(std::span<const std::uint8_t> target) {
   prefetchChanged_.notify_all();
 }
 
-StepStats Trainer::run(const Camera &camera, std::span<const std::uint8_t> target, const LearningRates *rates) {
+StepStats Trainer::run(const Camera &camera, std::span<const std::uint8_t> target, const LearningRates *rates, std::span<const std::uint8_t> nextTarget) {
   upload_camera(camera);
   const std::size_t bytes = static_cast<std::size_t>(width_) * height_ * 4;
   if (target.size() != bytes) throw std::runtime_error("the target image does not match the camera");
@@ -513,10 +513,14 @@ StepStats Trainer::run(const Camera &camera, std::span<const std::uint8_t> targe
     std::swap(targetStaging_, targetNext_);
     prefetched_ = nullptr;
   } else {
-    // A prefetch of some other image carries on in the background.
+    // A prefetch of some other image carries on in the background. The staging
+    // buffer may be one that prefetch sized for a smaller image, and the image
+    // buffers, which decide on reallocating, may be larger already.
+    if (targetStaging_->size() < bytes) targetStaging_ = std::make_unique<Buffer>(ctx_, bytes, kStorage, MemoryUsage::Upload);
     std::memcpy(targetStaging_->mapped().data(), target.data(), bytes);
   }
   targetStaging_->flush();
+  if (!nextTarget.empty()) prefetch_target(nextTarget);
   if (fixedPoint_) {
     // Per-pixel derivatives carry a factor 1 / (3 pixels), which this undoes.
     // The rest leaves a resolution of 1/64 and room for the sums.
@@ -638,9 +642,9 @@ void Trainer::apply_gradients(const LearningRates &rates) {
   finish_timing();
 }
 
-StepStats Trainer::step(const Camera &camera, std::span<const std::uint8_t> target, const LearningRates &rates) {
+StepStats Trainer::step(const Camera &camera, std::span<const std::uint8_t> target, const LearningRates &rates, std::span<const std::uint8_t> nextTarget) {
   // One submission for the whole iteration, rather than one for the gradients and one for the step.
-  return run(camera, target, &rates);
+  return run(camera, target, &rates, nextTarget);
 }
 
 void Trainer::set_active_sh_degree(int degree) { activeShDegree_ = std::clamp(degree, 0, shDegree_); }
