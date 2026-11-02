@@ -9,6 +9,9 @@ const uint INVISIBLE = 0xFFFFFFFFu;
 // A pixel takes no more splats once its transmittance would fall below
 // 1e-4, as in the 3DGS paper. Compared as logarithms: this is log(1e-4).
 const float LOG_MIN_TRANSMITTANCE = -9.210340372;
+// Below these a Gaussian is degenerate and is not drawn, as in Faster-GS.
+const float MIN_QUATERNION_LENGTH = 1e-4;
+const float MIN_CONIC_DETERMINANT = 1e-6;
 const uint RAW_PER_SPLAT = 10u; // Sums per splat from the backward pass, listed in train_backward.glsl
 
 struct TrainSplat {

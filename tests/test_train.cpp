@@ -3,6 +3,7 @@
 #include "render/splat_renderer.hpp"
 #include "sfm/test_views.hpp"
 #include "test_support.hpp"
+#include "train/evaluate.hpp"
 #include "train/reference.hpp"
 #include "train/trainer.hpp"
 
@@ -366,4 +367,70 @@ TEST_CASE("Training overfits a single rendered view", "[train][vulkan]") {
   CHECK(trained.size() == cloud.size());
   CHECK(trained.positions != cloud.positions);
   CHECK(trained.sh != cloud.sh);
+}
+
+TEST_CASE("Fitting an exposure undoes a colour transform, on the half it did not see", "[train]") {
+  constexpr int width = 32, height = 16;
+  const auto target = noise_target(width, height, 31);
+  std::vector<float> render(static_cast<std::size_t>(width) * height * 4);
+  for (std::size_t i = 0; i < render.size() / 4; ++i) {
+    // The photo is 1.25 x render + 0.1, per channel with another gain.
+    for (std::size_t c = 0; c < 3; ++c) render[i * 4 + c] = (target[i * 4 + c] / 255.f - 0.1f) / (1.25f + 0.1f * static_cast<float>(c));
+  }
+  CHECK(psnr_of(render, target) < 30.0);
+  const Exposure fitted = fit_exposure(render, target, width, height, 0, width / 2);
+  CHECK_THAT(fitted[0], WithinAbs(1.25, 1e-2));
+  CHECK_THAT(fitted[5], WithinAbs(1.35, 1e-2));
+  CHECK_THAT(fitted[10], WithinAbs(1.45, 1e-2));
+  CHECK_THAT(fitted[3], WithinAbs(0.1, 1e-2));
+  CHECK(cross_fitted_psnr(render, target, width, height) > 45.0);
+
+  // A neutral render gets a neutral fit, and applying a fit gives what it scored.
+  std::vector<float> exposed = render;
+  apply_exposure(exposed, fitted);
+  CHECK(psnr_of(exposed, target) > 45.0);
+}
+
+TEST_CASE("Degenerate Gaussians are not drawn and do not spread", "[train][vulkan]") {
+  vk::Context *ctx = test::context();
+  if (ctx == nullptr) SKIP("No usable Vulkan device");
+  const Camera camera = test_camera(72, 56);
+  const auto target = noise_target(camera.width, camera.height, 37);
+  GaussianCloud healthy = random_cloud(40, 1, 41);
+  Trainer clean(*ctx, healthy);
+  const std::vector<float> expected = clean.render(camera);
+
+  GaussianCloud cloud = healthy;
+  const std::size_t base = cloud.size();
+  cloud.resize(base + 5, cloud.shDegree);
+  const auto floats = static_cast<std::size_t>(3 * cloud.shCoeffs());
+  for (std::size_t i = 0; i < base; ++i) {
+    std::copy_n(healthy.positions.data() + i * 3, 3, cloud.positions.data() + i * 3);
+    std::copy_n(healthy.scales.data() + i * 3, 3, cloud.scales.data() + i * 3);
+    std::copy_n(healthy.rotations.data() + i * 4, 4, cloud.rotations.data() + i * 4);
+    cloud.opacities[i] = healthy.opacities[i];
+    std::copy_n(healthy.sh.data() + i * floats, floats, cloud.sh.data() + i * floats);
+  }
+  for (std::size_t i = base; i < base + 5; ++i) {
+    cloud.positions[i * 3 + 2] = 4.f;
+    for (std::size_t a = 0; a < 3; ++a) cloud.scales[i * 3 + a] = std::log(0.3f);
+    cloud.rotations[i * 4] = 1.f;
+    cloud.opacities[i] = 2.f;
+  }
+  const float nan = std::nanf("");
+  cloud.positions[base * 3] = nan;
+  cloud.scales[(base + 1) * 3] = 200.f; // exp() overflows, and inf * 0 is NaN
+  cloud.rotations[(base + 2) * 4] = 1e-5f; // Too short to normalise
+  cloud.opacities[base + 3] = nan;
+  cloud.sh[(base + 4) * floats] = nan;
+
+  Trainer trainer(*ctx, cloud);
+  const std::vector<float> rendered = trainer.render(camera);
+  REQUIRE(rendered.size() == expected.size());
+  for (std::size_t i = 0; i < rendered.size(); ++i) REQUIRE(rendered[i] == expected[i]);
+  const StepStats stats = trainer.compute_gradients(camera, target);
+  CHECK(std::isfinite(stats.loss));
+  const auto gradients = trainer.gradients();
+  for (const float g : gradients.positions) REQUIRE(std::isfinite(g));
+  for (const float g : gradients.sh) REQUIRE(std::isfinite(g));
 }

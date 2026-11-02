@@ -116,13 +116,16 @@ std::vector<Splat> prepare(const GaussianCloud &cloud, const Camera &cam, const 
   for (std::size_t i = 0; i < cloud.size(); ++i) {
     const dvec3 p = position_of(cloud, i);
     const dvec3 t = dvec3(view * glm::dvec4(p, 1.0));
-    if (t.z < options.nearPlane) continue;
+    if (!(t.z >= options.nearPlane)) continue;
     const double opacity = 1.0 / (1.0 + std::exp(-static_cast<double>(cloud.opacities[i])));
-    if (opacity < 1.0 / 255.0) continue;
+    if (!(opacity >= 1.0 / 255.0)) continue;
+    double quatLength = 0.0;
+    const dvec4 quat = quat_of(cloud, i, &quatLength);
+    if (!(quatLength >= 1e-4)) continue;
 
     const dvec3 s(std::exp(static_cast<double>(cloud.scales[i * 3])), std::exp(static_cast<double>(cloud.scales[i * 3 + 1])),
                   std::exp(static_cast<double>(cloud.scales[i * 3 + 2])));
-    const dmat3 M = quat_to_mat(quat_of(cloud, i)) * dmat3(s.x, 0, 0, 0, s.y, 0, 0, 0, s.z);
+    const dmat3 M = quat_to_mat(quat) * dmat3(s.x, 0, 0, 0, s.y, 0, 0, 0, s.z);
     const dmat3 sigma = M * glm::transpose(M);
 
     const double tx = std::clamp(t.x / t.z, -limX, limX) * t.z, ty = std::clamp(t.y / t.z, -limY, limY) * t.z;
@@ -131,7 +134,7 @@ std::vector<Splat> prepare(const GaussianCloud &cloud, const Camera &cam, const 
     const dmat3 cov = T * sigma * glm::transpose(T);
     const double a = cov[0][0] + 0.3, b = cov[0][1], c = cov[1][1] + 0.3;
     const double det = a * c - b * b;
-    if (det <= 0.0) continue;
+    if (!(det > 1e-6)) continue;
     const double mid = 0.5 * (a + c);
     const double lambda = mid + std::sqrt(std::max(0.1, mid * mid - det));
 
@@ -153,6 +156,7 @@ std::vector<Splat> prepare(const GaussianCloud &cloud, const Camera &cam, const 
       const std::size_t at = (i * coefficients + k) * 3;
       color += basis[k] * dvec3(cloud.sh[at], cloud.sh[at + 1], cloud.sh[at + 2]);
     }
+    if (!(std::abs(color.r) < 1e30 && std::abs(color.g) < 1e30 && std::abs(color.b) < 1e30)) continue;
     out.color = glm::max(color, dvec3(0.0));
     splats.push_back(out);
   }

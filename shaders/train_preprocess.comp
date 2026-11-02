@@ -28,17 +28,22 @@ void main() {
 
   const vec3 p = vec3(positions[i * 3u], positions[i * 3u + 1u], positions[i * 3u + 2u]);
   const vec3 t = (cam.view * vec4(p, 1.0)).xyz;
-  if (t.z < cam.position.w) {
+  // Written so that NaN fails: one such Gaussian would blacken every pixel it
+  // touches, and through the loss reach all the Gaussians there.
+  if (!(t.z >= cam.position.w)) {
     return;
   }
   const float opacity = 1.0 / (1.0 + exp(-opacities[i]));
-  if (opacity < 1.0 / 255.0) {
+  if (!(opacity >= 1.0 / 255.0)) {
     return;
   }
 
   vec4 q = vec4(rotations[i * 4u], rotations[i * 4u + 1u], rotations[i * 4u + 2u], rotations[i * 4u + 3u]);
   const float len = length(q);
-  q = len > 0.0 ? q / len : vec4(1.0, 0.0, 0.0, 0.0);
+  if (!(len >= MIN_QUATERNION_LENGTH)) {
+    return;
+  }
+  q /= len;
   const vec3 s = exp(vec3(scales[i * 3u], scales[i * 3u + 1u], scales[i * 3u + 2u]));
   const mat3 M = train_quat_to_mat(q) * mat3(s.x, 0.0, 0.0, 0.0, s.y, 0.0, 0.0, 0.0, s.z);
   const mat3 sigma = M * transpose(M);
@@ -57,7 +62,7 @@ void main() {
   const float b = cov[0][1];
   const float c = cov[1][1] + 0.3;
   const float det = a * c - b * b;
-  if (det <= 0.0) {
+  if (!(det > MIN_CONIC_DETERMINANT)) {
     return;
   }
   const float mid = 0.5 * (a + c);
@@ -78,6 +83,10 @@ void main() {
   vec3 color = vec3(0.5);
   for (uint k = 0u; k < coefficients; ++k) {
     color += basis[k] * vec3(sh[base + k * 3u], sh[base + k * 3u + 1u], sh[base + k * 3u + 2u]);
+  }
+
+  if (!all(lessThan(abs(color), vec3(1e30)))) {
+    return;
   }
 
   // A pixel counts only if opacity * exp(power) >= 1/255, which is an ellipse.

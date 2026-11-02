@@ -41,6 +41,7 @@ struct TrainReport {
   float lastLoss = 0.f;
   double trainPsnr = 0.0;
   double holdoutPsnr = 0.0; // 0 if nothing was held out
+  double holdoutFittedPsnr = 0.0; // With each view's exposure fitted, see cross_fitted_psnr()
   double iterationsPerSecond = 0.0;
   std::size_t gaussians = 0;
   std::uint64_t peakGpuBytes = 0;

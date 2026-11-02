@@ -7,6 +7,7 @@
 #include "splat/cgc.hpp"
 #include "splat/gaussian_cloud.hpp"
 #include "train/densify.hpp"
+#include "train/evaluate.hpp"
 #include "train/trainer.hpp"
 
 #include <algorithm>
@@ -218,19 +219,6 @@ GaussianCloud initial_cloud(const ColmapModel &model, int shDegree) {
     cloud.opacities[i] = logitOpacity;
   }
   return cloud;
-}
-
-double psnr_of(const std::vector<float> &render, const std::vector<std::uint8_t> &target) {
-  double sum = 0.0;
-  const std::size_t pixels = target.size() / 4;
-  for (std::size_t i = 0; i < pixels; ++i) {
-    for (std::size_t c = 0; c < 3; ++c) {
-      const double d = std::clamp(static_cast<double>(render[i * 4 + c]), 0.0, 1.0) - target[i * 4 + c] / 255.0;
-      sum += d * d;
-    }
-  }
-  const double mse = sum / (3.0 * static_cast<double>(pixels));
-  return mse > 0.0 ? -10.0 * std::log10(mse) : 100.0;
 }
 
 void write_preview(const std::vector<float> &render, const View &view, const fs::path &path) {
@@ -536,13 +524,20 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
   report.iterationsPerSecond = options.iterations / seconds;
 
   trainer.set_active_sh_degree(options.shDegree);
-  const auto mean_psnr = [&](const std::vector<View> &views) {
-    double sum = 0.0;
-    for (const View &view : views) sum += psnr_of(fitting([&] { return trainer.render(view.camera); }), view.rgba);
-    return views.empty() ? 0.0 : sum / static_cast<double>(views.size());
-  };
-  report.trainPsnr = mean_psnr(trainViews);
-  report.holdoutPsnr = mean_psnr(holdoutViews);
+  // Training views through the exposures they learned, or they would be
+  // compared with photos the Gaussians were never fitted to.
+  for (std::size_t i = 0; i < trainViews.size(); ++i) {
+    std::vector<float> rendered = fitting([&] { return trainer.render(trainViews[i].camera); });
+    apply_exposure(rendered, exposures[i].value);
+    report.trainPsnr += psnr_of(rendered, trainViews[i].rgba) / static_cast<double>(trainViews.size());
+  }
+  // A held-out view has no learned exposure, so it is scored both as it is and
+  // with one fitted to its own photo. Only the second is fair to --exposure.
+  for (const View &view : holdoutViews) {
+    const std::vector<float> rendered = fitting([&] { return trainer.render(view.camera); });
+    report.holdoutPsnr += psnr_of(rendered, view.rgba) / static_cast<double>(holdoutViews.size());
+    report.holdoutFittedPsnr += cross_fitted_psnr(rendered, view.rgba, view.camera.width, view.camera.height) / static_cast<double>(holdoutViews.size());
+  }
 
   trainer.set_active_sh_degree(options.shDegree);
   report.gaussians = trainer.gaussian_count();
@@ -550,7 +545,8 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
   write_preview(trainer.render(trainViews[0].camera), trainViews[0], options.project / "preview_train.png");
   if (!holdoutViews.empty()) {
     write_preview(trainer.render(holdoutViews[0].camera), holdoutViews[0], options.project / "preview_holdout.png");
-    std::println("PSNR {:.2f} dB on training views, {:.2f} dB on held-out views", report.trainPsnr, report.holdoutPsnr);
+    std::println("PSNR {:.2f} dB on training views, {:.2f} dB on held-out views ({:.2f} dB with exposure fitted to each)", report.trainPsnr,
+                 report.holdoutPsnr, report.holdoutFittedPsnr);
   } else {
     std::println("PSNR {:.2f} dB on training views", report.trainPsnr);
   }
