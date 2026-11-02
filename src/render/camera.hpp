@@ -30,6 +30,9 @@ struct OrbitCamera {
   [[nodiscard]] Camera camera(int width, int height) const;
 
   void orbit(float dYawDeg, float dPitchDeg);
+  // Turns the view in place: the eye stays put and the target swings around
+  // it. Positive yaw turns left, positive pitch looks down.
+  void look(float dYawDeg, float dPitchDeg);
   void zoom(float factor); // < 1 moves closer
   // Moves the target in the camera's screen plane / forward, in world units
   // scaled by distance.

@@ -286,7 +286,7 @@ int run_viewer(const GaussianCloud &cloud, const ViewerOptions &options) {
           const float h = static_cast<float>(std::max(1u, swapchain.extent().height));
           const float panScale = 2.f * std::tan(glm::radians(orbit.fovDeg * 0.5f)) / h;
           if (e.motion.state & SDL_BUTTON_LMASK) {
-            orbit.orbit(-e.motion.xrel * 0.3f, e.motion.yrel * 0.3f);
+            orbit.look(-e.motion.xrel * 0.2f, e.motion.yrel * 0.2f);
           } else if (e.motion.state & (SDL_BUTTON_RMASK | SDL_BUTTON_MMASK)) {
             orbit.pan(-e.motion.xrel * panScale, -e.motion.yrel * panScale);
           }

@@ -125,7 +125,7 @@ view options:
   --up <axis>             As for render
 
 Viewer controls:
-  left mouse drag  orbit        right/middle drag  pan       wheel  zoom
+  left mouse drag  look         right/middle drag  pan       wheel  zoom
   W A S D / Q E    move         R  reset view                Esc    quit
   gamepad: left stick move, right stick orbit, triggers zoom, A reset
 

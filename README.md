@@ -13,7 +13,7 @@ from EXIF or given by hand. Output is a standard 3D Gaussian splatting `.ply`.
 Milestones M1 (viewer), M2 (ingest), M3 (camera poses), M4 (trainer core) and M5 (full training) are done:
 
 - `splat view scene.ply` opens a window and renders a 3DGS `.ply` in real time.
-  Controls: left-drag orbits, right- or middle-drag pans, the wheel zooms,
+  Controls: left-drag looks around, right- or middle-drag pans, the wheel zooms,
   W/A/S/D/Q/E move, R resets the view and Esc quits. On a gamepad (Steam
   Machine controller, Xbox or PlayStation pads), the left stick moves, the
   right stick orbits, the triggers zoom and A resets the view.

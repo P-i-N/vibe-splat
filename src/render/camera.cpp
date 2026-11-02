@@ -66,6 +66,13 @@ void OrbitCamera::orbit(float dYawDeg, float dPitchDeg) {
   pitchDeg = std::clamp(pitchDeg + dPitchDeg, -89.f, 89.f);
 }
 
+void OrbitCamera::look(float dYawDeg, float dPitchDeg) {
+  const glm::vec3 eyePos = eye();
+  orbit(dYawDeg, dPitchDeg);
+  // eye() is target + dir * distance, so moving the target back keeps the eye.
+  target += eyePos - eye();
+}
+
 void OrbitCamera::zoom(float factor) { distance = std::clamp(distance * factor, 1e-3f, 1e6f); }
 
 void OrbitCamera::pan(float dxScreen, float dyScreen) {
