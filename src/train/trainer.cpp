@@ -599,7 +599,7 @@ std::uint64_t Trainer::gpu_bytes() const {
 
 GaussianCloud Trainer::cloud() const {
   GaussianCloud out;
-  out.resize(count_, shDegree_);
+  out.shDegree = shDegree_;
   out.positions = groups_[0]->values->download_as<float>(ctx_);
   out.scales = groups_[1]->values->download_as<float>(ctx_);
   out.rotations = groups_[2]->values->download_as<float>(ctx_);

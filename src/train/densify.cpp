@@ -145,6 +145,15 @@ DensifyResult densify_cloud(const GaussianCloud &cloud, const DensifyStats &stat
 
   GaussianCloud &out = result.cloud;
   out.shDegree = cloud.shDegree;
+  // Reserved up front: growing the arrays one Gaussian at a time copies them over and over.
+  // A clone adds one, and a split replaces one with two.
+  const std::size_t total = kept + result.cloned + result.split;
+  out.positions.reserve(total * 3);
+  out.scales.reserve(total * 3);
+  out.rotations.reserve(total * 4);
+  out.opacities.reserve(total);
+  out.sh.reserve(total * static_cast<std::size_t>(3 * cloud.shCoeffs()));
+  result.source.reserve(total);
   // Survivors first, in their order; then what is new.
   for (std::size_t i = 0; i < n; ++i) {
     if (actions[i] == Action::Keep || actions[i] == Action::Clone) {
