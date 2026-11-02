@@ -25,6 +25,12 @@ add_test(NAME cli_make_test_scene COMMAND splat make-test-scene "${CMAKE_CURRENT
 add_test(NAME cli_render COMMAND splat render "${CMAKE_CURRENT_BINARY_DIR}/cli_scene.ply"
          -o "${CMAKE_CURRENT_BINARY_DIR}/cli_render.png" --width 320 --height 180)
 set_tests_properties(cli_render PROPERTIES DEPENDS cli_make_test_scene)
+# Compress the test scene to CGC and render the result.
+add_test(NAME cli_convert_cgc COMMAND splat convert "${CMAKE_CURRENT_BINARY_DIR}/cli_scene.ply" "${CMAKE_CURRENT_BINARY_DIR}/cli_scene.cgc")
+set_tests_properties(cli_convert_cgc PROPERTIES DEPENDS cli_make_test_scene)
+add_test(NAME cli_render_cgc COMMAND splat render "${CMAKE_CURRENT_BINARY_DIR}/cli_scene.cgc"
+         -o "${CMAKE_CURRENT_BINARY_DIR}/cli_render_cgc.png" --width 320 --height 180)
+set_tests_properties(cli_render_cgc PROPERTIES DEPENDS cli_convert_cgc)
 # Ingesting the image cli_render wrote checks the whole command line path.
 add_test(NAME cli_ingest COMMAND splat ingest "${CMAKE_CURRENT_BINARY_DIR}/cli_render.png"
          -o "${CMAKE_CURRENT_BINARY_DIR}/cli_project" --force --focal-35mm 28)

@@ -3,6 +3,7 @@
 #include "ingest/image.hpp"
 #include "render/camera.hpp"
 #include "sfm/colmap_model.hpp"
+#include "splat/cgc.hpp"
 #include "splat/gaussian_cloud.hpp"
 #include "train/densify.hpp"
 #include "train/trainer.hpp"
@@ -390,7 +391,8 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
       checkpointDue = false;
       // Through a temporary file, so that a crash never leaves half a checkpoint.
       const fs::path temporary = fs::path(options.out).concat(".tmp");
-      save_ply(trainer.cloud(), temporary);
+      // A fast LZMA preset, so that CGC checkpoints don't hold up training.
+      save_cloud(trainer.cloud(), temporary, cloud_format(options.out), CgcOptions{.lzmaLevel = 1, .lzmaExtreme = false});
       fs::rename(temporary, options.out);
       std::println("  iteration {:6}: checkpoint saved to {}", iteration, options.out.string());
     }
@@ -409,7 +411,7 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
 
   trainer.set_active_sh_degree(options.shDegree);
   report.gaussians = trainer.gaussian_count();
-  save_ply(trainer.cloud(), options.out);
+  save_cloud(trainer.cloud(), options.out);
   write_preview(trainer.render(trainViews[0].camera), trainViews[0], options.project / "preview_train.png");
   if (!holdoutViews.empty()) {
     write_preview(trainer.render(holdoutViews[0].camera), holdoutViews[0], options.project / "preview_holdout.png");

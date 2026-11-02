@@ -54,6 +54,23 @@ struct Bounds {
 // other splat viewers.
 void save_ply(const GaussianCloud &cloud, const std::filesystem::path &path);
 
+struct CgcOptions;
+
+// Splat file formats, chosen by extension: .cgc (any case) is the compressed
+// CGC format (see cgc.hpp), anything else is .ply.
+enum class CloudFormat { Ply, Cgc };
+
+[[nodiscard]] CloudFormat cloud_format(const std::filesystem::path &path);
+
+// Saves or loads in the format matching the path's extension.
+void save_cloud(const GaussianCloud &cloud, const std::filesystem::path &path);
+[[nodiscard]] GaussianCloud load_cloud(const std::filesystem::path &path);
+
+// Saves in an explicit format, for paths whose extension doesn't say (such as
+// a temporary file). `options` only applies to CGC.
+void save_cloud(const GaussianCloud &cloud, const std::filesystem::path &path, CloudFormat format);
+void save_cloud(const GaussianCloud &cloud, const std::filesystem::path &path, CloudFormat format, const CgcOptions &options);
+
 // A small synthetic scene for demos and tests: a ring of coloured spheres on a
 // checkered floor. About `count` Gaussians, SH degree 1.
 [[nodiscard]] GaussianCloud make_test_scene(std::size_t count = 200'000, std::uint32_t seed = 1);

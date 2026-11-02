@@ -386,3 +386,33 @@ TEST_CASE("A CGC scene renders like the original", "[vulkan][cgc]") {
   INFO("PSNR " << value << " dB");
   CHECK(value > 35.0);
 }
+
+TEST_CASE("The file extension picks PLY or CGC", "[cgc]") {
+  CHECK(cloud_format("a.cgc") == CloudFormat::Cgc);
+  CHECK(cloud_format("a.CGC") == CloudFormat::Cgc);
+  CHECK(cloud_format("dir.x/b.Cgc") == CloudFormat::Cgc);
+  CHECK(cloud_format("a.ply") == CloudFormat::Ply);
+  CHECK(cloud_format("a") == CloudFormat::Ply);
+  CHECK(cloud_format("a.cgc.tmp") == CloudFormat::Ply);
+}
+
+TEST_CASE("save_cloud and load_cloud follow the extension", "[cgc]") {
+  const GaussianCloud cloud = random_cloud(10, 1, 81);
+
+  const auto ply = temp_file("splat_dispatch.ply");
+  save_cloud(cloud, ply);
+  const GaussianCloud fromPly = load_cloud(ply);
+  CHECK(fromPly.positions == cloud.positions);
+  CHECK(fromPly.sh == cloud.sh);
+  std::filesystem::remove(ply);
+
+  const auto cgc = temp_file("splat_dispatch.CGC");
+  save_cloud(cloud, cgc);
+  check_round_trip(cloud, load_cloud(cgc));
+  std::filesystem::remove(cgc);
+
+  const auto temporary = temp_file("splat_dispatch.cgc.tmp");
+  save_cloud(cloud, temporary, CloudFormat::Cgc, CgcOptions{.lzmaLevel = 1, .lzmaExtreme = false});
+  check_round_trip(cloud, load_cgc(temporary));
+  std::filesystem::remove(temporary);
+}

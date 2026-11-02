@@ -1,8 +1,11 @@
 #include "splat/gaussian_cloud.hpp"
 
+#include "splat/cgc.hpp"
+
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cctype>
 #include <charconv>
 #include <cmath>
 #include <cstring>
@@ -364,6 +367,30 @@ void save_ply(const GaussianCloud &cloud, const std::filesystem::path &path) {
   if (!out) {
     throw std::runtime_error(std::format("Failed writing '{}'", path.string()));
   }
+}
+
+CloudFormat cloud_format(const std::filesystem::path &path) {
+  std::string ext = path.extension().string();
+  std::ranges::transform(ext, ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return ext == ".cgc" ? CloudFormat::Cgc : CloudFormat::Ply;
+}
+
+void save_cloud(const GaussianCloud &cloud, const std::filesystem::path &path) { save_cloud(cloud, path, cloud_format(path)); }
+
+void save_cloud(const GaussianCloud &cloud, const std::filesystem::path &path, CloudFormat format) {
+  save_cloud(cloud, path, format, CgcOptions{});
+}
+
+void save_cloud(const GaussianCloud &cloud, const std::filesystem::path &path, CloudFormat format, const CgcOptions &options) {
+  if (format == CloudFormat::Cgc) {
+    save_cgc(cloud, path, options);
+  } else {
+    save_ply(cloud, path);
+  }
+}
+
+GaussianCloud load_cloud(const std::filesystem::path &path) {
+  return cloud_format(path) == CloudFormat::Cgc ? load_cgc(path) : load_ply(path);
 }
 
 GaussianCloud make_test_scene(std::size_t count, std::uint32_t seed) {

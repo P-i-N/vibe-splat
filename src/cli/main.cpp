@@ -12,6 +12,7 @@
 #include "render/splat_renderer.hpp"
 #include "sfm/sfm.hpp"
 #include "sfm/test_views.hpp"
+#include "splat/cgc.hpp"
 #include "splat/gaussian_cloud.hpp"
 #include "train/train.hpp"
 #ifdef SPLAT_WITH_VIEWER
@@ -24,6 +25,7 @@
 #include <charconv>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
 #include <optional>
 #include <print>
 #include <span>
@@ -37,9 +39,10 @@ constexpr std::string_view kUsage = R"(splat {} - Gaussian splat generator and v
 Usage: splat <command> [options]
 
 Commands:
-  view <scene.ply>              Open the real-time viewer
-  render <scene.ply> -o <png>   Render one image without a window
-  make-test-scene <out.ply>     Write a synthetic scene for trying things out
+  view <scene.ply|cgc>          Open the real-time viewer
+  render <scene.ply|cgc> -o <png>  Render one image without a window
+  make-test-scene <out.ply|cgc> Write a synthetic scene for trying things out
+  convert <in> <out>            Convert between .ply and compressed .cgc
   info                          List Vulkan devices and whether splat can use them
   selftest                      Run a compute kernel on the GPU and check the result
   ingest <inputs...> -o <dir>   Import photos and videos into a project folder
@@ -86,7 +89,7 @@ sfm options (writes project/sparse/0 in COLMAP's format, plus preview.ply):
   --import <dir>          Instead of estimating, import a COLMAP sparse model
 
 train options (writes project/splat.ply and project/preview_*.png):
-  -o, --out <file.ply>    Output file
+  -o, --out <file>        Output file, .ply or compressed .cgc
   --iterations <n>        Default 30000
   --lambda-ssim <x>       Weight of D-SSIM against L1 (default 0.2)
   --sh-degree <0-3>       Default 3
@@ -175,7 +178,7 @@ glm::vec3 parse_up(const std::string &axis) {
 
 splat::GaussianCloud load_scene(const std::string &path) {
   const auto start = std::chrono::steady_clock::now();
-  auto cloud = splat::load_ply(path);
+  auto cloud = splat::load_cloud(path);
   const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
   std::println("Loaded {} Gaussians (SH degree {}) from {} in {:.0f} ms", cloud.size(), cloud.shDegree, path, ms);
   return cloud;
@@ -221,8 +224,34 @@ int cmd_make_test_scene(const GlobalOptions &opts) {
   }
   const auto count = args.number<std::size_t>("count", 200'000);
   const auto cloud = splat::make_test_scene(std::max<std::size_t>(count, 16));
-  splat::save_ply(cloud, args.positionals()[0]);
+  splat::save_cloud(cloud, args.positionals()[0]);
   std::println("Wrote {} Gaussians to {}", cloud.size(), args.positionals()[0]);
+  return 0;
+}
+
+int cmd_convert(const GlobalOptions &opts) {
+  const splat::cli::Args args(opts.rest, {});
+  args.allow_only({});
+  if (args.positionals().size() != 2) {
+    std::println(stderr, "Usage: splat convert <in.ply|cgc> <out.ply|cgc>");
+    return 2;
+  }
+  const std::filesystem::path in(args.positionals()[0]);
+  const std::filesystem::path out(args.positionals()[1]);
+  const auto cloud = load_scene(in.string());
+  const auto start = std::chrono::steady_clock::now();
+  if (splat::cloud_format(out) == splat::CloudFormat::Cgc) {
+    const auto stats = splat::save_cgc(cloud, out);
+    std::println("SH degree per Gaussian: 0: {}, 1: {}, 2: {}, 3: {}", stats.degreeCounts[0], stats.degreeCounts[1],
+                 stats.degreeCounts[2], stats.degreeCounts[3]);
+  } else {
+    splat::save_ply(cloud, out);
+  }
+  const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  const auto inBytes = std::filesystem::file_size(in);
+  const auto outBytes = std::filesystem::file_size(out);
+  std::println("Wrote {} in {:.1f} s: {:.2f} MB -> {:.2f} MB ({:.1f}x smaller)", out.string(), seconds, inBytes / 1e6,
+               outBytes / 1e6, static_cast<double>(inBytes) / static_cast<double>(std::max<std::uintmax_t>(outBytes, 1)));
   return 0;
 }
 
@@ -439,6 +468,7 @@ int main(int argc, char **argv) {
     if (opts.command == "view") return cmd_view(opts);
     if (opts.command == "render") return cmd_render(opts);
     if (opts.command == "make-test-scene") return cmd_make_test_scene(opts);
+    if (opts.command == "convert") return cmd_convert(opts);
     std::println(stderr, "Unknown command '{}'. Run 'splat --help'.", opts.command);
     return 2;
   } catch (const splat::vk::Error &e) {

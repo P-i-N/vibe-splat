@@ -153,6 +153,23 @@ The device needs Vulkan 1.3, one graphics+compute queue, subgroup arithmetic
 and `VK_KHR_push_descriptor`. Every current AMD, NVIDIA and Intel driver
 supports all of these, and so does Mesa (RADV, ANV, lavapipe).
 
+## Compressed output (.cgc)
+
+Wherever `splat` writes or reads a scene, a `.cgc` extension selects CGC
+(Compressed Gaussian Cloud) instead of `.ply`. It is meant for sending scenes
+over the network, for example to a browser viewer. `splat train -o scene.cgc`
+and `splat make-test-scene scene.cgc` write it directly, and `splat convert
+scene.ply scene.cgc` converts an existing file. `view` and `render` open it
+like a `.ply`.
+
+CGC is lossy. Each Gaussian keeps only the SH bands that visibly change its
+colour. Gaussians are sorted along a Morton curve into chunks of 256, and
+positions and scales are quantized within each chunk's bounds. Rotations,
+colours, opacities and SH are quantized too. Everything is stored column by
+column in byte planes and compressed with LZMA. Training itself always works
+at full precision. The byte layout is in
+`docs/superpowers/specs/2026-11-02-cgc-format-design.md`.
+
 ## Running
 
 Users need nothing but a GPU driver with Vulkan 1.3. The program loads the
@@ -206,7 +223,7 @@ Tests need a Vulkan device. Without a GPU, Mesa's lavapipe
 ```
 shaders/        GLSL shaders, compiled to SPIR-V and embedded at build time
 src/core/       Vulkan context, buffers, images, compute pipelines, radix sort
-src/splat/      Gaussian cloud data, .ply reading and writing, test scene
+src/splat/      Gaussian cloud data, .ply and .cgc reading and writing, test scene
 src/render/     Camera, splat renderer, offscreen rendering and PNG output
 src/viewer/     SDL3 window, swapchain and input (built when SDL3 is found)
 src/cli/        The `splat` command-line program
