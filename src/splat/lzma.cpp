@@ -61,7 +61,6 @@ std::vector<std::byte> lzma_decompress(std::span<const std::byte> stream, std::s
     throw std::runtime_error("Cannot start the LZMA decoder");
   }
   std::vector<std::byte> out;
-  out.reserve(expectedSize);
   // One byte of headroom, so that data longer than expected is detected.
   run(decoder.s, stream, out, expectedSize + 1);
   if (out.size() != expectedSize) {

@@ -5,10 +5,39 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <span>
 #include <vector>
 
 namespace splat {
+
+// CGC (Compressed Gaussian Cloud): a lossy, compact file format for viewing
+// splats over the network. Splats are Morton-ordered into chunks of 256,
+// quantized, stored column by column and compressed with LZMA. Each splat
+// keeps only the SH bands that visibly change its colour. The byte layout is
+// described in docs/superpowers/specs/2026-11-02-cgc-format-design.md.
+
+struct CgcOptions {
+  // A band is dropped when it changes the colour by less than this (RMS over
+  // view directions, scaled by opacity, in 0..1 colour units).
+  float shThreshold = 1.5f / 255.f;
+  int lzmaLevel = 9; // liblzma preset 0..9
+  bool lzmaExtreme = true;
+};
+
+struct CgcStats {
+  std::uint64_t bytes = 0;                    // size of the written file
+  std::array<std::size_t, 4> degreeCounts{}; // splats stored at SH degree 0..3
+};
+
+// Writes `cloud` as CGC. Throws std::runtime_error, writing nothing, if any
+// value is NaN or infinite, or if the file cannot be written.
+CgcStats save_cgc(const GaussianCloud &cloud, const std::filesystem::path &path, const CgcOptions &options = {});
+
+// Reads a CGC file. The cloud's SH degree is the highest any splat uses;
+// splats with fewer bands get zeros. Splats come back in Morton order.
+// Throws std::runtime_error on malformed files.
+[[nodiscard]] GaussianCloud load_cgc(const std::filesystem::path &path);
 
 // Pieces of the CGC encoder, exposed for unit tests.
 namespace cgc_detail {
