@@ -19,6 +19,9 @@ layout(std430, binding = 2) readonly buffer Ranges { uvec2 ranges[]; };
 layout(std430, binding = 3) readonly buffer Image { vec4 image[]; };
 layout(std430, binding = 4) readonly buffer Adjoint { vec4 adjoint[]; };
 
+// rgb: composite so far, a: its log transmittance. Tiles do not share pixels.
+layout(std430, binding = BEHIND_BINDING) buffer Behind { vec4 behind[]; };
+
 layout(push_constant) uniform Push {
   uint width;
   uint height;
@@ -36,9 +39,10 @@ void main() {
   const uint x0 = tx * TILE_SIZE, y0 = ty * TILE_SIZE;
   const uint x1 = min(x0 + TILE_SIZE, pc.width), y1 = min(y0 + TILE_SIZE, pc.height);
 
-  vec4 behind[TILE_SIZE * TILE_SIZE]; // rgb: composite so far, a: its log transmittance
-  for (uint i = 0u; i < TILE_SIZE * TILE_SIZE; ++i) {
-    behind[i] = vec4(pc.background.rgb, 0.0);
+  for (uint y = y0; y < y1; ++y) {
+    for (uint x = x0; x < x1; ++x) {
+      behind[y * pc.width + x] = vec4(pc.background.rgb, 0.0);
+    }
   }
 
   const uvec2 range = ranges[tile];
@@ -48,19 +52,20 @@ void main() {
     const vec3 q = s.conicOpacity.xyz;
     float g[9] = float[9](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     bool any = false;
-    for (uint y = y0; y < y1; ++y) {
-      for (uint x = x0; x < x1; ++x) {
+    const uvec4 area = splat_pixels(s, uvec4(x0, y0, x1, y1));
+    for (uint y = area.y; y < area.w; ++y) {
+      for (uint x = area.x; x < area.z; ++x) {
         vec2 d;
         float power, alpha;
         if (!splat_at(s, x, y, d, power, alpha)) {
           continue;
         }
-        const uint local = (y - y0) * TILE_SIZE + (x - x0);
         const uint at = y * pc.width + x;
+        const vec4 state = behind[at];
         const float logRest = log(1.0 - alpha);
-        const float T = exp(image[at].a - behind[local].a - logRest);
+        const float T = exp(image[at].a - state.a - logRest);
         const vec3 A = adjoint[at].rgb;
-        const vec3 B = behind[local].rgb;
+        const vec3 B = state.rgb;
 
         const vec3 dColour = T * alpha * A;
         g[6] += dColour.r;
@@ -81,7 +86,7 @@ void main() {
         }
         any = true;
 
-        behind[local] = vec4(mix(B, s.color.rgb, alpha), behind[local].a + logRest);
+        behind[at] = vec4(mix(B, s.color.rgb, alpha), state.a + logRest);
       }
     }
     if (any) {

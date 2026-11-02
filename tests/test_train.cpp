@@ -1,3 +1,4 @@
+#include "reference_helpers.hpp"
 #include "render/offscreen.hpp"
 #include "render/splat_renderer.hpp"
 #include "sfm/test_views.hpp"
@@ -18,52 +19,11 @@ using Catch::Matchers::WithinAbs;
 
 namespace {
 
-constexpr float kShC0 = 0.28209479177387814f;
+using test::random_cloud;
 
-GaussianCloud random_cloud(std::size_t count, int degree, std::uint32_t seed) {
-  std::mt19937 rng(seed);
-  std::uniform_real_distribution<float> u(-1.f, 1.f), unit(0.f, 1.f);
-  GaussianCloud cloud;
-  cloud.resize(count, degree);
-  const auto coefficients = static_cast<std::size_t>(cloud.shCoeffs());
-  for (std::size_t i = 0; i < count; ++i) {
-    cloud.positions[i * 3] = u(rng) * 1.4f;
-    cloud.positions[i * 3 + 1] = u(rng) * 1.1f;
-    cloud.positions[i * 3 + 2] = 3.f + unit(rng) * 3.f;
-    for (std::size_t a = 0; a < 3; ++a) cloud.scales[i * 3 + a] = std::log(0.06f + 0.2f * unit(rng));
-    for (std::size_t a = 0; a < 4; ++a) cloud.rotations[i * 4 + a] = u(rng);
-    cloud.opacities[i] = u(rng) * 1.5f;
-    for (std::size_t c = 0; c < 3; ++c) cloud.sh[i * coefficients * 3 + c] = (unit(rng) - 0.5f) / kShC0;
-    for (std::size_t k = 3; k < coefficients * 3; ++k) cloud.sh[i * coefficients * 3 + k] = u(rng) * 0.2f;
-  }
-  return cloud;
-}
+Camera test_camera(int width = 64, int height = 48) { return test::train_camera(width, height); }
 
-Camera test_camera(int width = 64, int height = 48) {
-  Camera camera;
-  camera.fx = camera.fy = 60.f;
-  camera.cx = static_cast<float>(width) * 0.5f;
-  camera.cy = static_cast<float>(height) * 0.5f;
-  camera.width = width;
-  camera.height = height;
-  return camera;
-}
-
-std::vector<std::uint8_t> noise_target(int width, int height, std::uint32_t seed) {
-  std::mt19937 rng(seed);
-  std::vector<std::uint8_t> target(static_cast<std::size_t>(width) * height * 4);
-  // Smooth rather than white, so that SSIM has structure to compare.
-  for (int y = 0; y < height; ++y) {
-    for (int x = 0; x < width; ++x) {
-      const std::size_t at = (static_cast<std::size_t>(y) * width + x) * 4;
-      target[at] = static_cast<std::uint8_t>(127.f + 100.f * std::sin(0.2f * static_cast<float>(x)) + static_cast<float>(rng() % 16));
-      target[at + 1] = static_cast<std::uint8_t>(127.f + 100.f * std::cos(0.15f * static_cast<float>(y)) + static_cast<float>(rng() % 16));
-      target[at + 2] = static_cast<std::uint8_t>(60 + (x + y) % 120);
-      target[at + 3] = 255;
-    }
-  }
-  return target;
-}
+std::vector<std::uint8_t> noise_target(int width, int height, std::uint32_t seed) { return test::smooth_target(width, height, seed); }
 
 // How well two gradient vectors agree: direction and length.
 void check_close(const std::vector<double> &a, const std::vector<double> &b, const char *what, double minCosine, double maxRatioError) {
@@ -132,6 +92,12 @@ TEST_CASE("Analytic gradients match finite differences on the CPU", "[train][ref
   check_close(g.scales, finite_differences(cloud, &GaussianCloud::scales, camera, adjoint, 2e-3f), "scales", 0.999, 0.01);
   check_close(g.rotations, finite_differences(cloud, &GaussianCloud::rotations, camera, adjoint, 2e-3f), "rotations", 0.999, 0.01);
   check_close(g.opacities, finite_differences(cloud, &GaussianCloud::opacities, camera, adjoint, 2e-3f), "opacities", 0.999, 0.01);
+
+  // Degree 3, with position: this is where the view direction term matters.
+  const GaussianCloud degree3 = random_cloud(12, 3, 6);
+  const ParameterGradients g3 = reference_gradients(degree3, camera, adjoint, smooth);
+  check_close(g3.positions, finite_differences(degree3, &GaussianCloud::positions, camera, adjoint, 2e-3f), "positions, degree 3", 0.999, 0.01);
+  check_close(g3.sh, finite_differences(degree3, &GaussianCloud::sh, camera, adjoint, 2e-3f), "sh degree 3", 0.999, 0.01);
 
   const GaussianCloud degree2 = random_cloud(12, 2, 4);
   const ParameterGradients g2 = reference_gradients(degree2, camera, adjoint, smooth);
@@ -273,38 +239,11 @@ TEST_CASE("Training overfits a single rendered view", "[train][vulkan]") {
   if (ctx == nullptr) SKIP("No usable Vulkan device");
 
   const auto views = make_test_views(1, 128, 96, 100.0);
-  Camera camera = test_camera(128, 96);
-  camera.fx = camera.fy = 100.f;
-  glm::dmat4 view(views[0].pose.R(0, 0));
-  for (int r = 0; r < 3; ++r) {
-    for (int c = 0; c < 3; ++c) view[c][r] = views[0].pose.R(r, c);
-    view[3][r] = views[0].pose.t(r);
-    view[r][3] = 0.0;
-  }
-  view[3][3] = 1.0;
-  camera.view = glm::mat4(view);
-  const Eigen::Vector3d center = views[0].pose.center();
-  camera.position = glm::vec3(center.x(), center.y(), center.z());
-
+  const Camera camera = test::camera_of(views[0], 128, 96, 100.f);
   std::vector<std::uint8_t> target(static_cast<std::size_t>(128) * 96 * 4, 255);
   for (std::size_t i = 0; i < 128u * 96u; ++i) std::copy_n(views[0].image.pixels.data() + i * 3, 3, target.data() + i * 4);
 
-  // A grid of grey Gaussians in front of the camera.
-  GaussianCloud cloud;
-  constexpr std::size_t kSide = 40;
-  cloud.resize(kSide * kSide, 0);
-  const glm::mat3 toWorld = glm::transpose(glm::mat3(camera.view));
-  for (std::size_t i = 0; i < cloud.size(); ++i) {
-    const float x = (static_cast<float>(i % kSide) + 0.5f - kSide * 0.5f) / kSide * 2.6f;
-    const float y = (static_cast<float>(i / kSide) + 0.5f - kSide * 0.5f) / kSide * 2.0f;
-    const glm::vec3 world = camera.position + toWorld * glm::vec3(x, y, 2.f);
-    for (std::size_t a = 0; a < 3; ++a) {
-      cloud.positions[i * 3 + a] = world[static_cast<int>(a)];
-      cloud.scales[i * 3 + a] = std::log(0.05f);
-    }
-    cloud.rotations[i * 4] = 1.f;
-    cloud.opacities[i] = 0.f;
-  }
+  const GaussianCloud cloud = test::grid_in_front(camera, 40);
 
   Trainer trainer(*ctx, cloud);
   LearningRates rates;

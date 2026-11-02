@@ -11,4 +11,5 @@ void add_gradient(uint at, float value) {
   atomicAdd(gradients[at], int(clamp(value * fixedScale, -1.0e9, 1.0e9)));
 }
 
+#define BEHIND_BINDING 7
 #include "train_backward.glsl"

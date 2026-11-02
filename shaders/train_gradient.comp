@@ -2,11 +2,6 @@
 // Backward pass, step 2: the chain rule from the screen-space sums of the
 // previous step down to the raw parameters. The maths is mirrored and checked
 // against finite differences in src/train/reference.cpp.
-//
-// One thing is deliberately left out: colour also depends on position through
-// the view direction for SH degree above 0. The effect is tiny compared with
-// what the same point's position does to the image, and 3DGS trainers that
-// freeze this direction lose nothing measurable.
 #extension GL_GOOGLE_include_directive : require
 #include "splat_types.glsl"
 #include "train_types.glsl"
@@ -25,6 +20,8 @@ layout(std430, binding = 8) writeonly buffer GradScales { float gradScales[]; };
 layout(std430, binding = 9) writeonly buffer GradRotations { float gradRotations[]; };
 layout(std430, binding = 10) writeonly buffer GradOpacities { float gradOpacities[]; };
 layout(std430, binding = 11) writeonly buffer GradSH { float gradSh[]; };
+layout(std430, binding = 12) readonly buffer Splats { TrainSplat splats[]; };
+layout(std430, binding = 13) buffer DensifyStats { vec4 densifyStats[]; }; // x: gradient sum, y: visits, z: largest radius
 
 // tr(G A X J^T) for 2x2 symmetric G, with A and J 2x3 and X 3x3.
 float trace_term(mat2 G, mat3x2 A, mat3 X, mat3x2 J) {
@@ -60,6 +57,12 @@ void main() {
 
   // Screen-space sums: dL/dcentre and dL/dcovariance as a symmetric matrix.
   const vec2 gCentre = vec2(raw[at + 1u], raw[at + 2u]);
+
+  // What densification decides on. Only this invocation touches this element.
+  // Per half the image rather than per pixel, so that one threshold suits any resolution.
+  densifyStats[i].x += length(gCentre * 0.5 * cam.viewport.xy);
+  densifyStats[i].y += 1.0;
+  densifyStats[i].z = max(densifyStats[i].z, splats[i].centerRadius.z);
   const mat2 G = mat2(raw[at + 3u], raw[at + 4u], raw[at + 4u], raw[at + 5u]);
 
   const mat3 Rv = mat3(cam.view);
@@ -84,10 +87,7 @@ void main() {
                             vec2(clampedX ? fx * tx * iz2 * iz : 2.0 * fx * tx * iz2 * iz,
                                  clampedY ? fy * ty * iz2 * iz : 2.0 * fy * ty * iz2 * iz));
   gT += 2.0 * vec3(trace_term(G, dJx, X, J), trace_term(G, dJy, X, J), trace_term(G, dJz, X, J));
-  const vec3 gP = transpose(Rv) * gT;
-  gradPositions[i * 3u] = gP.x;
-  gradPositions[i * 3u + 1u] = gP.y;
-  gradPositions[i * 3u + 2u] = gP.z;
+  vec3 gP = transpose(Rv) * gT;
 
   // The 3D covariance: dL = tr(G3 dSigma).
   const mat3x2 T = J * Rv;
@@ -122,7 +122,7 @@ void main() {
   const vec3 gColour = vec3(raw[at + 6u], raw[at + 7u], raw[at + 8u]);
   float basis[16];
   sh_basis(normalize(p - cam.position.xyz), cam.counts.y, basis);
-  const uint coefficients = cam.counts.z / 3u;
+  const uint coefficients = cam.counts.w;
   const uint base = i * cam.counts.z;
   vec3 colour = vec3(0.5);
   for (uint k = 0u; k < coefficients; ++k) {
@@ -130,6 +130,25 @@ void main() {
   }
   // Colour is clamped at zero, where the coefficients stop mattering.
   const vec3 unclamped = vec3(greaterThan(colour, vec3(0.0)));
+
+  // Position also changes the view direction, and with it the colour.
+  if (cam.counts.y > 0u) {
+    const vec3 toSplat = p - cam.position.xyz;
+    const float distance = length(toSplat);
+    const vec3 dir = toSplat / distance;
+    vec3 basisGradient[16];
+    sh_basis_gradient(dir, cam.counts.y, basisGradient);
+    vec3 gDir = vec3(0.0);
+    for (uint k = 1u; k < coefficients; ++k) {
+      const vec3 coefficient = vec3(sh[base + k * 3u], sh[base + k * 3u + 1u], sh[base + k * 3u + 2u]);
+      gDir += dot(gColour * unclamped, coefficient) * basisGradient[k];
+    }
+    gP += (gDir - dir * dot(dir, gDir)) / distance;
+  }
+  gradPositions[i * 3u] = gP.x;
+  gradPositions[i * 3u + 1u] = gP.y;
+  gradPositions[i * 3u + 2u] = gP.z;
+
   for (uint k = 0u; k < coefficients; ++k) {
     const vec3 g = basis[k] * gColour * unclamped;
     gradSh[base + k * 3u] = g.r;

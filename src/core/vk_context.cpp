@@ -301,6 +301,10 @@ Context::Context(const ContextOptions &options) {
     if (info_.floatAtomicAdd) {
       extensions.push_back(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
     }
+    hasMemoryBudget_ = has_extension(physical_, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    if (hasMemoryBudget_) {
+      extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    }
 
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -432,6 +436,23 @@ void Context::end_one_shot(VkCommandBuffer cmd) {
   vkFreeCommandBuffers(device_, commandPool_, 1, &cmd);
   check(submitted, "vkQueueSubmit2");
   check(waited, "vkWaitForFences");
+}
+
+std::uint64_t Context::free_device_memory() const {
+  VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+  VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+  if (hasMemoryBudget_) properties.pNext = &budget;
+  vkGetPhysicalDeviceMemoryProperties2(physical_, &properties);
+  std::uint64_t best = 0;
+  for (std::uint32_t h = 0; h < properties.memoryProperties.memoryHeapCount; ++h) {
+    const VkMemoryHeap &heap = properties.memoryProperties.memoryHeaps[h];
+    if ((heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) continue;
+    const std::uint64_t available = !hasMemoryBudget_ ? heap.size / 5 * 4
+                                    : budget.heapBudget[h] > budget.heapUsage[h] ? budget.heapBudget[h] - budget.heapUsage[h]
+                                                                                 : 0;
+    best = std::max(best, available);
+  }
+  return best;
 }
 
 } // namespace splat::vk

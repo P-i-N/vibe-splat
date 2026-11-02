@@ -65,6 +65,35 @@ std::array<double, 16> sh_basis(dvec3 dir, int degree) {
   return b;
 }
 
+std::array<dvec3, 16> sh_basis_gradient(dvec3 dir, int degree) {
+  constexpr double C1 = 0.4886025119029199, A = 1.0925484305920792, K = 0.31539156525252005, L = 0.5462742152960396;
+  constexpr double C = -0.5900435899266435, E = 2.890611442640554, F = -0.4570457994644658, G = 0.3731763325901154, H = 1.445305721320277;
+  const double x = dir.x, y = dir.y, z = dir.z, xx = x * x, yy = y * y, zz = z * z;
+  std::array<dvec3, 16> g{};
+  if (degree > 0) {
+    g[1] = {0.0, -C1, 0.0};
+    g[2] = {0.0, 0.0, C1};
+    g[3] = {-C1, 0.0, 0.0};
+  }
+  if (degree > 1) {
+    g[4] = A * dvec3(y, x, 0.0);
+    g[5] = -A * dvec3(0.0, z, y);
+    g[6] = K * dvec3(-2.0 * x, -2.0 * y, 4.0 * z);
+    g[7] = -A * dvec3(z, 0.0, x);
+    g[8] = L * dvec3(2.0 * x, -2.0 * y, 0.0);
+  }
+  if (degree > 2) {
+    g[9] = C * dvec3(6.0 * x * y, 3.0 * xx - 3.0 * yy, 0.0);
+    g[10] = E * dvec3(y * z, x * z, x * y);
+    g[11] = F * dvec3(-2.0 * x * y, 4.0 * zz - xx - 3.0 * yy, 8.0 * y * z);
+    g[12] = G * dvec3(-6.0 * x * z, -6.0 * y * z, 6.0 * zz - 3.0 * xx - 3.0 * yy);
+    g[13] = F * dvec3(4.0 * zz - 3.0 * xx - yy, -2.0 * x * y, 8.0 * x * z);
+    g[14] = H * dvec3(2.0 * x * z, -2.0 * y * z, xx - yy);
+    g[15] = C * dvec3(3.0 * xx - 3.0 * yy, -6.0 * x * y, 0.0);
+  }
+  return g;
+}
+
 dvec3 position_of(const GaussianCloud &c, std::size_t i) {
   return {c.positions[i * 3], c.positions[i * 3 + 1], c.positions[i * 3 + 2]};
 }
@@ -206,7 +235,7 @@ ReferenceLoss reference_loss(const ReferenceImage &image, const std::vector<std:
       const dvec3 n1 = 2.0 * mx * my + kC1, n2 = 2.0 * cxy + kC2, d1 = mx * mx + my * my + kC1, d2 = vx + vy + kC2;
       const dvec3 s = (n1 * n2) / (d1 * d2);
       ssimSum += s.r + s.g + s.b;
-      const dvec3 dMu = s * (2.0 * my / n1 - 2.0 * mx / d1), dVar = -s / d2, dCov = s * 2.0 / n2;
+      const dvec3 dMu = 2.0 * my * n2 / (d1 * d2) - s * 2.0 * mx / d1, dVar = -s / d2, dCov = 2.0 * n1 / (d1 * d2);
       const std::size_t at = static_cast<std::size_t>(row) * w + px;
       P[at] = (dMu - 2.0 * mx * dVar - my * dCov) / norm;
       Q[at] = dVar / norm;
@@ -328,8 +357,7 @@ ParameterGradients reference_gradients(const GaussianCloud &cloud, const Camera 
                       dvec2(clampedX ? fx * tx * iz2 * iz : 2.0 * fx * tx * iz2 * iz,
                             clampedY ? fy * ty * iz2 * iz : 2.0 * fy * ty * iz2 * iz));
     gT += 2.0 * dvec3(trace_term(G, dJx, X, J), trace_term(G, dJy, X, J), trace_term(G, dJz, X, J));
-    const dvec3 gP = glm::transpose(Rv) * gT;
-    for (int a = 0; a < 3; ++a) out.positions[i * 3 + a] = gP[a];
+    dvec3 gP = glm::transpose(Rv) * gT;
 
     const dmat3x2 T = J * Rv;
     const dmat3 G3 = glm::transpose(T) * G * T;
@@ -357,6 +385,22 @@ ParameterGradients reference_gradients(const GaussianCloud &cloud, const Camera 
       const std::size_t at = (i * coefficients + k) * 3;
       colour += basis[k] * dvec3(cloud.sh[at], cloud.sh[at + 1], cloud.sh[at + 2]);
     }
+    // Position also changes the view direction, and with it the colour.
+    if (cloud.shDegree > 0) {
+      const dvec3 toSplat = p - dvec3(cam.position);
+      const double distance = glm::length(toSplat);
+      const dvec3 dir = toSplat / distance;
+      const auto basisGradient = sh_basis_gradient(dir, cloud.shDegree);
+      const dvec3 unclamped(colour.r > 0.0 ? 1.0 : 0.0, colour.g > 0.0 ? 1.0 : 0.0, colour.b > 0.0 ? 1.0 : 0.0);
+      dvec3 gDir(0.0);
+      for (std::size_t k = 1; k < coefficients; ++k) {
+        const std::size_t at = (i * coefficients + k) * 3;
+        gDir += glm::dot(gColour * unclamped, dvec3(cloud.sh[at], cloud.sh[at + 1], cloud.sh[at + 2])) * basisGradient[k];
+      }
+      gP += (gDir - dir * glm::dot(dir, gDir)) / distance;
+    }
+    for (int a = 0; a < 3; ++a) out.positions[i * 3 + a] = gP[a];
+
     for (std::size_t k = 0; k < coefficients; ++k) {
       const std::size_t at = (i * coefficients + k) * 3;
       for (int c = 0; c < 3; ++c) out.sh[at + static_cast<std::size_t>(c)] = colour[c] > 0.0 ? basis[k] * gColour[c] : 0.0;

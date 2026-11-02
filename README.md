@@ -10,7 +10,7 @@ from EXIF or given by hand. Output is a standard 3D Gaussian splatting `.ply`.
 
 ## Status
 
-Milestones M1 (viewer), M2 (ingest), M3 (camera poses) and M4 (trainer core) are done:
+Milestones M1 (viewer), M2 (ingest), M3 (camera poses), M4 (trainer core) and M5 (full training) are done:
 
 - `splat view scene.ply` opens a window and renders a 3DGS `.ply` in real time.
   Controls: left-drag orbits, right- or middle-drag pans, the wheel zooms,
@@ -27,7 +27,7 @@ Milestones M1 (viewer), M2 (ingest), M3 (camera poses) and M4 (trainer core) are
   below).
 - `splat make-test-views dir/` renders images with known poses to try it on.
 - `splat train project/` trains Gaussians from those poses and writes
-  `project/splat.ply` (see below). Gaussians do not split or multiply yet.
+  `project/splat.ply` (see below).
 
 Any `.ply` in the standard 3DGS layout should work, with SH degree 0 to 3.
 That is the layout written by the original implementation and most trainers.
@@ -116,6 +116,17 @@ does automatic differentiation: each pass has a hand-derived counterpart.
   without them. A last pass applies the chain rule down to position, scale,
   rotation, opacity and SH.
 - **Optimiser.** Adam, with the learning rates of the 3DGS paper.
+- **Density.** Every 100 iterations in the first half of training, a Gaussian
+  whose screen position keeps wanting to move is cloned if small and split in
+  two if large, and nearly transparent ones are removed. Opacity is capped every
+  3000 iterations, so that those no longer needed fade away.
+- **View dependence.** SH starts at degree 0 and gains a degree every 1000
+  iterations, up to `--sh-degree`.
+- **Memory.** A hard budget, by default 90% of the GPU's free memory
+  (`--vram-budget` overrides it). At the limit, the Gaussians with the highest
+  gradients densify first, and a view that still does not fit gives up the
+  largest ones. At SH degree 3 a Gaussian takes about 1.1 KiB, plus 16 bytes per
+  tile it covers.
 
 Images are undistorted when loaded, since the renderer is a pinhole camera.
 `src/train/reference.cpp` has every kernel again on the CPU: the tests check it

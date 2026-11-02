@@ -73,21 +73,29 @@ void main() {
   const uint degree = cam.counts.y;
   float basis[16];
   sh_basis(normalize(p - cam.position.xyz), degree, basis);
-  const uint coefficients = cam.counts.z / 3u;
+  const uint coefficients = cam.counts.w;
   const uint base = i * cam.counts.z;
   vec3 color = vec3(0.5);
   for (uint k = 0u; k < coefficients; ++k) {
     color += basis[k] * vec3(sh[base + k * 3u], sh[base + k * 3u + 1u], sh[base + k * 3u + 2u]);
   }
 
+  // A pixel counts only if opacity * exp(power) >= 1/255, which is an ellipse.
+  // Its bounding box is often far smaller than the square of radius 3 sigma, above
+  // all at low opacity, and how much is computed depends on that area. So this
+  // is what makes training fast, and leaves the picture exactly the same.
+  const float reach = 2.0 * log(255.0 * opacity);
+  const vec2 extent = min(vec2(sqrt(reach * a), sqrt(reach * c)), vec2(radius));
+
   const float gridW = ceil(cam.viewport.x / float(TILE_SIZE)), gridH = ceil(cam.viewport.y / float(TILE_SIZE));
   const float size = float(TILE_SIZE);
   splats[i].centerRadius = vec4(center, radius, t.z);
   splats[i].conicOpacity = vec4(vec3(c, -b, a) / det, opacity);
   splats[i].color = vec4(max(color, vec3(0.0)), 1.0);
-  splats[i].tiles = uvec4(uint(max(0.0, floor((center.x - radius) / size))),
-                          uint(max(0.0, floor((center.y - radius) / size))),
-                          uint(clamp(floor((center.x + radius) / size), 0.0, gridW - 1.0)),
-                          uint(clamp(floor((center.y + radius) / size), 0.0, gridH - 1.0)));
+  splats[i].extent = vec4(extent, 0.0, 0.0);
+  splats[i].tiles = uvec4(uint(clamp(floor((center.x - extent.x - 1.0) / size), 0.0, gridW - 1.0)),
+                          uint(clamp(floor((center.y - extent.y - 1.0) / size), 0.0, gridH - 1.0)),
+                          uint(clamp(floor((center.x + extent.x + 1.0) / size), 0.0, gridW - 1.0)),
+                          uint(clamp(floor((center.y + extent.y + 1.0) / size), 0.0, gridH - 1.0)));
   keys[i] = 0xFFFFFFFFu - floatBitsToUint(t.z);
 }

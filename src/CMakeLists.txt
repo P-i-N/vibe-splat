@@ -23,6 +23,7 @@ add_library(splat_core STATIC
   sfm/reconstruct.cpp
   sfm/test_views.cpp
   train/reference.cpp
+  train/densify.cpp
   train/trainer.cpp
   train/train.cpp
 )

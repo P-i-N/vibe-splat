@@ -21,7 +21,7 @@ struct CameraParams {
   vec4 position;   // camera centre in world space
   vec4 intrinsics; // fx, fy, cx, cy (pixels)
   vec4 viewport;   // width, height, tan(half fov x), tan(half fov y)
-  uvec4 counts;    // gaussian count, SH degree, SH floats per gaussian, unused
+  uvec4 counts;    // gaussian count, SH degree, SH floats per gaussian, SH coefficients in use (training only)
 };
 
 #endif

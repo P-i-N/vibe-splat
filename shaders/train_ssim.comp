@@ -1,15 +1,15 @@
 #version 460
-// Loss, part 1: SSIM of each pixel against the target, over an 11x11 Gaussian
-// window cut off at the image border. Also writes the three per-pixel fields
-// that the loss pass turns into dSSIM/dImage:
+// Loss, part 2: finishes the window vertically and computes SSIM per pixel.
+// Also writes the three per-pixel fields that the loss pass turns into
+// dSSIM/dImage:
 //   P = dS/dmu_x - 2 mu_x dS/dvar_x - mu_y dS/dcov,  Q = dS/dvar_x,  R = dS/dcov
-// each divided by the window's total weight.
+// each divided by the vertical and horizontal window's total weight, as the
+// window is cut off at the image border.
 layout(local_size_x = 16) in;
 
-layout(std430, binding = 0) readonly buffer Image { vec4 image[]; };
-layout(std430, binding = 1) readonly buffer Target { uint target[]; };
-layout(std430, binding = 2) writeonly buffer Fields { vec4 fields[]; };
-layout(std430, binding = 3) writeonly buffer RowTotals { vec2 rowTotals[]; }; // x: SSIM, y: L1
+layout(std430, binding = 0) readonly buffer Moments { vec4 moments[]; };
+layout(std430, binding = 1) writeonly buffer Fields { vec4 fields[]; };
+layout(std430, binding = 2) writeonly buffer RowTotals { vec2 rowTotals[]; }; // x: SSIM, y: L1
 
 layout(push_constant) uniform Push { uint width; uint height; } pc;
 
@@ -17,44 +17,48 @@ const float WEIGHTS[11] = float[](0.00102838, 0.00759876, 0.03600077, 0.10936069
                                   0.21300554, 0.10936069, 0.03600077, 0.00759876, 0.00102838);
 const float C1 = 0.0001, C2 = 0.0009;
 
+float window_norm(int at, int size) {
+  float norm = 0.0;
+  for (int i = max(at - 5, 0); i <= min(at + 5, size - 1); ++i) {
+    norm += WEIGHTS[i - at + 5];
+  }
+  return norm;
+}
+
 void main() {
   const uint row = gl_GlobalInvocationID.x;
   if (row >= pc.height) {
     return;
   }
+  const float rowNorm = window_norm(int(row), int(pc.height));
   float rowSum = 0.0;
   for (uint px = 0u; px < pc.width; ++px) {
     vec3 mx = vec3(0.0), my = vec3(0.0), xx = vec3(0.0), yy = vec3(0.0), xy = vec3(0.0);
-    float norm = 0.0;
     const int y0 = max(int(row) - 5, 0), y1 = min(int(row) + 5, int(pc.height) - 1);
-    const int x0 = max(int(px) - 5, 0), x1 = min(int(px) + 5, int(pc.width) - 1);
     for (int v = y0; v <= y1; ++v) {
-      const float wy = WEIGHTS[v - int(row) + 5];
-      for (int u = x0; u <= x1; ++u) {
-        const float w = wy * WEIGHTS[u - int(px) + 5];
-        const uint at = uint(v) * pc.width + uint(u);
-        const vec3 a = image[at].rgb;
-        const vec3 b = unpackUnorm4x8(target[at]).rgb;
-        mx += w * a;
-        my += w * b;
-        xx += w * a * a;
-        yy += w * b * b;
-        xy += w * a * b;
-        norm += w;
-      }
+      const float w = WEIGHTS[v - int(row) + 5];
+      const uint at = (uint(v) * pc.width + px) * 5u;
+      mx += w * moments[at].rgb;
+      my += w * moments[at + 1u].rgb;
+      xx += w * moments[at + 2u].rgb;
+      yy += w * moments[at + 3u].rgb;
+      xy += w * moments[at + 4u].rgb;
     }
-    mx /= norm;
-    my /= norm;
-    const vec3 vx = xx / norm - mx * mx, vy = yy / norm - my * my, cxy = xy / norm - mx * my;
+    mx /= rowNorm;
+    my /= rowNorm;
+    const vec3 vx = xx / rowNorm - mx * mx, vy = yy / rowNorm - my * my, cxy = xy / rowNorm - mx * my;
 
     const vec3 n1 = 2.0 * mx * my + C1, n2 = 2.0 * cxy + C2;
     const vec3 d1 = mx * mx + my * my + C1, d2 = vx + vy + C2;
     const vec3 s = (n1 * n2) / (d1 * d2);
     rowSum += s.r + s.g + s.b;
 
-    const vec3 dMu = s * (2.0 * my / n1 - 2.0 * mx / d1);
+    // n1 and n2 are cancelled out of s by hand: n2 can be exactly zero, and
+    // s / n2 would then be NaN although the derivative is well defined.
+    const vec3 dMu = 2.0 * my * n2 / (d1 * d2) - s * 2.0 * mx / d1;
     const vec3 dVar = -s / d2;
-    const vec3 dCov = s * 2.0 / n2;
+    const vec3 dCov = 2.0 * n1 / (d1 * d2);
+    const float norm = rowNorm * window_norm(int(px), int(pc.width));
     const uint at = row * pc.width + px;
     fields[at * 3u] = vec4((dMu - 2.0 * mx * dVar - my * dCov) / norm, 0.0);
     fields[at * 3u + 1u] = vec4(dVar / norm, 0.0);
