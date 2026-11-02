@@ -7,6 +7,8 @@
 #include "train/trainer.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <glm/gtc/constants.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include <algorithm>
@@ -280,6 +282,16 @@ TEST_CASE("Adam matches a hand-computed step", "[train][vulkan]") {
     if (g.opacities[i] == 0.f) continue;
     CHECK_THAT(after.opacities[i], WithinAbs(cloud.opacities[i] - (g.opacities[i] > 0.f ? rates.opacity : -rates.opacity), 2e-5));
   }
+
+  // A view that sees none of them moves nothing, despite the momentum.
+  Camera away = camera;
+  away.view = glm::rotate(glm::mat4(1.f), glm::pi<float>(), glm::vec3(0.f, 1.f, 0.f)) * camera.view;
+  trainer.compute_gradients(away, target);
+  trainer.apply_gradients(rates);
+  const GaussianCloud unseen = trainer.cloud();
+  CHECK(unseen.positions == after.positions);
+  CHECK(unseen.opacities == after.opacities);
+  CHECK(unseen.sh == after.sh);
 }
 
 TEST_CASE("Training overfits a single rendered view", "[train][vulkan]") {

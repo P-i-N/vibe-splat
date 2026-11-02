@@ -129,7 +129,9 @@ does automatic differentiation: each pass has a hand-derived counterpart.
 - **Overlap.** One submission per iteration (forward, loss, backward, Adam),
   and the next view's image is copied to staging memory on a worker thread
   while the GPU works on the current one.
-- **Optimiser.** Adam, with the learning rates of the 3DGS paper.
+- **Optimiser.** Adam, with the learning rates of the 3DGS paper. It only
+  updates Gaussians the current view sees: the rest keep their values and
+  moments, which also spares most of its memory traffic.
 - **Density.** Every 100 iterations in the first half of training, a Gaussian
   whose screen position keeps wanting to move is cloned if small and split in
   two if large, and nearly transparent ones are removed. Opacity is capped every

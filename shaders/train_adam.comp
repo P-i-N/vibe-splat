@@ -1,5 +1,9 @@
 #version 460
 // One Adam step (Kingma and Ba 2015) over a flat array of parameters.
+// Selective, as in gsplat and Taming 3DGS: a parameter without a gradient,
+// which means its Gaussian was out of view, keeps its value and moments
+// rather than drifting on momentum from other views. Most Gaussians are out
+// of any one view, so this also skips most of the memory traffic.
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) buffer Parameters { float parameters[]; };
@@ -25,6 +29,9 @@ void main() {
     return;
   }
   const float g = gradients[i];
+  if (g == 0.0) {
+    return;
+  }
   m[i] = pc.beta1 * m[i] + (1.0 - pc.beta1) * g;
   v[i] = pc.beta2 * v[i] + (1.0 - pc.beta2) * g * g;
   const float rate = pc.dcStride > 0u && i % pc.dcStride >= 3u ? pc.learningRate * pc.restScale : pc.learningRate;
