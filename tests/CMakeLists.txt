@@ -5,6 +5,7 @@ add_executable(splat_tests
   test_selftest.cpp
   test_radix_sort.cpp
   test_ply.cpp
+  test_cgc.cpp
   test_render.cpp
   test_ingest.cpp
   test_sfm.cpp

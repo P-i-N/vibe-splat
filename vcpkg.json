@@ -12,6 +12,7 @@
     "stb",
     "nlohmann-json",
     "eigen3",
+    "liblzma",
     {
       "name": "sdl3",
       "default-features": false,
