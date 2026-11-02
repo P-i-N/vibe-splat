@@ -84,6 +84,11 @@ public:
   // RGBA8, width * height * 4 bytes.
   StepStats compute_gradients(const Camera &camera, std::span<const std::uint8_t> target);
 
+  // The same, and also counts for each Gaussian the pixels it reaches whose
+  // error is above errorShare of this view's worst, each counting as
+  // pixelWeight, for densification to use (FastGS).
+  StepStats score_view(const Camera &camera, std::span<const std::uint8_t> target, float errorShare, float pixelWeight = 1.f);
+
   // One Adam step from the current gradients.
   void apply_gradients(const LearningRates &rates);
 
@@ -169,10 +174,11 @@ private:
   int width_ = 0, height_ = 0;
   std::uint32_t gridW_ = 0, tileCount_ = 0;
 
-  vk::ComputePipeline preprocess_, binCount_, binEmit_, tileRanges_, forward_, exposure_, ssim_, loss_, exposureBackward_, gradient_, adam_,
-      gather_;
+  vk::ComputePipeline preprocess_, binCount_, binEmit_, tileRanges_, forward_, exposure_, ssim_, loss_, exposureBackward_, errorMask_, score_, gradient_,
+      adam_, gather_;
   Exposure exposureValues_ = kNeutralExposure;
   bool exposing_ = false; // The last iteration ran the exposure passes
+  float scoreErrorShare_ = 0.f; // Above 0: this iteration marks high-error pixels
   std::optional<vk::ComputePipeline> backward_, fixedToFloat_;
   vk::RadixSorter sorter_;
 
@@ -181,7 +187,7 @@ private:
   std::unique_ptr<vk::Buffer> camera_, counters_, fixedScale_;
   std::unique_ptr<vk::Buffer> splats_, keys_, values_, tmpKeys_, tmpValues_, coverage_, rawGradients_, stats_;
   std::unique_ptr<vk::Buffer> entryKeys_, entryValues_, tmpEntryKeys_, tmpEntryValues_;
-  std::unique_ptr<vk::Buffer> ranges_, image_, stops_, exposed_, exposureTotals_, adjoint_, fields_, targetStaging_, target_, groupTotals_;
+  std::unique_ptr<vk::Buffer> ranges_, image_, stops_, exposed_, exposureTotals_, adjoint_, fields_, targetStaging_, target_, groupTotals_, errorMax_;
   // prefetch_target() hands one copy at a time to a worker thread that lives
   // as long as the trainer, so that no thread is started per iteration.
   std::unique_ptr<vk::Buffer> targetNext_;

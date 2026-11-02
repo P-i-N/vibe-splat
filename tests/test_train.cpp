@@ -248,6 +248,11 @@ TEST_CASE("GPU forward and gradients match the CPU reference where pixels stop e
     const double cosine = fixedPoint ? 0.97 : 0.999, ratio = fixedPoint ? 0.1 : 0.02;
     const DensifyStats densifyStats = gradients.densify_stats();
     check_close(to_double(densifyStats.contribution), reference_contributions(cloud, camera, {}), "contribution", cosine, ratio);
+    std::vector<double> absolute(cloud.size());
+    for (std::size_t i = 0; i < absolute.size(); ++i) {
+      absolute[i] = std::hypot(cpu.absoluteCentre[i * 2] * 0.5 * camera.width, cpu.absoluteCentre[i * 2 + 1] * 0.5 * camera.height);
+    }
+    check_close(to_double(densifyStats.absoluteGradientSum), absolute, "absolute", cosine, ratio);
     check_close(to_double(g.positions), cpu.positions, "positions", cosine, ratio);
     check_close(to_double(g.scales), cpu.scales, "scales", cosine, ratio);
     check_close(to_double(g.rotations), cpu.rotations, "rotations", cosine, ratio);
@@ -433,4 +438,39 @@ TEST_CASE("Degenerate Gaussians are not drawn and do not spread", "[train][vulka
   const auto gradients = trainer.gradients();
   for (const float g : gradients.positions) REQUIRE(std::isfinite(g));
   for (const float g : gradients.sh) REQUIRE(std::isfinite(g));
+}
+
+TEST_CASE("Scoring a view counts the high-error pixels each Gaussian reaches", "[train][vulkan]") {
+  vk::Context *ctx = test::context();
+  if (ctx == nullptr) SKIP("No usable Vulkan device");
+  const Camera camera = test_camera(72, 56);
+  const auto target = noise_target(camera.width, camera.height, 43);
+  const GaussianCloud cloud = random_cloud(60, 1, 47);
+  const std::vector<double> cpu = reference_marked_pixels(cloud, camera, target, 0.5, {});
+  double cpuTotal = 0.0;
+  for (const double c : cpu) cpuTotal += c;
+  REQUIRE(cpuTotal > 0.0);
+
+  for (const bool fixedPoint : {false, true}) {
+    TrainerOptions options;
+    options.forceFixedPoint = fixedPoint;
+    if (!fixedPoint && !ctx->info().floatAtomicAdd) continue;
+    INFO("fixed point: " << fixedPoint);
+    Trainer trainer(*ctx, cloud, options);
+    // An ordinary iteration counts nothing.
+    trainer.compute_gradients(camera, target);
+    for (const float c : trainer.densify_stats().markedPixels) REQUIRE(c == 0.f);
+
+    const StepStats stats = trainer.score_view(camera, target, 0.5f, 2.f);
+    const DensifyStats scored = trainer.densify_stats();
+    // A pixel either way: the GPU keeps the worst error to 1/65535, which moves the limit a little.
+    for (std::size_t i = 0; i < cpu.size(); ++i) {
+      CHECK_THAT(scored.markedPixels[i], WithinAbs(2.0 * cpu[i], 3.0));
+      CHECK_THAT(scored.markedLoss[i], WithinAbs(2.0 * cpu[i] * stats.loss, 3.0));
+    }
+    // Back to counting nothing, and the same again adds up.
+    trainer.compute_gradients(camera, target);
+    const DensifyStats after = trainer.densify_stats();
+    for (std::size_t i = 0; i < cpu.size(); ++i) CHECK(after.markedPixels[i] == scored.markedPixels[i]);
+  }
 }

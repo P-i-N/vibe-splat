@@ -11,6 +11,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <limits>
@@ -181,6 +182,94 @@ TEST_CASE("The limit is kept, with the highest gradients first", "[densify]") {
   r = densify_cloud(cloud, stats, options, rng);
   CHECK(r.cloud.size() == 6);
   CHECK(r.heldBack == 5);
+}
+
+TEST_CASE("Large Gaussians can split on the gradient that does not cancel", "[densify]") {
+  std::mt19937 rng(1);
+  GaussianCloud cloud = line_of(4, 1.f);
+  for (std::size_t a = 0; a < 3; ++a) {
+    cloud.scales[2 * 3 + a] = std::log(0.05f);
+    cloud.scales[3 * 3 + a] = std::log(0.05f);
+  }
+  DensifyStats stats = stats_of(4, 0.f);
+  stats.absoluteGradientSum = {9.f, 0.f, 9.f, 0.f};
+  stats.gradientSum = {0.f, 9.f, 0.f, 9.f};
+  DensifyOptions options = default_options();
+  options.splitThreshold = 4.f;
+  const DensifyResult r = densify_cloud(cloud, stats, options, rng);
+  // Large: only the first, by the absolute sum. Small: only the last, by the signed one.
+  CHECK(r.split == 1);
+  CHECK(r.cloned == 1);
+  CHECK(r.source == std::vector<std::int64_t>{1, 2, 3, -1, -1, -1});
+}
+
+TEST_CASE("With scored views only Gaussians in high-error pixels densify", "[densify]") {
+  std::mt19937 rng(1);
+  const GaussianCloud cloud = line_of(3, 0.05f);
+  DensifyStats stats = stats_of(3, 2.f);
+  stats.absoluteGradientSum.assign(3, 0.f);
+  stats.markedPixels = {60.f, 49.f, 0.f};
+  stats.markedLoss = {0.f, 0.f, 0.f};
+  DensifyOptions options = default_options();
+  options.scoredViews = 10;
+  options.minMarkedPixels = 5.f; // More than 5 per view
+  const DensifyResult r = densify_cloud(cloud, stats, options, rng);
+  CHECK(r.cloned == 1);
+  CHECK(r.cloud.positions[3 * 3] == cloud.positions[0]);
+}
+
+TEST_CASE("A share of the transparent goes, the least useful first", "[densify]") {
+  std::mt19937 rng(1);
+  GaussianCloud cloud = line_of(5, 0.05f);
+  for (std::size_t i = 0; i < 4; ++i) cloud.opacities[i] = std::log(0.001f / 0.999f);
+  DensifyStats stats = stats_of(5, 0.f);
+  stats.contribution = {4.f, 1.f, 3.f, 2.f, 0.f};
+  DensifyOptions options = default_options();
+  options.transparentShare = 0.5;
+  DensifyResult r = densify_cloud(cloud, stats, options, rng);
+  CHECK(r.pruned == 2);
+  CHECK(r.source == std::vector<std::int64_t>{0, 2, 4});
+
+  // With scored views, those in the worst pixels instead.
+  stats.markedPixels.assign(5, 0.f);
+  stats.markedLoss = {4.f, 1.f, 3.f, 2.f, 9.f};
+  options.scoredViews = 1;
+  r = densify_cloud(cloud, stats, options, rng);
+  CHECK(r.source == std::vector<std::int64_t>{1, 3, 4});
+}
+
+TEST_CASE("Exploration splits large Gaussians and seeds new ones within the limit", "[densify]") {
+  std::mt19937 rng(3);
+  GaussianCloud cloud = line_of(8, 1.f, 0.5f, 1);
+  for (std::size_t a = 0; a < 3; ++a) {
+    cloud.scales[0 * 3 + a] = std::log(0.01f); // Too small to split
+    cloud.scales[1 * 3 + a] = std::log(4.f);
+  }
+  const DensifyStats stats = stats_of(8, 0.f);
+  DensifyOptions options = default_options();
+  options.exploreSplits = 2;
+  options.exploreSeeds = 3;
+  DensifyResult r = densify_cloud(cloud, stats, options, rng);
+  CHECK(r.split == 2);
+  CHECK(r.seeded == 3);
+  REQUIRE(r.cloud.size() == 8 + 2 + 3);
+  r.cloud.validate();
+  CHECK(std::find(r.source.begin(), r.source.end(), std::int64_t{0}) != r.source.end());
+  // The last three are the seeds: within the box, with one colour from all sides.
+  const auto floats = static_cast<std::size_t>(3 * r.cloud.shCoeffs());
+  for (std::size_t i = 10; i < 13; ++i) {
+    CHECK(r.source[i] == -1);
+    CHECK(r.cloud.positions[i * 3] >= 0.f);
+    CHECK(r.cloud.positions[i * 3] <= 7.f);
+    CHECK(r.cloud.sh[i * floats + 3] == 0.f);
+    CHECK_THAT(1.f / (1.f + std::exp(-r.cloud.opacities[i])), WithinAbs(0.1f, 1e-5));
+  }
+
+  // At the limit, nothing is added.
+  options.maxGaussians = 9;
+  r = densify_cloud(cloud, stats, options, rng);
+  CHECK(r.cloud.size() == 9);
+  CHECK(r.seeded == 0);
 }
 
 TEST_CASE("The GPU collects densification statistics", "[densify][vulkan]") {

@@ -1,0 +1,25 @@
+#version 460
+// After a scored view: adds to each Gaussian's statistics how many marked
+// pixels it reached, and that count weighted by the view's loss.
+#extension GL_GOOGLE_include_directive : require
+#include "train_types.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Raw { float raw[]; };
+layout(std430, binding = 1) buffer DensifyStats { DensifyStat densifyStats[]; };
+
+layout(push_constant) uniform Push {
+  uint count;
+  float toPixels; // From the raw sum, which is over 3 pixels of the image like the derivatives
+  float loss;
+} pc;
+
+void main() {
+  const uint i = gl_GlobalInvocationID.x;
+  if (i < pc.count) {
+    const float pixels = raw[i * RAW_PER_SPLAT + 12u] * pc.toPixels;
+    densifyStats[i].more.y += pixels;
+    densifyStats[i].more.z += pixels * pc.loss;
+  }
+}

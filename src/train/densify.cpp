@@ -1,7 +1,9 @@
 #include "train/densify.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <limits>
 #include <numeric>
 #include <span>
 #include <stdexcept>
@@ -102,39 +104,69 @@ DensifyResult densify_cloud(const GaussianCloud &cloud, const DensifyStats &stat
   if (stats.gradientSum.size() != n || stats.visits.size() != n || stats.maxRadius.size() != n) {
     throw std::runtime_error("densify: statistics do not match the cloud");
   }
+  const bool scored = options.scoredViews > 0;
+  if ((options.splitThreshold > 0.f && stats.absoluteGradientSum.size() != n) ||
+      (scored && (stats.markedPixels.size() != n || stats.markedLoss.size() != n)) ||
+      (options.transparentShare < 1.0 && stats.contribution.size() != n)) {
+    throw std::runtime_error("densify: statistics do not match the options");
+  }
 
   DensifyResult result;
   enum class Action : std::uint8_t { Keep, Prune, Clone, Split };
   std::vector<Action> actions(n, Action::Keep);
-  std::vector<float> average(n, 0.f);
+  const auto largest_of = [&](std::size_t i) { return std::exp(std::max({cloud.scales[i * 3], cloud.scales[i * 3 + 1], cloud.scales[i * 3 + 2]})); };
+
+  std::vector<std::size_t> transparent;
+  for (std::size_t i = 0; i < n; ++i) {
+    const bool oversized = options.pruneLarge && (stats.maxRadius[i] > options.maxScreenRadius || largest_of(i) > options.maxWorldScale);
+    if (oversized || !all_finite(cloud, i)) {
+      actions[i] = Action::Prune;
+      ++result.pruned;
+    } else if (sigmoid(cloud.opacities[i]) < options.pruneOpacity) {
+      transparent.push_back(i);
+    }
+  }
+  if (options.transparentShare < 1.0) {
+    const auto worst_first = [&](std::size_t a, std::size_t b) {
+      return scored ? stats.markedLoss[a] > stats.markedLoss[b] : stats.contribution[a] < stats.contribution[b];
+    };
+    std::stable_sort(transparent.begin(), transparent.end(), worst_first);
+    transparent.resize(static_cast<std::size_t>(std::ceil(static_cast<double>(transparent.size()) * options.transparentShare)));
+  }
+  for (const std::size_t i : transparent) {
+    actions[i] = Action::Prune;
+    ++result.pruned;
+  }
+
+  // How far above its limit each candidate is, as limits differ between the two kinds.
+  std::vector<float> priority(n, 0.f);
   std::vector<std::size_t> candidates;
   std::size_t kept = 0;
   for (std::size_t i = 0; i < n; ++i) {
-    const float largest = std::exp(std::max({cloud.scales[i * 3], cloud.scales[i * 3 + 1], cloud.scales[i * 3 + 2]}));
-    const bool transparent = sigmoid(cloud.opacities[i]) < options.pruneOpacity;
-    const bool oversized = options.pruneLarge && (stats.maxRadius[i] > options.maxScreenRadius || largest > options.maxWorldScale);
-    if (transparent || oversized || !all_finite(cloud, i)) {
-      actions[i] = Action::Prune;
-      ++result.pruned;
-      continue;
-    }
+    if (actions[i] == Action::Prune) continue;
     ++kept;
-    average[i] = stats.visits[i] > 0.f ? stats.gradientSum[i] / stats.visits[i] : 0.f;
-    if (average[i] >= options.gradientThreshold) candidates.push_back(i);
+    if (stats.visits[i] <= 0.f) continue;
+    if (scored && stats.markedPixels[i] / static_cast<float>(options.scoredViews) <= options.minMarkedPixels) continue;
+    const bool splitsAlone = options.splitThreshold > 0.f && largest_of(i) > options.denseScale;
+    const float value = (splitsAlone ? stats.absoluteGradientSum[i] : stats.gradientSum[i]) / stats.visits[i];
+    const float limit = splitsAlone ? options.splitThreshold : options.gradientThreshold;
+    if (value >= limit) {
+      priority[i] = limit > 0.f ? value / limit : value;
+      candidates.push_back(i);
+    }
   }
 
   // Each candidate adds one Gaussian, whichever it does: a clone keeps the
   // original and a split replaces it with two.
   const std::size_t room = options.maxGaussians > kept ? options.maxGaussians - kept : 0;
   if (candidates.size() > room) {
-    std::stable_sort(candidates.begin(), candidates.end(), [&](std::size_t a, std::size_t b) { return average[a] > average[b]; });
+    std::stable_sort(candidates.begin(), candidates.end(), [&](std::size_t a, std::size_t b) { return priority[a] > priority[b]; });
     result.heldBack = candidates.size() - room;
     candidates.resize(room);
     std::sort(candidates.begin(), candidates.end());
   }
   for (const std::size_t i : candidates) {
-    const float largest = std::exp(std::max({cloud.scales[i * 3], cloud.scales[i * 3 + 1], cloud.scales[i * 3 + 2]}));
-    if (largest > options.denseScale) {
+    if (largest_of(i) > options.denseScale) {
       actions[i] = Action::Split;
       ++result.split;
     } else {
@@ -143,11 +175,59 @@ DensifyResult densify_cloud(const GaussianCloud &cloud, const DensifyStats &stat
     }
   }
 
+  // Exploration, with what room is left. Among the Gaussians nothing asked
+  // for, a split goes to one of the larger half.
+  std::size_t left = room - candidates.size();
+  if (options.exploreSplits > 0 && left > 0) {
+    std::vector<std::size_t> large;
+    for (std::size_t i = 0; i < n; ++i) {
+      if (actions[i] == Action::Keep && largest_of(i) > options.denseScale) large.push_back(i);
+    }
+    const auto mean_scale = [&](std::size_t i) { return cloud.scales[i * 3] + cloud.scales[i * 3 + 1] + cloud.scales[i * 3 + 2]; };
+    const auto middle = large.begin() + static_cast<std::ptrdiff_t>(large.size() / 2);
+    std::nth_element(large.begin(), middle, large.end(), [&](std::size_t a, std::size_t b) { return mean_scale(a) > mean_scale(b); });
+    large.resize((large.size() + 1) / 2);
+    std::shuffle(large.begin(), large.end(), rng);
+    for (std::size_t k = 0; k < std::min({options.exploreSplits, large.size(), left}); ++k) {
+      actions[large[k]] = Action::Split;
+      ++result.split;
+    }
+    left -= std::min({options.exploreSplits, large.size(), left});
+  }
+
+  // Seeds: where to, how large (a typical Gaussian) and which colour (a random one's).
+  std::vector<std::size_t> survivors;
+  std::array<float, 3> low{}, high{};
+  float seedScale = 0.f;
+  result.seeded = std::min(options.exploreSeeds, left);
+  if (result.seeded > 0) {
+    for (std::size_t i = 0; i < n; ++i) {
+      if (actions[i] != Action::Prune) survivors.push_back(i);
+    }
+    if (survivors.empty()) {
+      result.seeded = 0;
+    } else {
+      low.fill(std::numeric_limits<float>::max());
+      high.fill(std::numeric_limits<float>::lowest());
+      std::vector<float> scales;
+      scales.reserve(survivors.size());
+      for (const std::size_t i : survivors) {
+        for (std::size_t a = 0; a < 3; ++a) {
+          low[a] = std::min(low[a], cloud.positions[i * 3 + a]);
+          high[a] = std::max(high[a], cloud.positions[i * 3 + a]);
+        }
+        scales.push_back((cloud.scales[i * 3] + cloud.scales[i * 3 + 1] + cloud.scales[i * 3 + 2]) / 3.f);
+      }
+      std::nth_element(scales.begin(), scales.begin() + static_cast<std::ptrdiff_t>(scales.size() / 2), scales.end());
+      seedScale = scales[scales.size() / 2];
+    }
+  }
+
   GaussianCloud &out = result.cloud;
   out.shDegree = cloud.shDegree;
   // Reserved up front: growing the arrays one Gaussian at a time copies them over and over.
   // A clone adds one, and a split replaces one with two.
-  const std::size_t total = kept + result.cloned + result.split;
+  const std::size_t total = kept + result.cloned + result.split + result.seeded;
   out.positions.reserve(total * 3);
   out.scales.reserve(total * 3);
   out.rotations.reserve(total * 4);
@@ -178,6 +258,20 @@ DensifyResult densify_cloud(const GaussianCloud &cloud, const DensifyStats &stat
         result.source.push_back(-1);
       }
     }
+  }
+  const auto floats = static_cast<std::size_t>(3 * cloud.shCoeffs());
+  for (std::size_t k = 0; k < result.seeded; ++k) {
+    const std::size_t at = out.size();
+    append_copy(out, cloud, survivors[std::uniform_int_distribution<std::size_t>(0, survivors.size() - 1)(rng)]);
+    for (std::size_t a = 0; a < 3; ++a) {
+      out.positions[at * 3 + a] = std::uniform_real_distribution<float>(low[a], high[a])(rng);
+      out.scales[at * 3 + a] = seedScale;
+    }
+    std::fill_n(out.rotations.begin() + static_cast<std::ptrdiff_t>(at * 4), 4, 0.f);
+    out.rotations[at * 4] = 1.f;
+    out.opacities[at] = std::log(0.1f / 0.9f);
+    std::fill_n(out.sh.begin() + static_cast<std::ptrdiff_t>(at * floats + 3), floats - 3, 0.f); // Same colour from all sides
+    result.source.push_back(-1);
   }
   return result;
 }

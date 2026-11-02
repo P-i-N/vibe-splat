@@ -40,6 +40,11 @@ struct ReferenceImage {
 // backward pass adds up for pruning.
 [[nodiscard]] std::vector<double> reference_contributions(const GaussianCloud &cloud, const Camera &camera, const ReferenceOptions &options);
 
+// Per Gaussian, how many pixels it reaches whose mean error is at least `share`
+// of the image's worst, as Trainer::score_view() counts them. `target` is RGBA8.
+[[nodiscard]] std::vector<double> reference_marked_pixels(const GaussianCloud &cloud, const Camera &camera, const std::vector<std::uint8_t> &target,
+                                                          double share, const ReferenceOptions &options);
+
 struct ReferenceLoss {
   double loss = 0.0;
   double l1 = 0.0;   // Mean absolute difference
@@ -52,6 +57,7 @@ struct ReferenceLoss {
 
 struct ParameterGradients {
   std::vector<double> positions, scales, rotations, opacities, sh;
+  std::vector<double> absoluteCentre; // 2 per Gaussian: |dL/dcentre| summed per pixel, so nothing cancels
 };
 
 // Gradients of the scalar sum(adjoint * image) with respect to all parameters.

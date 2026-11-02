@@ -17,8 +17,9 @@ layout(std430, binding = 1) readonly buffer Target { uint target[]; };
 layout(std430, binding = 2) readonly buffer Fields { vec4 fields[]; }; // Plane j at j * pixels
 layout(std430, binding = 3) writeonly buffer Adjoint { vec4 adjoint[]; };
 layout(std430, binding = 4) buffer GroupTotals { vec2 groupTotals[]; }; // x: SSIM, y: L1
+layout(std430, binding = 5) buffer ErrorMax { uint errorMax; }; // The worst pixel, over 65535, when scoring
 
-layout(push_constant) uniform Push { uint width; uint height; uint gridW; float lambda; } pc;
+layout(push_constant) uniform Push { uint width; uint height; uint gridW; float lambda; uint scoring; } pc;
 
 const float WEIGHTS[11] = float[](0.00102838, 0.00759876, 0.03600077, 0.10936069, 0.21300554, 0.26601172,
                                   0.21300554, 0.10936069, 0.03600077, 0.00759876, 0.00102838);
@@ -77,7 +78,12 @@ void main() {
       }
     }
     const vec3 result = (1.0 - pc.lambda) * sign(difference) - pc.lambda * (p + 2.0 * x * q + y * r);
-    adjoint[pixel] = vec4(result * perValue, 0.0);
+    // When scoring, alpha holds the pixel's mean error, for train_error_mask.comp.
+    const float error = own / 3.0;
+    adjoint[pixel] = vec4(result * perValue, pc.scoring != 0u ? error : 0.0);
+    if (pc.scoring != 0u) {
+      atomicMax(errorMax, uint(clamp(error, 0.0, 1.0) * 65535.0));
+    }
   }
   const float total = workgroup_sum(own);
   if (gl_LocalInvocationIndex == 0u) {

@@ -21,7 +21,7 @@ using vk::MemoryUsage;
 constexpr VkBufferUsageFlags kStorage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
 constexpr std::uint32_t kTileSize = 16;
 constexpr float kBeta1 = 0.9f, kBeta2 = 0.999f, kEpsilon = 1e-15f;
-constexpr std::size_t kRawGradientsPerSplat = 10; // RAW_PER_SPLAT in train_types.glsl
+constexpr std::size_t kRawGradientsPerSplat = 13; // RAW_PER_SPLAT in train_types.glsl
 constexpr std::uint32_t kMaxMarks = 16;
 
 // Must match shaders/splat_types.glsl and train_types.glsl (std430).
@@ -60,6 +60,15 @@ struct ExposurePush {
 struct LossPush {
   std::uint32_t width, height, gridW;
   float lambda;
+  std::uint32_t scoring;
+};
+struct ErrorMaskPush {
+  std::uint32_t pixels;
+  float share;
+};
+struct ScorePush {
+  std::uint32_t count;
+  float toPixels, loss;
 };
 struct FixedPush {
   std::uint32_t count;
@@ -111,9 +120,10 @@ Trainer::Trainer(vk::Context &ctx, const GaussianCloud &initial, const TrainerOp
       forward_(ctx, shaders::train_forward_comp, 5, sizeof(TilePush)),
       exposure_(ctx, shaders::train_exposure_comp, 2, sizeof(ExposurePush)),
       ssim_(ctx, shaders::train_ssim_comp, 4, sizeof(SsimPush)),
-      loss_(ctx, shaders::train_loss_comp, 5, sizeof(LossPush)),
+      loss_(ctx, shaders::train_loss_comp, 6, sizeof(LossPush)),
       exposureBackward_(ctx, shaders::train_exposure_backward_comp, 3, sizeof(ExposurePush)),
-      gradient_(ctx, shaders::train_gradient_comp, 14),
+      errorMask_(ctx, shaders::train_error_mask_comp, 2, sizeof(ErrorMaskPush)),
+      score_(ctx, shaders::train_score_comp, 2, sizeof(ScorePush)), gradient_(ctx, shaders::train_gradient_comp, 14),
       adam_(ctx, shaders::train_adam_comp, 4, sizeof(AdamPush)), gather_(ctx, shaders::train_gather_comp, 3, sizeof(GatherPush)),
       sorter_(ctx) {
   initial.validate();
@@ -140,6 +150,7 @@ Trainer::Trainer(vk::Context &ctx, const GaussianCloud &initial, const TrainerOp
 
   camera_ = std::make_unique<Buffer>(ctx, sizeof(GpuCamera), kStorage, MemoryUsage::Upload);
   counters_ = std::make_unique<Buffer>(ctx, sizeof(std::uint32_t) * 2, kStorage, MemoryUsage::Readback);
+  errorMax_ = gpu_buffer(ctx, sizeof(std::uint32_t));
   allocate_per_gaussian();
 
   VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
@@ -192,7 +203,7 @@ void Trainer::allocate_per_gaussian() {
   tmpValues_ = gpu_buffer(ctx_, n * 4);
   coverage_ = gpu_buffer(ctx_, n * 4);
   rawGradients_ = gpu_buffer(ctx_, n * kRawGradientsPerSplat * sizeof(float));
-  stats_ = gpu_buffer(ctx_, n * 16);
+  stats_ = gpu_buffer(ctx_, n * 32);
   ctx_.submit_and_wait([&](VkCommandBuffer cmd) {
     clear(cmd, *stats_);
     vk::compute_barrier(cmd);
@@ -343,13 +354,18 @@ void Trainer::record_backward(VkCommandBuffer cmd) {
     vk::compute_barrier(cmd);
   }
   const vk::Buffer *seen = exposing_ ? exposed_.get() : image_.get();
+  if (scoreErrorShare_ > 0.f) clear(cmd, *errorMax_);
   ssim_.dispatch(cmd, {seen, target_.get(), fields_.get(), groupTotals_.get()}, SsimPush{w, h, gridW_}, tileCount_);
   vk::compute_barrier(cmd);
-  loss_.dispatch(cmd, {seen, target_.get(), fields_.get(), adjoint_.get(), groupTotals_.get()},
-                 LossPush{w, h, gridW_, options_.lambdaSsim}, tileCount_);
+  loss_.dispatch(cmd, {seen, target_.get(), fields_.get(), adjoint_.get(), groupTotals_.get(), errorMax_.get()},
+                 LossPush{w, h, gridW_, options_.lambdaSsim, scoreErrorShare_ > 0.f ? 1u : 0u}, tileCount_);
   vk::compute_barrier(cmd);
   if (exposing_) {
     exposureBackward_.dispatch(cmd, {image_.get(), adjoint_.get(), exposureTotals_.get()}, exposure, vk::div_up(w * h, 256));
+    vk::compute_barrier(cmd);
+  }
+  if (scoreErrorShare_ > 0.f) {
+    errorMask_.dispatch(cmd, {adjoint_.get(), errorMax_.get()}, ErrorMaskPush{w * h, scoreErrorShare_}, vk::div_up(w * h, 256));
     vk::compute_barrier(cmd);
   }
   mark(cmd, "loss");
@@ -395,6 +411,19 @@ std::vector<float> Trainer::render(const Camera &camera) {
 
 StepStats Trainer::compute_gradients(const Camera &camera, std::span<const std::uint8_t> target) {
   return run(camera, target, nullptr);
+}
+
+StepStats Trainer::score_view(const Camera &camera, std::span<const std::uint8_t> target, float errorShare, float pixelWeight) {
+  scoreErrorShare_ = errorShare;
+  const StepStats stats = run(camera, target, nullptr);
+  scoreErrorShare_ = 0.f;
+  // The raw sums are over 3 pixels of the image, like the derivatives.
+  const float toPixels = 3.f * static_cast<float>(width_) * static_cast<float>(height_) * pixelWeight;
+  ctx_.submit_and_wait([&](VkCommandBuffer cmd) {
+    score_.dispatch(cmd, {rawGradients_.get(), stats_.get()}, ScorePush{count_, toPixels, stats.loss}, vk::div_up(count_, 256));
+    vk::compute_barrier(cmd);
+  });
+  return stats;
 }
 
 void Trainer::wait_for_prefetch() {
@@ -527,11 +556,17 @@ DensifyStats Trainer::densify_stats() const {
   stats.visits.resize(count_);
   stats.maxRadius.resize(count_);
   stats.contribution.resize(count_);
+  stats.absoluteGradientSum.resize(count_);
+  stats.markedPixels.resize(count_);
+  stats.markedLoss.resize(count_);
   for (std::size_t i = 0; i < count_; ++i) {
-    stats.gradientSum[i] = raw[i * 4];
-    stats.visits[i] = raw[i * 4 + 1];
-    stats.maxRadius[i] = raw[i * 4 + 2];
-    stats.contribution[i] = raw[i * 4 + 3];
+    stats.gradientSum[i] = raw[i * 8];
+    stats.visits[i] = raw[i * 8 + 1];
+    stats.maxRadius[i] = raw[i * 8 + 2];
+    stats.contribution[i] = raw[i * 8 + 3];
+    stats.absoluteGradientSum[i] = raw[i * 8 + 4];
+    stats.markedPixels[i] = raw[i * 8 + 5];
+    stats.markedLoss[i] = raw[i * 8 + 6];
   }
   return stats;
 }
@@ -617,7 +652,7 @@ void Trainer::reset_opacity(float maximum) {
 
 std::uint64_t Trainer::bytes_per_gaussian() const noexcept {
   const std::uint64_t parameters = (3 + 3 + 4 + 1 + shFloats_) * sizeof(float) * 4; // Value, gradient, 2 moments
-  return parameters + sizeof(GpuSplat) + 4 * 5 + kRawGradientsPerSplat * sizeof(float) + 16;
+  return parameters + sizeof(GpuSplat) + 4 * 5 + kRawGradientsPerSplat * sizeof(float) + 32;
 }
 
 std::uint64_t Trainer::gpu_bytes() const {

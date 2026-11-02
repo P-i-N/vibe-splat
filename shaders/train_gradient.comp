@@ -21,7 +21,7 @@ layout(std430, binding = 9) writeonly buffer GradRotations { float gradRotations
 layout(std430, binding = 10) writeonly buffer GradOpacities { float gradOpacities[]; };
 layout(std430, binding = 11) writeonly buffer GradSH { float gradSh[]; };
 layout(std430, binding = 12) readonly buffer Splats { TrainSplat splats[]; };
-layout(std430, binding = 13) buffer DensifyStats { vec4 densifyStats[]; }; // x: gradient sum, y: visits, z: largest radius, w: contribution
+layout(std430, binding = 13) buffer DensifyStats { DensifyStat densifyStats[]; };
 
 // tr(G A X J^T) for 2x2 symmetric G, with A and J 2x3 and X 3x3.
 float trace_term(mat2 G, mat3x2 A, mat3 X, mat3x2 J) {
@@ -60,10 +60,11 @@ void main() {
 
   // What densification decides on. Only this invocation touches this element.
   // Per half the image rather than per pixel, so that one threshold suits any resolution.
-  densifyStats[i].x += length(gCentre * 0.5 * cam.viewport.xy);
-  densifyStats[i].y += 1.0;
-  densifyStats[i].z = max(densifyStats[i].z, splats[i].centerRadius.z);
-  densifyStats[i].w += raw[at + 9u] * 3.0 * cam.viewport.x * cam.viewport.y; // In pixels
+  densifyStats[i].main.x += length(gCentre * 0.5 * cam.viewport.xy);
+  densifyStats[i].main.y += 1.0;
+  densifyStats[i].main.z = max(densifyStats[i].main.z, splats[i].centerRadius.z);
+  densifyStats[i].main.w += raw[at + 9u] * 3.0 * cam.viewport.x * cam.viewport.y; // In pixels
+  densifyStats[i].more.x += length(vec2(raw[at + 10u], raw[at + 11u]) * 0.5 * cam.viewport.xy);
   const mat2 G = mat2(raw[at + 3u], raw[at + 4u], raw[at + 4u], raw[at + 5u]);
 
   const mat3 Rv = mat3(cam.view);

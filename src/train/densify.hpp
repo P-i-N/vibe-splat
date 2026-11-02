@@ -14,6 +14,9 @@ struct DensifyStats {
   std::vector<float> visits;      // How many views saw it
   std::vector<float> maxRadius;   // Largest size on screen, in pixels
   std::vector<float> contribution; // Its blending weight T alpha summed over the pixels of those views
+  std::vector<float> absoluteGradientSum; // As gradientSum, but pixels pulling opposite ways do not cancel
+  std::vector<float> markedPixels; // Over the views scored, the high-error pixels it reached
+  std::vector<float> markedLoss;   // The same, each view's count weighted by its loss
 };
 
 struct DensifyOptions {
@@ -24,6 +27,21 @@ struct DensifyOptions {
   float maxScreenRadius = 20.f;
   float maxWorldScale = 0.0f;
   std::size_t maxGaussians = ~std::size_t{0};
+  // Above 0, large Gaussians split on the gradient that does not cancel, against
+  // this limit (AbsGS). Small ones still clone on the other.
+  float splitThreshold = 0.0f;
+  // Above 0, the views scored (FastGS): only Gaussians reaching more than
+  // minMarkedPixels high-error pixels per view densify at all.
+  int scoredViews = 0;
+  float minMarkedPixels = 5.f;
+  // The share of the too transparent actually removed: below 1, those adding
+  // least to the images, or with scored views those in the worst pixels.
+  double transparentShare = 1.0;
+  // Each round, regardless of gradients (the blur trap paper): this many
+  // random large Gaussians split, and this many new ones are placed at random
+  // in the cloud's bounding box. Places gradients never point to get a chance.
+  std::size_t exploreSplits = 0;
+  std::size_t exploreSeeds = 0;
 };
 
 struct DensifyResult {
@@ -33,6 +51,7 @@ struct DensifyResult {
   std::vector<std::int64_t> source;
   std::size_t cloned = 0;
   std::size_t split = 0;
+  std::size_t seeded = 0;
   std::size_t pruned = 0;
   std::size_t heldBack = 0; // Candidates left out to stay within maxGaussians
 };

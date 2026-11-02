@@ -234,6 +234,34 @@ std::vector<double> reference_contributions(const GaussianCloud &cloud, const Ca
   return contributions;
 }
 
+std::vector<double> reference_marked_pixels(const GaussianCloud &cloud, const Camera &camera, const std::vector<std::uint8_t> &target, double share,
+                                            const ReferenceOptions &options) {
+  const ReferenceImage image = composite(cloud, camera, options, nullptr);
+  std::vector<double> errors(image.rgb.size());
+  double worst = 0.0;
+  for (std::size_t at = 0; at < errors.size(); ++at) {
+    for (std::size_t c = 0; c < 3; ++c) errors[at] += std::abs(image.rgb[at][static_cast<int>(c)] - target[at * 4 + c] / 255.0) / 3.0;
+    worst = std::max(worst, errors[at]);
+  }
+  std::vector<double> counts(cloud.size(), 0.0);
+  const std::vector<Splat> splats = prepare(cloud, camera, options);
+  for (std::size_t j = 0; j < splats.size(); ++j) {
+    const Splat &s = splats[j];
+    const int x0 = std::max(0, static_cast<int>(std::floor(s.center.x - s.radius)) - 1), x1 = std::min(camera.width - 1, static_cast<int>(std::ceil(s.center.x + s.radius)) + 1);
+    const int y0 = std::max(0, static_cast<int>(std::floor(s.center.y - s.radius)) - 1), y1 = std::min(camera.height - 1, static_cast<int>(std::ceil(s.center.y + s.radius)) + 1);
+    for (int y = y0; y <= y1; ++y) {
+      for (int x = x0; x <= x1; ++x) {
+        dvec2 d;
+        double power = 0.0, alpha = 0.0;
+        if (!splat_at(s, x, y, d, power, alpha, options.noCutoffs)) continue;
+        const std::size_t at = static_cast<std::size_t>(y) * camera.width + x;
+        if (j >= image.stop[at] && errors[at] >= share * worst) counts[s.index] += 1.0;
+      }
+    }
+  }
+  return counts;
+}
+
 ReferenceLoss reference_loss(const ReferenceImage &image, const std::vector<std::uint8_t> &target, double lambda) {
   const int w = image.width, h = image.height;
   const std::size_t pixels = static_cast<std::size_t>(w) * h;
@@ -315,6 +343,7 @@ ParameterGradients reference_gradients(const GaussianCloud &cloud, const Camera 
   out.rotations.assign(n * 4, 0.0);
   out.opacities.assign(n, 0.0);
   out.sh.assign(cloud.sh.size(), 0.0);
+  out.absoluteCentre.assign(n * 2, 0.0);
 
   // train_backward.glsl
   std::vector<std::array<double, 9>> raw(n, std::array<double, 9>{});
@@ -348,6 +377,8 @@ ParameterGradients reference_gradients(const GaussianCloud &cloud, const Camera 
           const dvec2 v(s.conic.x * d.x + s.conic.y * d.y, s.conic.y * d.x + s.conic.z * d.y);
           g[1] += dPower * v.x;
           g[2] += dPower * v.y;
+          out.absoluteCentre[s.index * 2] += std::abs(dPower * v.x);
+          out.absoluteCentre[s.index * 2 + 1] += std::abs(dPower * v.y);
           g[3] += dPower * 0.5 * v.x * v.x;
           g[4] += dPower * 0.5 * v.x * v.y;
           g[5] += dPower * 0.5 * v.y * v.y;

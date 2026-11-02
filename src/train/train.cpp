@@ -31,14 +31,14 @@ namespace {
 
 constexpr float kInitialOpacity = 0.1f;
 constexpr float kResetOpacity = 0.01f;
-constexpr double kDenseFraction = 0.01;      // Of the scene's extent: larger Gaussians split, smaller clone
 // Larger than either of these and a Gaussian is removed. They only catch true
 // outliers. Tight limits take big Gaussians out of walls and floors faster than
 // new ones can fill the holes, and quality collapses: 20 pixels on screen cost
 // 10 dB in a run of 7000 iterations at 800x600.
 constexpr double kMaxWorldFraction = 1.0;    // Of the scene's extent
 constexpr double kMaxScreenFraction = 0.25;  // Of the image's longer side
-constexpr int kDensifyInterval = 100;
+// A pixel is high error above this share of its view's worst, as in FastGS.
+constexpr float kScoreErrorShare = 0.1f;
 constexpr int kOpacityResetInterval = 3000;
 // A cloud just after an opacity reset renders almost black, so checkpoints wait this long.
 constexpr int kCheckpointRecovery = 1000;
@@ -333,6 +333,8 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
   extent = std::max(extent * 1.1, 1e-6);
   std::vector<double> depths;
   for (const ColmapPoint &p : model.points) depths.push_back(glm::length(p.position - middle));
+  // Cameras close together say little about the size of what they look at.
+  if (options.pointExtent) extent = std::max(std::accumulate(depths.begin(), depths.end(), 0.0) / static_cast<double>(depths.size()), 1e-6);
   std::nth_element(depths.begin(), depths.begin() + static_cast<std::ptrdiff_t>(depths.size() / 2), depths.end());
   const double typicalDepth = std::max(depths[depths.size() / 2] + extent, 1e-6);
 
@@ -467,20 +469,38 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
                               before, seconds));
     }
 
-    if (options.densify && iteration >= densifyFrom && iteration <= densifyUntil && iteration % kDensifyInterval == 0) {
+    if (options.densify && iteration >= densifyFrom && iteration <= densifyUntil && iteration % options.densifyInterval == 0) {
       // What a Gaussian costs, with the tile entries it brings and room for them to grow.
       const double perGaussian = static_cast<double>(trainer.bytes_per_gaussian()) + 1.5 * Trainer::kBytesPerTileEntry * entriesPerVisible;
       const std::uint64_t available = trainerOptions.memoryBudget;
       const std::uint64_t pixelBytes = static_cast<std::uint64_t>(view.camera.width) * view.camera.height * Trainer::kBytesPerPixel;
       DensifyOptions densifyOptions;
-      densifyOptions.gradientThreshold = options.gradientThreshold;
-      densifyOptions.denseScale = static_cast<float>(kDenseFraction * extent);
+      const double densifyProgress = static_cast<double>(iteration) / std::max(densifyUntil, 1);
+      const auto rise = static_cast<float>(std::pow(options.thresholdRise, densifyProgress - 0.5));
+      densifyOptions.gradientThreshold = options.gradientThreshold * rise;
+      densifyOptions.splitThreshold = options.splitThreshold * rise;
+      densifyOptions.denseScale = static_cast<float>(options.denseFraction * extent);
       densifyOptions.maxWorldScale = static_cast<float>(kMaxWorldFraction * extent);
       densifyOptions.maxScreenRadius = static_cast<float>(kMaxScreenFraction * std::max(view.camera.width, view.camera.height));
-      densifyOptions.pruneLarge = iteration > kOpacityResetInterval;
+      densifyOptions.pruneLarge = iteration > kOpacityResetInterval && !options.significancePrune;
+      if (options.significancePrune) densifyOptions.transparentShare = 0.5;
+      densifyOptions.exploreSplits = densifyOptions.exploreSeeds = static_cast<std::size_t>(options.explore);
       densifyOptions.maxGaussians = available > pixelBytes ? static_cast<std::size_t>(static_cast<double>(available - pixelBytes) / perGaussian) : 0;
       if (options.maxGaussians > 0) densifyOptions.maxGaussians = std::min(densifyOptions.maxGaussians, options.maxGaussians);
       const auto densifyStart = std::chrono::steady_clock::now();
+      if (options.scoreViews > 0) {
+        densifyOptions.scoredViews = options.scoreViews;
+        densifyOptions.minMarkedPixels = options.scoreMinPixels;
+        std::uniform_int_distribution<std::size_t> pick(0, trainViews.size() - 1);
+        for (int k = 0; k < options.scoreViews; ++k) {
+          const std::size_t i = pick(densifyRng);
+          const View &scored = view_at(i, iteration);
+          // A pixel of a smaller image stands for several of the full one.
+          const float area = static_cast<float>(trainViews[i].camera.width) / static_cast<float>(scored.camera.width);
+          trainer.set_exposure(exposures[i].value);
+          fitting([&] { return trainer.score_view(scored.camera, scored.rgba, kScoreErrorShare, area * area); });
+        }
+      }
       const DensifyResult result = trainer.densify(densifyOptions, densifyRng);
       report.heldBack += result.heldBack;
       // Not on the last round: as in the paper, and the cloud would have

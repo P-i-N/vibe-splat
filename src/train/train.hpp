@@ -34,6 +34,17 @@ struct TrainOptions {
   // at the end of densification and again halfway through the rest. 0: none.
   // 70% each time leaves a tenth, for about 0.1 dB of PSNR on held-out views.
   double pruneShare = 0.7;
+  // The gradient threshold rises by this factor during densification, centred
+  // on gradientThreshold, so that broad shapes come first (Improving ADC). 1: fixed.
+  double thresholdRise = 1.0;
+  float splitThreshold = 0.f;     // Above 0: see DensifyOptions::splitThreshold
+  double denseFraction = 0.01;    // Of the scene's extent: larger Gaussians split, smaller clone
+  int densifyInterval = 100;      // Iterations between densification rounds
+  int scoreViews = 0;             // Above 0: views scored per round, see DensifyOptions::scoredViews
+  float scoreMinPixels = 5.f;     // See DensifyOptions::minMarkedPixels
+  int explore = 0;                // Random splits and random new Gaussians per round
+  bool significancePrune = false; // Of the too transparent remove the half adding least, and none for size
+  bool pointExtent = false;       // The scene's extent from the sparse points, not the cameras
 };
 
 struct TrainReport {

@@ -125,6 +125,21 @@ train options (writes project/splat.ply and project/preview_*.png):
   --prune <share>         Remove this share of Gaussians, those adding least, at the
                           end of densification and again halfway to the end
                           (default 0.7, which leaves a tenth; 0 keeps all)
+  --threshold-rise <x>    The gradient threshold rises by this factor over
+                          densification, centred on its value (default 1: fixed)
+  --split-threshold <x>   Large Gaussians split on the gradient that pixels pulling
+                          opposite ways do not cancel, above this (default 0: off)
+  --dense-fraction <x>    Larger than this share of the scene: split; smaller: clone
+                          (default 0.01)
+  --densify-interval <n>  Iterations between densification rounds (default 100)
+  --score-views <n>       Densify only Gaussians reaching many high-error pixels in
+                          this many views per round (default 0: off)
+  --score-min-pixels <x>  How many per view (default 5)
+  --explore <n>           Per round, split n random large Gaussians and place n new
+                          ones at random (default 0)
+  --significance-prune    Of the too transparent, remove the half adding least, and
+                          remove none for their size
+  --point-extent          Take the scene's extent from the sparse points, not the cameras
 
 make-test-views options:
   --count <n>             Number of images (default 12)
@@ -442,9 +457,11 @@ int cmd_train(const GlobalOptions &opts) {
   for (auto &a : rest) {
     if (a == "-o") a = "--out";
   }
-  const splat::cli::Args args(rest, {"--no-densify", "--full-resolution", "--exposure", "--full-adam"});
+  const splat::cli::Args args(rest, {"--no-densify", "--full-resolution", "--exposure", "--full-adam", "--significance-prune", "--point-extent"});
   args.allow_only({"out", "iterations", "lambda-ssim", "sh-degree", "max-size", "max-views", "holdout", "seed", "report-every", "save-every",
-                   "no-densify", "gradient-threshold", "vram-budget", "max-gaussians", "prune", "full-resolution", "exposure", "full-adam"});
+                   "no-densify", "gradient-threshold", "vram-budget", "max-gaussians", "prune", "full-resolution", "exposure", "full-adam",
+                   "threshold-rise", "split-threshold", "dense-fraction", "densify-interval", "score-views", "score-min-pixels", "explore",
+                   "significance-prune", "point-extent"});
   if (args.positionals().size() != 1) {
     std::println(stderr, "Usage: splat train <project> [options]  (see splat --help)");
     return 2;
@@ -469,6 +486,15 @@ int cmd_train(const GlobalOptions &opts) {
   options.vramBudgetGiB = args.number("vram-budget", 0.0);
   options.maxGaussians = args.number<std::size_t>("max-gaussians", 0);
   options.pruneShare = std::clamp(args.number("prune", options.pruneShare), 0.0, 0.95);
+  options.thresholdRise = std::max(args.number("threshold-rise", options.thresholdRise), 1.0);
+  options.splitThreshold = std::max(args.number("split-threshold", options.splitThreshold), 0.f);
+  options.denseFraction = args.number("dense-fraction", options.denseFraction);
+  options.densifyInterval = std::max(args.number("densify-interval", options.densifyInterval), 1);
+  options.scoreViews = std::max(args.number("score-views", options.scoreViews), 0);
+  options.scoreMinPixels = args.number("score-min-pixels", options.scoreMinPixels);
+  options.explore = std::max(args.number("explore", options.explore), 0);
+  options.significancePrune = args.has("significance-prune");
+  options.pointExtent = args.has("point-extent");
   splat::vk::Context ctx(opts.context);
   std::println("Device: {}", ctx.info().name);
   splat::run_train(ctx, options);
