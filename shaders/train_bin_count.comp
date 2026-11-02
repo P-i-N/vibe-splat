@@ -24,8 +24,14 @@ void main() {
     coverage[r] = 0u;
     return;
   }
-  const uvec4 t = splats[values[r]].tiles;
-  const uint n = (t.z - t.x + 1u) * (t.w - t.y + 1u);
+  const TrainSplat s = splats[values[r]];
+  const uvec4 t = s.tiles;
+  uint n = 0u;
+  for (uint y = t.y; y <= t.w; ++y) {
+    for (uint x = t.x; x <= t.z; ++x) {
+      n += splat_reaches_tile(s, x, y) ? 1u : 0u;
+    }
+  }
   coverage[r] = n;
   atomicAdd(counters.visible, 1u);
   atomicAdd(counters.total, n);

@@ -108,7 +108,8 @@ splat view project/sparse/0/preview.ply
 does automatic differentiation: each pass has a hand-derived counterpart.
 
 - **Forward.** Parameters become screen-space splats, which are sorted by depth.
-  Each splat then adds one entry per 16x16 pixel tile it covers, and a stable
+  Each splat then adds one entry per 16x16 pixel tile its ellipse reaches (not
+  just every tile of its bounding box), and a stable
   sort by tile leaves every tile with its own depth-sorted list. One workgroup
   per tile, one thread per pixel: the tile's splats are staged through shared
   memory and every thread blends its own pixel in registers, front to back.

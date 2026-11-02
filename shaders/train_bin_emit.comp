@@ -21,10 +21,15 @@ void main() {
     return;
   }
   const uint splat = values[r];
-  const uvec4 t = splats[splat].tiles;
+  const TrainSplat s = splats[splat];
+  const uvec4 t = s.tiles;
   uint slot = offsets[r];
   for (uint y = t.y; y <= t.w; ++y) {
     for (uint x = t.x; x <= t.z; ++x) {
+      // The same test as in train_bin_count.comp, so the counts hold.
+      if (!splat_reaches_tile(s, x, y)) {
+        continue;
+      }
       entryKeys[slot] = y * pc.gridW + x;
       entryValues[slot] = splat;
       ++slot;

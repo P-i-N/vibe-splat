@@ -28,6 +28,35 @@ uvec4 splat_pixels(TrainSplat s, uvec4 tilePixels) {
                min(uint(high.x) + 1u, tilePixels.z), min(uint(high.y) + 1u, tilePixels.w));
 }
 
+// Whether a splat reaches any pixel centre of a tile, by the rule of
+// splat_at(): q = -2 power = d^T conic d must stay within 2 log(255 opacity).
+// The bounding box of that ellipse covers many tiles it misses, mostly along
+// the diagonal of a thin one, and each of those costs a tile entry that every
+// pixel of the tile would look at for nothing. The convex q is least at the
+// centre or, outside, on the edge of the tile's square of pixel centres.
+bool splat_reaches_tile(TrainSplat s, uint tx, uint ty) {
+  const vec3 q = s.conicOpacity.xyz;
+  const float reach = 2.0 * log(255.0 * s.conicOpacity.w);
+  const vec2 low = vec2(tx, ty) * float(TILE_SIZE) + 0.5 - s.centerRadius.xy;
+  const vec2 high = low + float(TILE_SIZE - 1u);
+  if (all(lessThanEqual(low, vec2(0.0))) && all(greaterThanEqual(high, vec2(0.0)))) {
+    return true;
+  }
+  float least = 1e30;
+  for (uint side = 0u; side < 2u; ++side) {
+    // Along x = const: q = q.x x^2 + 2 q.y x y + q.z y^2, least at y = -q.y x / q.z.
+    const float x = side == 0u ? low.x : high.x;
+    const float y = clamp(-q.y * x / q.z, low.y, high.y);
+    least = min(least, q.x * x * x + 2.0 * q.y * x * y + q.z * y * y);
+    // Along y = const, likewise.
+    const float v = side == 0u ? low.y : high.y;
+    const float u = clamp(-q.y * v / q.x, low.x, high.x);
+    least = min(least, q.x * u * u + 2.0 * q.y * u * v + q.z * v * v);
+  }
+  // A little slack, so that rounding never loses a pixel splat_at() would take.
+  return least <= reach * 1.001 + 1e-3;
+}
+
 // Evaluates a splat at a pixel. False if the pixel gets nothing from it. The
 // rules match the graphics path in splat.vert and splat.frag.
 bool splat_at(TrainSplat s, uint x, uint y, out vec2 d, out float power, out float alpha) {
