@@ -387,8 +387,13 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
     if (options.pruneShare > 0.0 && (iteration == densifyUntil || iteration == pruneAgainAt)) {
       const auto pruneStart = std::chrono::steady_clock::now();
       const std::size_t before = trainer.gaussian_count();
-      trainer.reset_densify_stats();
-      for (const View &scored : trainViews) fitting([&] { return trainer.compute_gradients(scored.camera, scored.rgba); });
+      // The first time, the statistics only cover the last densification
+      // interval, so every view is rendered once to score them. The second
+      // time, they have run since the first and seen every view many times.
+      if (iteration == densifyUntil) {
+        trainer.reset_densify_stats();
+        for (const View &scored : trainViews) fitting([&] { return trainer.compute_gradients(scored.camera, scored.rgba); });
+      }
       const std::size_t removed = trainer.remove_least_contributing_gaussians(options.pruneShare);
       const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - pruneStart).count();
       pruneSeconds += seconds;
@@ -412,7 +417,9 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
       const auto densifyStart = std::chrono::steady_clock::now();
       const DensifyResult result = trainer.densify(densifyOptions, densifyRng);
       report.heldBack += result.heldBack;
-      if (iteration % kOpacityResetInterval == 0) {
+      // Not on the last round: as in the paper, and the cloud would have
+      // no densification left to recover with.
+      if (iteration % kOpacityResetInterval == 0 && iteration < densifyUntil) {
         trainer.reset_opacity(kResetOpacity);
         lastOpacityReset = iteration;
       }
