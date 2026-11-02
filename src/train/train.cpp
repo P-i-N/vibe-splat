@@ -36,6 +36,8 @@ constexpr double kMaxWorldFraction = 1.0;    // Of the scene's extent
 constexpr double kMaxScreenFraction = 0.25;  // Of the image's longer side
 constexpr int kDensifyInterval = 100;
 constexpr int kOpacityResetInterval = 3000;
+// A cloud just after an opacity reset renders almost black, so checkpoints wait this long.
+constexpr int kCheckpointRecovery = 1000;
 constexpr std::uint64_t kBudgetReserve = 256ull * 1024 * 1024; // Sort scratch, staging, the driver's share
 constexpr float kShC0 = 0.28209479177387814f;
 
@@ -326,6 +328,8 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
   const double positionStart = 1.6e-4 * extent, positionEnd = 1.6e-6 * extent;
   double lossSum = 0.0;
   int lossCount = 0;
+  int lastOpacityReset = -kCheckpointRecovery;
+  bool checkpointDue = false;
   const auto start = std::chrono::steady_clock::now();
   for (int iteration = 1; iteration <= options.iterations; ++iteration) {
     if (order.empty()) {
@@ -365,7 +369,10 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
       if (options.maxGaussians > 0) densifyOptions.maxGaussians = std::min(densifyOptions.maxGaussians, options.maxGaussians);
       const DensifyResult result = trainer.densify(densifyOptions, densifyRng);
       report.heldBack += result.heldBack;
-      if (iteration % kOpacityResetInterval == 0) trainer.reset_opacity(kResetOpacity);
+      if (iteration % kOpacityResetInterval == 0) {
+        trainer.reset_opacity(kResetOpacity);
+        lastOpacityReset = iteration;
+      }
     }
 
     if (iteration % options.reportEvery == 0 || iteration == options.iterations) {
@@ -378,11 +385,14 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
       lossSum = 0.0;
       lossCount = 0;
     }
-    if (options.saveEvery > 0 && iteration % options.saveEvery == 0 && iteration < options.iterations) {
+    if (options.saveEvery > 0 && iteration % options.saveEvery == 0) checkpointDue = true;
+    if (checkpointDue && iteration - lastOpacityReset >= kCheckpointRecovery && iteration < options.iterations) {
+      checkpointDue = false;
       // Through a temporary file, so that a crash never leaves half a checkpoint.
       const fs::path temporary = fs::path(options.out).concat(".tmp");
       save_ply(trainer.cloud(), temporary);
       fs::rename(temporary, options.out);
+      std::println("  iteration {:6}: checkpoint saved to {}", iteration, options.out.string());
     }
   }
   const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
