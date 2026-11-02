@@ -3,6 +3,7 @@
 #include "render/camera.hpp"
 #include "splat/gaussian_cloud.hpp"
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <vector>
