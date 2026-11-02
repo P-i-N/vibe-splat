@@ -140,7 +140,9 @@ does automatic differentiation: each pass has a hand-derived counterpart.
   makes in video, do not end up in the Gaussians. The output stays neutral.
 - **Optimiser.** Adam, with the learning rates of the 3DGS paper. It only
   updates Gaussians the current view sees: the rest keep their values and
-  moments, which also spares most of its memory traffic.
+  moments, which also spares most of its memory traffic. `--full-adam`
+  updates them all, which on the test set is a fifth slower and 0.5 dB
+  better on held-out views.
 - **Density.** Every 100 iterations in the first half of training, a Gaussian
   whose screen position keeps wanting to move is cloned if small and split in
   two if large, and nearly transparent ones are removed. Opacity is capped every

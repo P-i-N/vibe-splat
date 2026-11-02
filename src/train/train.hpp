@@ -25,6 +25,7 @@ struct TrainOptions {
   // For photos whose exposure varies, as auto exposure in video does; on
   // evenly exposed photos it costs about 0.5 dB on held-out views.
   bool exposure = false;
+  bool fullAdam = false;       // Update every Gaussian each step, not only those in view: slower, sharper
   bool fullResolution = false; // Train at full size throughout, without the coarse start
   float gradientThreshold = 2e-4f;
   double vramBudgetGiB = 0.0; // 0: 90% of the GPU's free memory

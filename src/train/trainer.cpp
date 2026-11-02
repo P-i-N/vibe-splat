@@ -70,6 +70,7 @@ struct AdamPush {
   float learningRate, beta1, beta2, epsilon, correction1, correction2;
   std::uint32_t dcStride;
   float restScale;
+  std::uint32_t selective;
 };
 struct GatherPush {
   std::uint32_t count, stride;
@@ -497,7 +498,7 @@ void Trainer::record_adam(VkCommandBuffer cmd, const LearningRates &rates) {
     const Group &group = *groups_[g];
     const auto floats = static_cast<std::uint32_t>(group.values->size() / sizeof(float));
     const AdamPush push{floats, learning[g], kBeta1, kBeta2, kEpsilon, correction1, correction2,
-                        g == 4 ? shFloats_ : 0u, rates.shRestScale};
+                        g == 4 ? shFloats_ : 0u, rates.shRestScale, options_.selectiveAdam ? 1u : 0u};
     adam_.dispatch(cmd, {group.values.get(), group.gradients.get(), group.first.get(), group.second.get()}, push, vk::div_up(floats, 256));
   }
   vk::compute_barrier(cmd);
