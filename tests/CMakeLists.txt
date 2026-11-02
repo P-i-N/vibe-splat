@@ -32,6 +32,17 @@ set_tests_properties(cli_convert_cgc PROPERTIES DEPENDS cli_make_test_scene)
 add_test(NAME cli_render_cgc COMMAND splat render "${CMAKE_CURRENT_BINARY_DIR}/cli_scene.cgc"
          -o "${CMAKE_CURRENT_BINARY_DIR}/cli_render_cgc.png" --width 320 --height 180)
 set_tests_properties(cli_render_cgc PROPERTIES DEPENDS cli_convert_cgc)
+# The browser decoder must agree with the C++ one.
+add_test(NAME cli_convert_cgc_small COMMAND splat convert "${CMAKE_CURRENT_BINARY_DIR}/cli_scene.ply" "${CMAKE_CURRENT_BINARY_DIR}/cli_scene_small.cgc" --small)
+set_tests_properties(cli_convert_cgc_small PROPERTIES DEPENDS cli_make_test_scene)
+find_program(NODE_EXECUTABLE node)
+if(NODE_EXECUTABLE)
+  add_test(NAME cli_cgc_decoded COMMAND splat convert "${CMAKE_CURRENT_BINARY_DIR}/cli_scene.cgc" "${CMAKE_CURRENT_BINARY_DIR}/cli_scene_decoded.ply")
+  set_tests_properties(cli_cgc_decoded PROPERTIES DEPENDS cli_convert_cgc)
+  add_test(NAME web_cgc_decoder COMMAND "${NODE_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cgc_web_check.mjs"
+           "${CMAKE_CURRENT_BINARY_DIR}/cli_scene.cgc" "${CMAKE_CURRENT_BINARY_DIR}/cli_scene_decoded.ply")
+  set_tests_properties(web_cgc_decoder PROPERTIES DEPENDS cli_cgc_decoded)
+endif()
 # The floater filter options must be accepted (the test scene has nothing to prune).
 add_test(NAME cli_convert_prune COMMAND splat convert "${CMAKE_CURRENT_BINARY_DIR}/cli_scene.ply" "${CMAKE_CURRENT_BINARY_DIR}/cli_scene_pruned.ply"
          --prune-sigma 1 --prune-radius 4)

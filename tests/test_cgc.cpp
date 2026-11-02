@@ -86,73 +86,50 @@ float dot4(const std::array<float, 4> &a, const std::array<float, 4> &b) {
 
 } // namespace
 
-TEST_CASE("Rotations survive smallest-three packing", "[cgc]") {
-  using namespace cgc_detail;
-  std::vector<std::array<float, 4>> inputs = {
-      {0.f, 1.f, 0.f, 0.f}, {0.f, 0.f, 0.f, -1.f}, {-0.5f, 0.5f, -0.5f, 0.5f}, {0.3f, -1.5f, 2.4f, 0.9f}};
+namespace {
+
+// The covariance of a Gaussian: R diag(exp(2 s)) R^T, as 6 unique entries.
+std::array<float, 6> covariance(const float *s, const float *q) {
+  const auto n = normalized({q[0], q[1], q[2], q[3]});
+  const float w = n[0], x = n[1], y = n[2], z = n[3];
+  const float r[3][3] = {{1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)},
+                         {2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)},
+                         {2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)}};
+  std::array<float, 6> c{};
+  int out = 0;
+  for (int i = 0; i < 3; ++i) {
+    for (int j = i; j < 3; ++j) {
+      for (int a = 0; a < 3; ++a) c[out] += r[i][a] * r[j][a] * std::exp(2.f * s[a]);
+      ++out;
+    }
+  }
+  return c;
+}
+
+} // namespace
+
+TEST_CASE("Canonical axes describe the same ellipsoid", "[cgc]") {
   std::mt19937 rng(3);
   std::normal_distribution<float> normal;
-  for (int i = 0; i < 1000; ++i) inputs.push_back(normalized({normal(rng), normal(rng), normal(rng), normal(rng)}));
-
-  for (const auto &input : inputs) {
-    const auto decoded = unpack_rotation(pack_rotation(input));
-    INFO("q = " << input[0] << " " << input[1] << " " << input[2] << " " << input[3]);
-    CHECK(std::abs(dot4(decoded, decoded) - 1.f) < 1e-5f);
-    CHECK(std::abs(dot4(normalized(input), decoded)) > 0.999f);
+  std::uniform_real_distribution<float> uniform(-5.f, 1.f);
+  for (int i = 0; i < 2000; ++i) {
+    std::array<float, 3> s = {uniform(rng), uniform(rng), uniform(rng)};
+    std::array<float, 4> q = {normal(rng), normal(rng), normal(rng), normal(rng)};
+    const auto before = covariance(s.data(), q.data());
+    cgc_detail::canonicalize_axes(s, q);
+    const auto after = covariance(s.data(), q.data());
+    CHECK(s[0] >= s[1]);
+    CHECK(s[1] >= s[2]);
+    CHECK(q[0] >= 0.f);
+    for (int a = 1; a < 4; ++a) CHECK(q[0] >= std::abs(q[a]) - 1e-5f);
+    const float biggest = std::exp(2.f * s[0]);
+    for (int a = 0; a < 6; ++a) CHECK(std::abs(before[a] - after[a]) <= 1e-4f * biggest);
   }
-  CHECK(unpack_rotation(pack_rotation({0.f, 0.f, 0.f, 0.f})) == std::array<float, 4>{1.f, 0.f, 0.f, 0.f});
-}
-
-TEST_CASE("SH degree drops bands that barely change the colour", "[cgc]") {
-  using cgc_detail::choose_sh_degree;
-  constexpr float threshold = 1.5f / 255.f;
-  // Degree 3: 16 coefficients x RGB. Band l starts at coefficient l*l.
-  const auto cloud_sh = [](float band1, float band2, float band3) {
-    std::vector<float> sh(48, 0.f);
-    for (int k = 1; k < 16; ++k) {
-      const float v = k < 4 ? band1 : k < 9 ? band2 : band3;
-      for (int c = 0; c < 3; ++c) sh[k * 3 + c] = v;
-    }
-    return sh;
-  };
-  CHECK(choose_sh_degree(cloud_sh(0.f, 0.f, 0.f), 3, threshold) == 0);
-  CHECK(choose_sh_degree(cloud_sh(0.f, 0.f, 0.5f), 3, threshold) == 3);
-  CHECK(choose_sh_degree(cloud_sh(0.5f, 1e-4f, 1e-4f), 3, threshold) == 1);
-  CHECK(choose_sh_degree(cloud_sh(0.05f, 0.f, 0.f), 3, threshold) == 1);
-  CHECK(choose_sh_degree(cloud_sh(0.002f, 0.f, 0.f), 3, threshold) == 0);
-  CHECK(choose_sh_degree(std::vector<float>{0.1f, 0.2f, 0.3f}, 0, threshold) == 0);
-}
-
-TEST_CASE("Faint splats keep their SH bands", "[cgc]") {
-  // Scenes trained with many low-opacity splats stacked on top of each other
-  // (a Brush export has a median opacity around 0.08) still show the colour
-  // of those splats, so opacity must not lower the degree: with it, two
-  // thirds of such a scene lost all view dependence and renders fell from
-  // about 50 dB to 32 dB against the original.
-  GaussianCloud cloud;
-  cloud.resize(1024, 3);
-  for (std::size_t i = 0; i < cloud.size(); ++i) {
-    cloud.positions[i * 3] = static_cast<float>(i % 32) * 0.1f;
-    cloud.positions[i * 3 + 1] = static_cast<float>(i / 32) * 0.1f;
-    cloud.rotations[i * 4] = 1.f;
-    for (int a = 0; a < 3; ++a) cloud.scales[i * 3 + a] = std::log(0.05f);
-    cloud.opacities[i] = -2.5f; // sigmoid(-2.5) ~= 0.076
-    for (int c = 0; c < 3; ++c) cloud.sh[(i * 16 + 3) * 3 + c] = 0.2f; // a strong band 1
-  }
-  const CgcStats stats = save_cgc(cloud, "splat_cgc_faint.cgc");
-  std::filesystem::remove("splat_cgc_faint.cgc");
-  CHECK(stats.degreeCounts[1] == cloud.size());
-}
-
-TEST_CASE("Byte planes split 32-bit values by byte", "[cgc]") {
-  using namespace cgc_detail;
-  const std::vector<std::uint32_t> values = {0x04030201, 0x08070605};
-  std::vector<std::byte> out;
-  append_planes(out, values);
-  const std::vector<std::byte> expected = {std::byte{1}, std::byte{5}, std::byte{2}, std::byte{6},
-                                           std::byte{3}, std::byte{7}, std::byte{4}, std::byte{8}};
-  CHECK(out == expected);
-  CHECK(read_planes(out, 2) == values);
+  std::array<float, 3> s = {1.f, 2.f, 3.f};
+  std::array<float, 4> zero = {0.f, 0.f, 0.f, 0.f};
+  cgc_detail::canonicalize_axes(s, zero);
+  CHECK(s == std::array<float, 3>{3.f, 2.f, 1.f});
+  CHECK(std::abs(dot4(zero, zero) - 1.f) < 1e-5f);
 }
 
 namespace {
@@ -205,49 +182,47 @@ std::size_t nearest(const GaussianCloud &cloud, const float *p) {
 
 constexpr float kShC0 = 0.28209479177387814f;
 
-// Checks every attribute of `loaded` against `original` within CGC's
-// quantization error. Splats come back in Morton order, so each is matched to
-// the nearest original. Returns, per channel, how many DC colours missed the
-// tolerance (allowed for the few clamped to the percentile range).
-std::array<int, 3> check_round_trip(const GaussianCloud &original, const GaussianCloud &loaded, std::size_t skip = SIZE_MAX) {
+// Checks every attribute of `loaded` against `original` within the coarsest
+// layer's quantization error. Splats come back reordered, so each is matched to
+// the nearest original. SH goes through a codebook, so it is compared on
+// average. Returns how many DC colours missed the tolerance.
+int check_round_trip(const GaussianCloud &original, const GaussianCloud &loaded, std::size_t skip = SIZE_MAX) {
   REQUIRE(loaded.size() == original.size());
-  const int degree = original.shDegree;
+  REQUIRE(loaded.shDegree == original.shDegree);
   const std::size_t coeffs = static_cast<std::size_t>(original.shCoeffs());
-  const std::size_t loadedCoeffs = static_cast<std::size_t>(loaded.shCoeffs());
-  std::array<int, 3> colourMisses{};
+  int colourMisses = 0;
   for (std::size_t j = 0; j < loaded.size(); ++j) {
     const std::size_t i = nearest(original, &loaded.positions[j * 3]);
     if (i == skip) continue;
-    for (int a = 0; a < 3; ++a) CHECK(std::abs(loaded.positions[j * 3 + a] - original.positions[i * 3 + a]) <= 0.01f);
-    for (int a = 0; a < 3; ++a) CHECK(std::abs(loaded.scales[j * 3 + a] - original.scales[i * 3 + a]) <= 0.05f);
-    std::array<float, 4> qa{}, qb{};
-    for (int a = 0; a < 4; ++a) {
-      qa[a] = original.rotations[i * 4 + a];
-      qb[a] = loaded.rotations[j * 4 + a];
-    }
-    CHECK(std::abs(dot4(normalized(qa), qb)) > 0.999f);
-    CHECK(std::abs(sigmoid(loaded.opacities[j]) - sigmoid(original.opacities[i])) <= 1.f / 256.f);
+    for (int a = 0; a < 3; ++a) CHECK(std::abs(loaded.positions[j * 3 + a] - original.positions[i * 3 + a]) <= 0.02f);
+    const float biggest = std::exp(2.f * std::max({original.scales[i * 3], original.scales[i * 3 + 1], original.scales[i * 3 + 2]}));
+    const auto a = covariance(&original.scales[i * 3], &original.rotations[i * 4]);
+    const auto b = covariance(&loaded.scales[j * 3], &loaded.rotations[j * 4]);
+    for (int k = 0; k < 6; ++k) CHECK(std::abs(a[k] - b[k]) <= 0.25f * biggest);
+    CHECK(std::abs(sigmoid(loaded.opacities[j]) - sigmoid(original.opacities[i])) <= 1.f / 32.f + 1e-5f);
     for (int c = 0; c < 3; ++c) {
       const float want = kShC0 * original.sh[i * coeffs * 3 + c] + 0.5f;
-      const float got = kShC0 * loaded.sh[j * loadedCoeffs * 3 + c] + 0.5f;
-      if (std::abs(want - got) > 0.004f) ++colourMisses[c];
-    }
-    const int kept = cgc_detail::choose_sh_degree(std::span(&original.sh[i * coeffs * 3], coeffs * 3), degree, 1.5f / 255.f);
-    for (int band = 1; band <= degree; ++band) {
-      const float tolerance = band == 1 ? 0.3f / 15.f : 0.3f / 7.f;
-      for (std::size_t k = static_cast<std::size_t>(band * band); k < static_cast<std::size_t>((band + 1) * (band + 1)); ++k) {
-        for (int c = 0; c < 3; ++c) {
-          const float got = loaded.sh[(j * loadedCoeffs + k) * 3 + c];
-          if (band <= kept) {
-            CHECK(std::abs(got - original.sh[(i * coeffs + k) * 3 + c]) <= tolerance);
-          } else {
-            CHECK(got == 0.f);
-          }
-        }
-      }
+      const float got = kShC0 * loaded.sh[j * coeffs * 3 + c] + 0.5f;
+      if (std::abs(want - got) > 0.06f) ++colourMisses;
     }
   }
   return colourMisses;
+}
+
+// RMS difference of the higher SH bands, matching splats by nearest position.
+float sh_rms_error(const GaussianCloud &original, const GaussianCloud &loaded) {
+  const std::size_t coeffs = static_cast<std::size_t>(original.shCoeffs());
+  double sum = 0.0;
+  std::size_t count = 0;
+  for (std::size_t j = 0; j < loaded.size(); ++j) {
+    const std::size_t i = nearest(original, &loaded.positions[j * 3]);
+    for (std::size_t k = 3; k < coeffs * 3; ++k) {
+      const double d = original.sh[i * coeffs * 3 + k] - loaded.sh[j * coeffs * 3 + k];
+      sum += d * d;
+      ++count;
+    }
+  }
+  return count == 0 ? 0.f : static_cast<float>(std::sqrt(sum / static_cast<double>(count)));
 }
 
 } // namespace
@@ -260,25 +235,45 @@ TEST_CASE("CGC round-trips every attribute within its quantization step", "[cgc]
     const GaussianCloud loaded = round_trip(cloud, "splat_cgc_roundtrip.cgc", &stats);
     CHECK(loaded.shDegree == degree);
     CHECK(stats.bytes > 0);
-    CHECK(stats.degreeCounts[0] + stats.degreeCounts[1] + stats.degreeCounts[2] + stats.degreeCounts[3] == 1000);
-    for (const int misses : check_round_trip(cloud, loaded)) CHECK(misses <= 2);
+    CHECK(stats.layerCounts[0] + stats.layerCounts[1] + stats.layerCounts[2] == 1000);
+    CHECK(check_round_trip(cloud, loaded) <= 10);
+    for (const float v : loaded.sh) CHECK(std::isfinite(v));
   }
 }
 
-TEST_CASE("CGC stores degree 0 when higher SH bands are empty", "[cgc]") {
+TEST_CASE("The SH codebook reproduces a few distinct patterns", "[cgc]") {
+  GaussianCloud cloud = random_cloud(4000, 3, 5);
+  const std::size_t coeffs = static_cast<std::size_t>(cloud.shCoeffs());
+  std::mt19937 rng(6);
+  std::normal_distribution<float> normal(0.f, 0.2f);
+  std::vector<float> patterns(8 * 45);
+  for (float &v : patterns) v = normal(rng);
+  for (std::size_t i = 0; i < cloud.size(); ++i) {
+    std::copy_n(&patterns[(i % 8) * 45], 45, &cloud.sh[i * coeffs * 3 + 3]);
+  }
+  const GaussianCloud loaded = round_trip(cloud, "splat_cgc_patterns.cgc");
+  CHECK(sh_rms_error(cloud, loaded) < 0.03f);
+}
+
+TEST_CASE("Empty higher SH bands stay nearly empty", "[cgc]") {
   GaussianCloud cloud = random_cloud(500, 3, 5);
   const std::size_t coeffs = static_cast<std::size_t>(cloud.shCoeffs());
   for (std::size_t i = 0; i < cloud.size(); ++i) {
     for (std::size_t k = 3; k < coeffs * 3; ++k) cloud.sh[i * coeffs * 3 + k] = 0.f;
   }
-  CgcStats stats;
-  const GaussianCloud loaded = round_trip(cloud, "splat_cgc_dc_only.cgc", &stats);
-  CHECK(stats.degreeCounts[0] == cloud.size());
-  CHECK(loaded.shDegree == 0);
+  const GaussianCloud loaded = round_trip(cloud, "splat_cgc_dc_only.cgc");
+  for (std::size_t i = 0; i < loaded.size(); ++i) {
+    for (std::size_t k = 3; k < coeffs * 3; ++k) CHECK(loaded.sh[i * coeffs * 3 + k] == 0.f);
+  }
 }
 
 TEST_CASE("A colour outlier does not coarsen everyone else's colour", "[cgc]") {
   GaussianCloud cloud = random_cloud(1000, 1, 21);
+  // Give every splat the same importance class as the outlier, so it has company.
+  for (float &v : cloud.opacities) v = 2.f;
+  for (std::size_t i = 0; i < cloud.size(); ++i) {
+    for (int a = 0; a < 3; ++a) cloud.scales[i * 3 + a] = -3.f;
+  }
   cloud.positions.insert(cloud.positions.end(), {5.f, 5.f, 11.f});
   cloud.scales.insert(cloud.scales.end(), {-3.f, -3.f, -3.f});
   cloud.rotations.insert(cloud.rotations.end(), {1.f, 0.f, 0.f, 0.f});
@@ -286,12 +281,12 @@ TEST_CASE("A colour outlier does not coarsen everyone else's colour", "[cgc]") {
   cloud.sh.insert(cloud.sh.end(), {100.f, 100.f, 100.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f});
 
   const GaussianCloud loaded = round_trip(cloud, "splat_cgc_outlier.cgc");
-  for (const int misses : check_round_trip(cloud, loaded, cloud.size() - 1)) CHECK(misses <= 2);
+  CHECK(check_round_trip(cloud, loaded, cloud.size() - 1) <= 10);
   for (const float v : loaded.sh) CHECK(std::isfinite(v));
 }
 
-TEST_CASE("CGC handles small, chunk-boundary and degenerate clouds", "[cgc]") {
-  for (const std::size_t count : {std::size_t{0}, std::size_t{1}, std::size_t{256}, std::size_t{257}}) {
+TEST_CASE("CGC handles small and degenerate clouds", "[cgc]") {
+  for (const std::size_t count : {std::size_t{0}, std::size_t{1}, std::size_t{2}, std::size_t{3}, std::size_t{256}, std::size_t{257}}) {
     INFO(count << " splats");
     const GaussianCloud cloud = random_cloud(count, 2, 31);
     const GaussianCloud loaded = round_trip(cloud, "splat_cgc_sizes.cgc");
@@ -309,28 +304,23 @@ TEST_CASE("CGC handles small, chunk-boundary and degenerate clouds", "[cgc]") {
   const GaussianCloud loaded = round_trip(same, "splat_cgc_flat.cgc");
   REQUIRE(loaded.size() == same.size());
   for (std::size_t i = 0; i < loaded.size(); ++i) {
-    CHECK(loaded.positions[i * 3] == 1.f);
-    CHECK(loaded.positions[i * 3 + 1] == 2.f);
-    CHECK(loaded.positions[i * 3 + 2] == 3.f);
-    CHECK(loaded.scales[i * 3] == -2.f);
+    CHECK(std::abs(loaded.positions[i * 3] - 1.f) < 1e-4f);
+    CHECK(std::abs(loaded.positions[i * 3 + 1] - 2.f) < 1e-4f);
+    CHECK(std::abs(loaded.positions[i * 3 + 2] - 3.f) < 1e-4f);
+    CHECK(std::abs(loaded.scales[i * 3] - -2.f) < 0.1f);
   }
 }
 
-TEST_CASE("A degenerate thin axis does not coarsen its chunk's scales", "[cgc]") {
-  // Trained scenes leave many splats with an axis a few microns thin. Such an
-  // axis is invisible whether it is 6 um or 0.1 mm, but left alone it would
-  // stretch the chunk's 8-bit log-scale range over everyone else.
-  GaussianCloud cloud = random_cloud(200, 0, 71);
-  for (std::size_t i = 0; i < cloud.size(); ++i) {
-    cloud.positions[i * 3] = cloud.positions[i * 3 + 1] = cloud.positions[i * 3 + 2] = 0.f; // keep the order
-    cloud.scales[i * 3] = -4.f + 2.f * static_cast<float>(i) / static_cast<float>(cloud.size());
-  }
-  cloud.scales[0] = -30.f;
-  const GaussianCloud loaded = round_trip(cloud, "splat_cgc_thin.cgc");
+TEST_CASE("A far-away floater does not coarsen the scene's positions", "[cgc]") {
+  // Positions live on a symlog grid, so precision falls with distance from the centre.
+  GaussianCloud cloud = random_cloud(1000, 0, 73);
+  cloud.positions[0] = 1e5f;
+  const GaussianCloud loaded = round_trip(cloud, "splat_cgc_floater.cgc");
   REQUIRE(loaded.size() == cloud.size());
-  CHECK(std::abs(loaded.scales[0] - -9.f) <= 0.02f);
-  for (std::size_t i = 1; i < loaded.size(); ++i) {
-    CHECK(std::abs(loaded.scales[i * 3] - cloud.scales[i * 3]) <= 0.02f);
+  for (std::size_t j = 0; j < loaded.size(); ++j) {
+    if (loaded.positions[j * 3] > 1000.f) continue;
+    const std::size_t i = nearest(cloud, &loaded.positions[j * 3]);
+    for (int a = 0; a < 3; ++a) CHECK(std::abs(loaded.positions[j * 3 + a] - cloud.positions[i * 3 + a]) <= 0.2f);
   }
 }
 
@@ -342,6 +332,16 @@ TEST_CASE("CGC keeps extreme opacities and scales finite", "[cgc]") {
   const GaussianCloud loaded = round_trip(cloud, "splat_cgc_extreme.cgc");
   for (const float v : loaded.opacities) CHECK(std::isfinite(v));
   for (const float v : loaded.scales) CHECK(std::isfinite(v));
+}
+
+TEST_CASE("The Small preset makes a smaller file", "[cgc]") {
+  const GaussianCloud cloud = random_cloud(20'000, 3, 74);
+  const auto path = temp_file("splat_cgc_preset.cgc");
+  const auto balanced = save_cgc(cloud, path);
+  const auto small = save_cgc(cloud, path, {.preset = CgcPreset::Small});
+  std::filesystem::remove(path);
+  CHECK(small.bytes < balanced.bytes);
+  CHECK(small.layerCounts[0] < balanced.layerCounts[0]);
 }
 
 TEST_CASE("CGC refuses to save non-finite values", "[cgc]") {
@@ -377,14 +377,26 @@ TEST_CASE("Loading a malformed CGC file throws", "[cgc]") {
   write(half);
   CHECK_THROWS_AS(load_cgc(path), std::runtime_error);
 
-  auto badProperties = good;
-  badProperties[16] = static_cast<char>(0xFF);
-  write(badProperties);
+  auto trailing = good;
+  trailing.push_back(0);
+  write(trailing);
   CHECK_THROWS_AS(load_cgc(path), std::runtime_error);
 
   auto badVersion = good;
-  badVersion[4] = 2;
+  badVersion[4] = 3;
   write(badVersion);
+  CHECK_THROWS_AS(load_cgc(path), std::runtime_error);
+
+  auto badCount = good;
+  badCount[8] = static_cast<char>(badCount[8] + 1);
+  write(badCount);
+  CHECK_THROWS_AS(load_cgc(path), std::runtime_error);
+
+  // First stream's LZMA properties byte: after the 36-byte header, 3 layer
+  // headers of 92 bytes and the stream's u32 size.
+  auto badProperties = good;
+  badProperties[36 + 3 * 92 + 4] = static_cast<char>(0xFF);
+  write(badProperties);
   CHECK_THROWS_AS(load_cgc(path), std::runtime_error);
 
   std::filesystem::remove(path);
@@ -453,7 +465,7 @@ TEST_CASE("save_cloud and load_cloud follow the extension", "[cgc]") {
   std::filesystem::remove(cgc);
 
   const auto temporary = temp_file("splat_dispatch.cgc.tmp");
-  save_cloud(cloud, temporary, CloudFormat::Cgc, CgcOptions{.lzmaLevel = 1, .lzmaExtreme = false});
+  save_cloud(cloud, temporary, CloudFormat::Cgc, CgcOptions{.fast = true});
   check_round_trip(cloud, load_cgc(temporary));
   std::filesystem::remove(temporary);
 }
@@ -570,43 +582,69 @@ TEST_CASE("prune_floaters leaves a cloud with nothing to prune untouched", "[pru
 
 namespace {
 
-std::vector<std::uint8_t> slice(const std::vector<std::byte> &payload, std::size_t offset, std::size_t size) {
-  std::vector<std::uint8_t> out;
-  for (std::size_t i = 0; i < size; ++i) out.push_back(static_cast<std::uint8_t>(payload[offset + i]));
-  return out;
+template <typename T> void append(std::vector<std::byte> &out, T value) {
+  const auto bytes = std::bit_cast<std::array<std::byte, sizeof(T)>>(value);
+  out.insert(out.end(), bytes.begin(), bytes.end());
 }
 
-std::vector<std::uint8_t> planes_of(std::initializer_list<std::uint32_t> values) {
-  std::vector<std::uint8_t> out;
+void append_planes(std::vector<std::byte> &out, std::initializer_list<std::uint32_t> values) {
   for (int b = 0; b < 4; ++b) {
-    for (const std::uint32_t v : values) out.push_back(static_cast<std::uint8_t>(v >> (8 * b)));
+    for (const std::uint32_t v : values) out.push_back(static_cast<std::byte>(v >> (8 * b)));
   }
-  return out;
 }
 
 } // namespace
 
+// Version 1 had no writer left, so this builds a file by hand from its old spec.
+TEST_CASE("Version 1 CGC files stay readable", "[cgc]") {
+  std::vector<std::byte> payload;
+  append<std::uint32_t>(payload, 2);
+  for (const float v : {0.f, 0.f, 0.f, 1.f, 1.f, 1.f, 0.5f, 0.f, 0.f}) append(payload, v); // colour ranges, SH ranges
+  const auto bits = [](float v) { return std::bit_cast<std::uint32_t>(v); };
+  append_planes(payload, {bits(0.f), bits(0.f), bits(0.f), bits(1.f), bits(1.f), bits(1.f),
+                          bits(-3.f), bits(-3.f), bits(-3.f), bits(-1.f), bits(-1.f), bits(-1.f)});
+  append_planes(payload, {0u, 0x7FFu | 0x3FFu << 11 | 0x7FFu << 21});
+  const std::uint32_t identity = 511u | 511u << 10 | 511u << 20;
+  append_planes(payload, {identity, identity});
+  for (const int v : {0, 255, 0, 255, 0, 255}) payload.push_back(static_cast<std::byte>(v)); // scales
+  for (const int v : {0, 255, 255, 0, 128, 128, 128, 128}) payload.push_back(static_cast<std::byte>(v)); // RGBA
+  for (const int v : {0, 1}) payload.push_back(static_cast<std::byte>(v)); // degrees
+  for (int k = 0; k < 9; ++k) payload.push_back(std::byte{30}); // band 1 of the second splat: all +0.5
+
+  std::vector<std::byte> file;
+  for (const char c : {'C', 'G', 'C', '\0'}) file.push_back(static_cast<std::byte>(c));
+  append<std::uint32_t>(file, 1);
+  append<std::uint64_t>(file, payload.size());
+  const auto stream = lzma_compress(payload);
+  file.insert(file.end(), stream.begin(), stream.end());
+  const auto path = temp_file("splat_cgc_v1.cgc");
+  std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(file.data()), static_cast<std::streamsize>(file.size()));
+  const GaussianCloud cloud = load_cgc(path);
+  std::filesystem::remove(path);
+
+  REQUIRE(cloud.size() == 2);
+  CHECK(cloud.shDegree == 1);
+  CHECK(cloud.positions[0] == 0.f);
+  CHECK(cloud.positions[3] == 1.f);
+  CHECK(std::abs(cloud.rotations[0] - 1.f) < 1e-5f);
+  CHECK(cloud.scales[0] == -3.f);
+  CHECK(cloud.scales[3] == -1.f);
+  CHECK(std::abs(kShC0 * cloud.sh[0] + 0.5f) < 1e-5f);
+  CHECK(std::abs(kShC0 * cloud.sh[12] + 0.5f - 1.f) < 1e-5f);
+  CHECK(std::abs(cloud.sh[15] - 0.5f) < 1e-5f);
+  CHECK(cloud.sh[3] == 0.f);
+}
+
 // Pins the byte layout from the spec, independently of load_cgc, so that a
 // change on both the encoder and decoder side cannot slip through unnoticed.
-TEST_CASE("CGC payload bytes follow the spec layout", "[cgc]") {
+TEST_CASE("CGC file bytes follow the spec layout", "[cgc]") {
   GaussianCloud cloud;
-  cloud.resize(3, 2);
-  // Morton order is p0, p1, p2: p1 maxes out x (bit 0), p2 maxes out y (bit 1).
-  cloud.positions = {0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f, 0.f};
-  cloud.scales = {-1.f, -2.f, -2.f, -1.5f, -2.f, -2.f, -3.f, -2.f, -2.f};
-  cloud.rotations = {1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f};
-  cloud.opacities = {-10.f, 0.f, 10.f};
-  const std::array<std::array<float, 3>, 3> colours = {{{0.2f, 0.5f, 1.f}, {0.4f, 0.5f, 0.4f}, {1.f, 0.5f, 0.2f}}};
-  constexpr std::size_t coeffs = 9;
-  for (std::size_t i = 0; i < 3; ++i) {
-    for (int c = 0; c < 3; ++c) cloud.sh[i * coeffs * 3 + c] = (colours[i][c] - 0.5f) / kShC0;
-  }
-  // p1: band 1 only, all 0.3. p2: band 1 (k=1, c=1) = -0.3; band 2 (k=4, c=2) = 0.5.
-  for (std::size_t k = 1; k < 4; ++k) {
-    for (int c = 0; c < 3; ++c) cloud.sh[(1 * coeffs + k) * 3 + c] = 0.3f;
-  }
-  cloud.sh[(2 * coeffs + 1) * 3 + 1] = -0.3f;
-  cloud.sh[(2 * coeffs + 4) * 3 + 2] = 0.5f;
+  cloud.resize(1, 0);
+  cloud.positions = {1.f, 2.f, 3.f};
+  cloud.scales = {-1.f, -2.f, -3.f}; // already sorted, so the identity stays
+  cloud.rotations = {1.f, 0.f, 0.f, 0.f};
+  cloud.opacities = {0.f};
+  cloud.sh = {0.f, 0.f, 0.f};
 
   const auto path = temp_file("splat_cgc_layout.cgc");
   save_cgc(cloud, path);
@@ -614,53 +652,45 @@ TEST_CASE("CGC payload bytes follow the spec layout", "[cgc]") {
   std::ifstream(path, std::ios::binary).read(file.data(), static_cast<std::streamsize>(file.size()));
   std::filesystem::remove(path);
 
-  // Outer header: magic, version, payload size, then the .lzma header.
-  REQUIRE(file.size() > 29);
+  const auto u32_at = [&](std::size_t at) {
+    std::uint32_t v = 0;
+    std::memcpy(&v, file.data() + at, 4);
+    return v;
+  };
+  const auto f32_at = [&](std::size_t at) { return std::bit_cast<float>(u32_at(at)); };
   CHECK(std::vector<char>(file.begin(), file.begin() + 4) == std::vector<char>{'C', 'G', 'C', '\0'});
-  std::uint32_t version = 0;
-  std::uint64_t payloadSize = 0;
-  std::memcpy(&version, file.data() + 4, 4);
-  std::memcpy(&payloadSize, file.data() + 8, 8);
-  CHECK(version == 1);
-  CHECK(payloadSize == 169);
-  std::uint64_t lzmaSize = 0;
-  std::memcpy(&lzmaSize, file.data() + 16 + 5, 8);
-  CHECK(lzmaSize == UINT64_MAX); // unknown size, ends with an end marker
+  CHECK(u32_at(4) == 2);  // version
+  CHECK(u32_at(8) == 1);  // count
+  CHECK(u32_at(12) == 0); // SH degree
+  CHECK(u32_at(16) == 3); // layers
+  CHECK(f32_at(20) == 1.f); // centre x
 
-  const auto stream = std::as_bytes(std::span(file)).subspan(16);
-  const std::vector<std::byte> payload = lzma_decompress(stream, payloadSize);
-  REQUIRE(payload.size() == 169);
+  // The one splat lands in the first layer, at 15 bits for positions.
+  constexpr std::size_t h = 36;
+  CHECK(u32_at(h) == 1);
+  CHECK(u32_at(h + 4) == 15);
+  CHECK(u32_at(h + 8) == 8);
+  CHECK(u32_at(h + 12) == 7);
+  CHECK(u32_at(h + 16) == 7);
+  CHECK(u32_at(h + 28) == 0); // no codebook at SH degree 0
+  CHECK(u32_at(h + 92) == 0); // the other layers are empty
+  CHECK(u32_at(h + 2 * 92) == 0);
 
-  std::uint32_t count = 0;
-  std::array<float, 9> ranges{};
-  std::memcpy(&count, payload.data(), 4);
-  std::memcpy(ranges.data(), payload.data() + 4, 36);
-  CHECK(count == 3);
-  CHECK(std::abs(ranges[0] - 0.2f) < 1e-6f); // colorMin R
-  CHECK(std::abs(ranges[5] - 1.f) < 1e-6f);  // colorMax B
-  CHECK(std::abs(ranges[6] - 0.3f) < 1e-6f); // shRange band 1
-  CHECK(std::abs(ranges[7] - 0.5f) < 1e-6f); // shRange band 2
-  CHECK(ranges[8] == 0.f);                    // shRange band 3: unused
-
-  // Chunk table: one chunk, 12 floats in byte planes.
-  CHECK(slice(payload, 40, 48) ==
-        planes_of({std::bit_cast<std::uint32_t>(0.f), std::bit_cast<std::uint32_t>(0.f), std::bit_cast<std::uint32_t>(0.f),
-                   std::bit_cast<std::uint32_t>(1.f), std::bit_cast<std::uint32_t>(1.f), std::bit_cast<std::uint32_t>(0.f),
-                   std::bit_cast<std::uint32_t>(-3.f), std::bit_cast<std::uint32_t>(-2.f), std::bit_cast<std::uint32_t>(-2.f),
-                   std::bit_cast<std::uint32_t>(-1.f), std::bit_cast<std::uint32_t>(-2.f), std::bit_cast<std::uint32_t>(-2.f)}));
-  // Positions: x in bits 0-10, y in bits 11-20, z in bits 21-31.
-  CHECK(slice(payload, 88, 12) == planes_of({0u, 0x7FFu, 0x3FFu << 11}));
-  // Rotations: identity drops w (index 0); x, y, z sit at the symmetric zero 511.
-  const std::uint32_t identity = 511u | 511u << 10 | 511u << 20;
-  CHECK(slice(payload, 100, 12) == planes_of({identity, identity, identity}));
-  // Scales: all x, then all y, then all z.
-  CHECK(slice(payload, 112, 9) == std::vector<std::uint8_t>{255, 191, 0, 0, 0, 0, 0, 0, 0});
-  // Colour and opacity: all R, all G, all B, all A.
-  CHECK(slice(payload, 121, 12) == std::vector<std::uint8_t>{0, 64, 255, 0, 0, 0, 255, 64, 0, 0, 128, 255});
-  CHECK(slice(payload, 133, 3) == std::vector<std::uint8_t>{0, 1, 2});
-  // Band 1 for p1 and p2: coefficient outer, channel inner; 5 bits, zero at 15.
-  CHECK(slice(payload, 136, 18) ==
-        std::vector<std::uint8_t>{30, 15, 30, 0, 30, 15, 30, 15, 30, 15, 30, 15, 30, 15, 30, 15, 30, 15});
-  // Band 2 for p2 only: 4 bits, zero at 7.
-  CHECK(slice(payload, 154, 15) == std::vector<std::uint8_t>{7, 7, 14, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7});
+  // 6 position planes, 3 rotation, 3 scale, 3 colour and 1 alpha column.
+  std::size_t at = h + 3 * 92;
+  std::vector<std::vector<std::byte>> columns;
+  for (int c = 0; c < 16; ++c) {
+    const std::uint32_t size = u32_at(at);
+    columns.push_back(lzma_decompress(std::as_bytes(std::span(file)).subspan(at + 4, size), 1));
+    at += 4 + size;
+  }
+  CHECK(at == file.size());
+  const auto value = [&](int c) { return std::to_integer<int>(columns[static_cast<std::size_t>(c)][0]); };
+  for (int c = 0; c < 6; ++c) CHECK(value(c) == 0); // alone in its grid
+  for (int c = 6; c < 9; ++c) CHECK(value(c) == 0); // identity: x = y = z = 0
+  CHECK(u32_at(h + 48) == std::bit_cast<std::uint32_t>(-9.f));
+  CHECK(value(9) == 160);  // (-1 - -9) / 0.05
+  CHECK(value(10) == 20);  // gap of 1 at step 0.05
+  CHECK(value(11) == 10);  // gap of 1 at step 0.1
+  CHECK(value(15) == 64);  // alpha 0.5 at 7 bits
 }

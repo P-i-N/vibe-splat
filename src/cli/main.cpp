@@ -70,6 +70,7 @@ make-test-scene options:
   --count <n>             Number of Gaussians (default 200000)
 
 convert options (both pruning tests are off unless given; either enables it):
+  --small                 CGC only: a smaller file, with weaker close-ups
   --prune-sigma <units>   Drop floaters: Gaussians whose largest axis (one standard
                           deviation) is longer than this many world units
   --prune-radius <factor> Drop Gaussians farther from the scene centre than this times
@@ -251,10 +252,10 @@ int cmd_make_test_scene(const GlobalOptions &opts) {
 }
 
 int cmd_convert(const GlobalOptions &opts) {
-  const splat::cli::Args args(opts.rest, {});
-  args.allow_only({"prune-sigma", "prune-radius"});
+  const splat::cli::Args args(opts.rest, {"--small"});
+  args.allow_only({"prune-sigma", "prune-radius", "small"});
   if (args.positionals().size() != 2) {
-    std::println(stderr, "Usage: splat convert <in.ply|cgc> <out.ply|cgc> [--prune-sigma <units>] [--prune-radius <factor>]");
+    std::println(stderr, "Usage: splat convert <in.ply|cgc> <out.ply|cgc> [--small] [--prune-sigma <units>] [--prune-radius <factor>]");
     return 2;
   }
   const std::filesystem::path in(args.positionals()[0]);
@@ -283,9 +284,8 @@ int cmd_convert(const GlobalOptions &opts) {
     std::println("Pruned {} floaters, {} Gaussians left", removed, cloud.size());
   }
   if (toCgc) {
-    const auto stats = splat::save_cgc(cloud, out);
-    std::println("SH degree per Gaussian: 0: {}, 1: {}, 2: {}, 3: {}", stats.degreeCounts[0], stats.degreeCounts[1],
-                 stats.degreeCounts[2], stats.degreeCounts[3]);
+    const auto stats = splat::save_cgc(cloud, out, {.preset = args.has("small") ? splat::CgcPreset::Small : splat::CgcPreset::Balanced});
+    std::println("Gaussians per layer, most important first: {}, {}, {}", stats.layerCounts[0], stats.layerCounts[1], stats.layerCounts[2]);
   } else {
     splat::save_ply(cloud, out);
   }

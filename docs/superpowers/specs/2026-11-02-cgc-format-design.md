@@ -1,7 +1,7 @@
 # CGC: Compressed Gaussian Cloud format
 
 Date: 2026-11-02
-Status: approved
+Status: superseded by `2026-11-02-cgc-v2-format.md`; version 1 files stay readable
 
 ## Intent
 

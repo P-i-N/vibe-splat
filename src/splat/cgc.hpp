@@ -12,32 +12,35 @@
 namespace splat {
 
 // CGC (Compressed Gaussian Cloud): a lossy, compact file format for viewing
-// splats over the network. Splats are Morton-ordered into chunks of 256,
-// quantized, stored column by column and compressed with LZMA. Each splat
-// keeps only the SH bands that visibly change its colour. The byte layout is
-// described in docs/superpowers/specs/2026-11-02-cgc-format-design.md.
+// splats over the network. Splats are split into three layers by importance,
+// each with its own precision. Within a layer they are Morton-sorted on a global
+// grid, rotations are canonicalized, higher SH bands share a codebook, and every
+// byte column is its own LZMA stream. The byte layout is described in
+// docs/superpowers/specs/2026-11-02-cgc-v2-format.md.
+
+enum class CgcPreset {
+  Balanced, // about 29x smaller than PLY, about 42 dB against the original
+  Small,    // about 32x smaller, about 41 dB, with weaker close-ups
+};
 
 struct CgcOptions {
-  // A band is dropped when it changes the colour by less than this (RMS over
-  // view directions, in 0..1 colour units). Opacity is deliberately not taken
-  // into account: scenes made of many faint, stacked splats still show their
-  // colour, and weighting by opacity stripped the SH from most of them.
-  float shThreshold = 1.5f / 255.f;
-  int lzmaLevel = 9; // liblzma preset 0..9
-  bool lzmaExtreme = true;
+  CgcPreset preset = CgcPreset::Balanced;
+  // Much quicker and a little larger, for training checkpoints.
+  bool fast = false;
 };
 
 struct CgcStats {
-  std::uint64_t bytes = 0;                    // size of the written file
-  std::array<std::size_t, 4> degreeCounts{}; // splats stored at SH degree 0..3
+  std::uint64_t bytes = 0;                // size of the written file
+  std::array<std::size_t, 3> layerCounts{}; // splats per layer, most important first
 };
 
 // Writes `cloud` as CGC. Throws std::runtime_error, writing nothing, if any
 // value is NaN or infinite, or if the file cannot be written.
 CgcStats save_cgc(const GaussianCloud &cloud, const std::filesystem::path &path, const CgcOptions &options = {});
 
-// Reads a CGC file. The cloud's SH degree is the highest any splat uses;
-// splats with fewer bands get zeros. Splats come back in Morton order.
+// Reads a CGC file of version 2, or an older version 1 file. Splats come back
+// layer by layer, each layer in Morton order; a splat's axes may be permuted
+// and flipped, which describes the same ellipsoid.
 // Throws std::runtime_error on malformed files.
 [[nodiscard]] GaussianCloud load_cgc(const std::filesystem::path &path);
 
@@ -48,21 +51,10 @@ namespace cgc_detail {
 // bit 2, and so on.
 [[nodiscard]] std::uint64_t morton_code(std::uint32_t x, std::uint32_t y, std::uint32_t z);
 
-// "Smallest three" quaternion packing (w, x, y, z): index of the dropped
-// largest component in bits 30-31, the other three in 10 bits each. Input
-// need not be normalised; a zero quaternion packs as the identity.
-[[nodiscard]] std::uint32_t pack_rotation(std::array<float, 4> wxyz);
-[[nodiscard]] std::array<float, 4> unpack_rotation(std::uint32_t packed);
-
-// The lowest SH degree whose dropped bands each change the colour by less
-// than `threshold` (RMS over all view directions, worst colour channel).
-// `sh` holds one Gaussian's 3 * (degree + 1)^2 coefficients in
-// GaussianCloud order.
-[[nodiscard]] int choose_sh_degree(std::span<const float> sh, int degree, float threshold);
-
-// Appends 32-bit values as four byte planes, least significant first.
-void append_planes(std::vector<std::byte> &out, std::span<const std::uint32_t> values);
-[[nodiscard]] std::vector<std::uint32_t> read_planes(std::span<const std::byte> in, std::size_t count);
+// Rewrites a splat's axes so that log scales descend, and its quaternion
+// (w, x, y, z) so that w is the largest component and not negative. The
+// ellipsoid stays the same. A zero quaternion counts as the identity.
+void canonicalize_axes(std::array<float, 3> &logScales, std::array<float, 4> &wxyz);
 
 } // namespace cgc_detail
 

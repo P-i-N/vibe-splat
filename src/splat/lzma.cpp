@@ -40,11 +40,14 @@ void run(lzma_stream &s, std::span<const std::byte> input, std::vector<std::byte
 
 } // namespace
 
-std::vector<std::byte> lzma_compress(std::span<const std::byte> data, int level, bool extreme) {
+std::vector<std::byte> lzma_compress(std::span<const std::byte> data, int level, bool extreme, int lc, int lp, int pb) {
   lzma_options_lzma options;
   if (lzma_lzma_preset(&options, static_cast<std::uint32_t>(level) | (extreme ? LZMA_PRESET_EXTREME : 0u))) {
     throw std::runtime_error(std::format("Invalid LZMA preset {}", level));
   }
+  options.lc = static_cast<std::uint32_t>(lc);
+  options.lp = static_cast<std::uint32_t>(lp);
+  options.pb = static_cast<std::uint32_t>(pb);
   Stream stream;
   if (lzma_alone_encoder(&stream.s, &options) != LZMA_OK) {
     throw std::runtime_error("Cannot start the LZMA encoder");

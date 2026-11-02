@@ -196,13 +196,18 @@ and `splat make-test-scene scene.cgc` write it directly, and `splat convert
 scene.ply scene.cgc` converts an existing file. `view` and `render` open it
 like a `.ply`.
 
-CGC is lossy. Each Gaussian keeps only the SH bands that visibly change its
-colour. Gaussians are sorted along a Morton curve into chunks of 256, and
-positions and scales are quantized within each chunk's bounds. Rotations,
-colours, opacities and SH are quantized too. Everything is stored column by
-column in byte planes and compressed with LZMA. Training itself always works
-at full precision. The byte layout is in
-`docs/superpowers/specs/2026-11-02-cgc-format-design.md`.
+CGC is lossy. Gaussians are split into three layers by importance, and fainter,
+smaller ones are stored more coarsely. Within a layer they are sorted along a
+Morton curve on one grid, axes are sorted so rotations and scales cost less, higher
+SH bands share one codebook, and each byte column is its own LZMA stream. Training
+itself always works at full precision. On public 3DGS scenes this is about 28x
+smaller than the PLY, at 40 to 43 dB against it; `splat convert --small` gives about
+31x at 39 to 41 dB, with weaker close-ups. Scenes with very few Gaussians and strongly
+view-dependent colour lose more. Older `.cgc` files still load.
+
+[web/cgc.js](web/cgc.js) is a dependency-free decoder for browsers, LZMA included.
+The byte layout and the measurements behind it are in
+`docs/superpowers/specs/2026-11-02-cgc-v2-format.md`.
 
 ### Pruning floaters
 

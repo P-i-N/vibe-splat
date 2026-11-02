@@ -520,8 +520,8 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
       checkpointDue = false;
       // Through a temporary file, so that a crash never leaves half a checkpoint.
       const fs::path temporary = fs::path(options.out).concat(".tmp");
-      // A fast LZMA preset, so that CGC checkpoints don't hold up training.
-      save_output(temporary, CgcOptions{.lzmaLevel = 1, .lzmaExtreme = false});
+      // Quick settings, so that CGC checkpoints don't hold up training.
+      save_output(temporary, CgcOptions{.fast = true});
       fs::rename(temporary, options.out);
       bar.message(std::format("  iteration {:6}: checkpoint saved to {}", iteration, options.out.string()));
     }
