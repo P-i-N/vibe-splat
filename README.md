@@ -109,15 +109,23 @@ does automatic differentiation: each pass has a hand-derived counterpart.
 
 - **Forward.** Parameters become screen-space splats, which are sorted by depth.
   Each splat then adds one entry per 16x16 pixel tile it covers, and a stable
-  sort by tile leaves every tile with its own depth-sorted list. Tiles do not
+  sort by tile leaves every tile with its own depth-sorted list. One workgroup
+  per tile, one thread per pixel: the tile's splats are staged through shared
+  memory and every thread blends its own pixel in registers. Tiles do not
   share pixels, so they composite in parallel with no blending hardware.
-- **Loss.** 0.8 L1 + 0.2 D-SSIM, and its derivative at every pixel.
+- **Loss.** 0.8 L1 + 0.2 D-SSIM, and its derivative at every pixel. The 11x11
+  SSIM window is separable: a horizontal pass into shared memory and a
+  vertical pass out of it, per tile.
 - **Backward.** At a pixel `C = F + T (alpha c + (1 - alpha) B)`, with `B` what
   lies behind a splat and `T` the transmittance in front of it. So
-  `dC/dalpha = T (c - B)` and `dC/dc = T alpha`. These add up per splat in
-  screen space, using float atomics, or fixed-point integer atomics on GPUs
-  without them. A last pass applies the chain rule down to position, scale,
-  rotation, opacity and SH.
+  `dC/dalpha = T (c - B)` and `dC/dc = T alpha`. Each pixel's share is reduced
+  over its subgroup with one butterfly for all nine values, then added per
+  splat with float atomics, or fixed-point integer atomics on GPUs without
+  them. A last pass applies the chain rule down to position, scale, rotation,
+  opacity and SH.
+- **Overlap.** One submission per iteration (forward, loss, backward, Adam),
+  and the next view's image is copied to staging memory on a worker thread
+  while the GPU works on the current one.
 - **Optimiser.** Adam, with the learning rates of the 3DGS paper.
 - **Density.** Every 100 iterations in the first half of training, a Gaussian
   whose screen position keeps wanting to move is cloned if small and split in

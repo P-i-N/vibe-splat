@@ -1,17 +1,20 @@
 #version 460
-// Forward pass, step 5: composites each tile's splats back to front. Tiles do
-// not share pixels, so tiles can run in parallel without blending hardware,
-// which is what makes the result available to the following compute passes.
+// Forward pass, step 5: composites each tile's splats back to front. One
+// workgroup per tile and one thread per pixel: the tile's splats are staged
+// through shared memory in batches, and every thread blends its own pixel in
+// registers, writing it once at the end. Tiles do not share pixels, so tiles
+// run in parallel without blending hardware, which is what makes the result
+// available to the following compute passes.
 // Output: rgb, and in a the log of the transmittance through all splats.
 #extension GL_GOOGLE_include_directive : require
 #include "train_types.glsl"
 
-layout(local_size_x = 16) in;
+layout(local_size_x = 16, local_size_y = 16) in; // TILE_SIZE
 
 layout(std430, binding = 0) readonly buffer Splats { TrainSplat splats[]; };
 layout(std430, binding = 1) readonly buffer EntryValues { uint entryValues[]; };
 layout(std430, binding = 2) readonly buffer Ranges { uvec2 ranges[]; };
-layout(std430, binding = 3) buffer Image { vec4 image[]; };
+layout(std430, binding = 3) writeonly buffer Image { vec4 image[]; };
 
 layout(push_constant) uniform Push {
   uint width;
@@ -21,37 +24,45 @@ layout(push_constant) uniform Push {
   vec4 background;
 } pc;
 
-void main() {
-  const uint tile = gl_GlobalInvocationID.x;
-  if (tile >= pc.tileCount) {
-    return;
-  }
-  const uint tx = tile % pc.gridW, ty = tile / pc.gridW;
-  const uint x0 = tx * TILE_SIZE, y0 = ty * TILE_SIZE;
-  const uint x1 = min(x0 + TILE_SIZE, pc.width), y1 = min(y0 + TILE_SIZE, pc.height);
+shared TrainSplat batch[TILE_BATCH];
 
-  // Working in the buffer itself: a local array this size would live in scratch
-  // memory on many GPUs, which is several times slower. Tiles do not share pixels.
-  for (uint y = y0; y < y1; ++y) {
-    for (uint x = x0; x < x1; ++x) {
-      image[y * pc.width + x] = vec4(pc.background.rgb, 0.0);
+void main() {
+  const uint tile = gl_WorkGroupID.x;
+  const uint tx = tile % pc.gridW, ty = tile / pc.gridW;
+  const uvec4 tilePixels = uvec4(tx * TILE_SIZE, ty * TILE_SIZE, min(tx * TILE_SIZE + TILE_SIZE, pc.width),
+                                 min(ty * TILE_SIZE + TILE_SIZE, pc.height));
+  const uint x = tilePixels.x + gl_LocalInvocationID.x, y = tilePixels.y + gl_LocalInvocationID.y;
+  const bool inside = x < pc.width && y < pc.height;
+
+  vec3 rgb = pc.background.rgb;
+  float logTransmittance = 0.0;
+  const uvec2 range = ranges[tile];
+  for (uint start = range.x; start < range.y; start += TILE_BATCH) {
+    const uint count = min(TILE_BATCH, range.y - start);
+    barrier();
+    if (gl_LocalInvocationIndex < count) {
+      batch[gl_LocalInvocationIndex] = splats[entryValues[start + gl_LocalInvocationIndex]];
+    }
+    barrier();
+    if (!inside) {
+      continue;
+    }
+    for (uint k = 0u; k < count; ++k) {
+      const TrainSplat s = batch[k];
+      const uvec4 area = splat_pixels(s, tilePixels);
+      if (x < area.x || x >= area.z || y < area.y || y >= area.w) {
+        continue;
+      }
+      vec2 d;
+      float power, alpha;
+      if (!splat_at(s, x, y, d, power, alpha)) {
+        continue;
+      }
+      rgb = mix(rgb, s.color.rgb, alpha);
+      logTransmittance += log(1.0 - alpha);
     }
   }
-  const uvec2 range = ranges[tile];
-  for (uint e = range.x; e < range.y; ++e) {
-    const TrainSplat s = splats[entryValues[e]];
-    const uvec4 area = splat_pixels(s, uvec4(x0, y0, x1, y1));
-    for (uint y = area.y; y < area.w; ++y) {
-      for (uint x = area.x; x < area.z; ++x) {
-        vec2 d;
-        float power, alpha;
-        if (!splat_at(s, x, y, d, power, alpha)) {
-          continue;
-        }
-        const uint at = y * pc.width + x;
-        const vec4 current = image[at];
-        image[at] = vec4(mix(current.rgb, s.color.rgb, alpha), current.a + log(1.0 - alpha));
-      }
-    }
+  if (inside) {
+    image[y * pc.width + x] = vec4(rgb, logTransmittance);
   }
 }

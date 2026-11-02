@@ -51,10 +51,10 @@ struct TilePush {
   float background[4];
 };
 struct SsimPush {
-  std::uint32_t width, height;
+  std::uint32_t width, height, gridW;
 };
 struct LossPush {
-  std::uint32_t width, height;
+  std::uint32_t width, height, gridW;
   float lambda;
 };
 struct FixedPush {
@@ -66,6 +66,9 @@ struct AdamPush {
   float learningRate, beta1, beta2, epsilon, correction1, correction2;
   std::uint32_t dcStride;
   float restScale;
+};
+struct GatherPush {
+  std::uint32_t count, stride;
 };
 
 std::unique_ptr<Buffer> gpu_buffer(vk::Context &ctx, VkDeviceSize bytes) {
@@ -79,6 +82,7 @@ void clear(VkCommandBuffer cmd, const Buffer &buffer) { vkCmdFillBuffer(cmd, buf
 struct Trainer::Group {
   std::unique_ptr<Buffer> values, gradients, first, second;
 
+  Group() = default;
   Group(vk::Context &ctx, std::span<const float> initial) {
     const VkDeviceSize bytes = initial.size_bytes();
     values = gpu_buffer(ctx, bytes);
@@ -100,12 +104,11 @@ Trainer::Trainer(vk::Context &ctx, const GaussianCloud &initial, const TrainerOp
       binEmit_(ctx, shaders::train_bin_emit_comp, 6, sizeof(EmitPush)),
       tileRanges_(ctx, shaders::train_tile_ranges_comp, 2, sizeof(CountPush)),
       forward_(ctx, shaders::train_forward_comp, 4, sizeof(TilePush)),
-      ssimH_(ctx, shaders::train_ssim_h_comp, 3, sizeof(SsimPush)),
-      ssim_(ctx, shaders::train_ssim_comp, 3, sizeof(SsimPush)),
-      lossH_(ctx, shaders::train_loss_h_comp, 2, sizeof(SsimPush)),
+      ssim_(ctx, shaders::train_ssim_comp, 4, sizeof(SsimPush)),
       loss_(ctx, shaders::train_loss_comp, 5, sizeof(LossPush)),
       gradient_(ctx, shaders::train_gradient_comp, 14),
-      adam_(ctx, shaders::train_adam_comp, 4, sizeof(AdamPush)), sorter_(ctx) {
+      adam_(ctx, shaders::train_adam_comp, 4, sizeof(AdamPush)), gather_(ctx, shaders::train_gather_comp, 3, sizeof(GatherPush)),
+      sorter_(ctx) {
   initial.validate();
   if (initial.empty()) throw std::runtime_error("nothing to train: the cloud is empty");
   count_ = static_cast<std::uint32_t>(initial.size());
@@ -115,11 +118,11 @@ Trainer::Trainer(vk::Context &ctx, const GaussianCloud &initial, const TrainerOp
 
   fixedPoint_ = options.forceFixedPoint || !ctx.info().floatAtomicAdd;
   if (fixedPoint_) {
-    backward_.emplace(ctx, shaders::train_backward_fixed_comp, 8, sizeof(TilePush));
+    backward_.emplace(ctx, shaders::train_backward_fixed_comp, 7, sizeof(TilePush));
     fixedToFloat_.emplace(ctx, shaders::train_fixed_to_float_comp, 1, sizeof(FixedPush));
     fixedScale_ = std::make_unique<Buffer>(ctx, sizeof(float), kStorage, MemoryUsage::Upload);
   } else {
-    backward_.emplace(ctx, shaders::train_backward_float_comp, 7, sizeof(TilePush));
+    backward_.emplace(ctx, shaders::train_backward_float_comp, 6, sizeof(TilePush));
   }
 
   groups_.push_back(std::make_unique<Group>(ctx, initial.positions));
@@ -190,6 +193,11 @@ void Trainer::allocate_per_gaussian() {
 }
 
 Trainer::~Trainer() {
+  if (prefetchWorker_.joinable()) {
+    prefetchWorker_.request_stop();
+    prefetchChanged_.notify_all();
+    prefetchWorker_.join();
+  }
   vkDeviceWaitIdle(ctx_.device());
   vkDestroyQueryPool(ctx_.device(), timestamps_, nullptr);
 }
@@ -207,14 +215,14 @@ void Trainer::ensure_size(int width, int height) {
     image_ = gpu_buffer(ctx_, pixels * 16);
     adjoint_ = gpu_buffer(ctx_, pixels * 16);
     fields_ = gpu_buffer(ctx_, pixels * 48);
-    moments_ = gpu_buffer(ctx_, pixels * 80);
-    behind_ = gpu_buffer(ctx_, pixels * 16);
-    target_ = std::make_unique<Buffer>(ctx_, pixels * 4, kStorage, MemoryUsage::Upload);
+    // The target is written by the CPU into staging memory and copied to the
+    // device once per iteration, as the loss passes read it several times.
+    targetStaging_ = std::make_unique<Buffer>(ctx_, pixels * 4, kStorage, MemoryUsage::Upload);
+    target_ = gpu_buffer(ctx_, pixels * 4);
   }
   if (!ranges_ || ranges_->size() < VkDeviceSize{tileCount_} * 8) ranges_ = gpu_buffer(ctx_, VkDeviceSize{tileCount_} * 8);
-  const VkDeviceSize rows = static_cast<std::uint32_t>(height);
-  if (!rowTotals_ || rowTotals_->size() < rows * 8) {
-    rowTotals_ = std::make_unique<Buffer>(ctx_, rows * 8, kStorage, MemoryUsage::Readback);
+  if (!groupTotals_ || groupTotals_->size() < VkDeviceSize{tileCount_} * 8) {
+    groupTotals_ = std::make_unique<Buffer>(ctx_, VkDeviceSize{tileCount_} * 8, kStorage, MemoryUsage::Readback);
   }
 }
 
@@ -308,22 +316,17 @@ void Trainer::record_forward(VkCommandBuffer cmd, std::uint32_t entries) {
   const TilePush push{static_cast<std::uint32_t>(width_), static_cast<std::uint32_t>(height_), gridW_, tileCount_,
                       {options_.background[0], options_.background[1], options_.background[2], 0.f}};
   mark(cmd, "tile lists");
-  forward_.dispatch(cmd, {splats_.get(), entryValues_.get(), ranges_.get(), image_.get()}, push, vk::div_up(tileCount_, 16));
+  forward_.dispatch(cmd, {splats_.get(), entryValues_.get(), ranges_.get(), image_.get()}, push, tileCount_);
   vk::compute_barrier(cmd);
   mark(cmd, "composite");
 }
 
 void Trainer::record_backward(VkCommandBuffer cmd) {
   const auto w = static_cast<std::uint32_t>(width_), h = static_cast<std::uint32_t>(height_);
-  const std::uint32_t rowGroups = vk::div_up(h, 16);
-  ssimH_.dispatch(cmd, {image_.get(), target_.get(), moments_.get()}, SsimPush{w, h}, rowGroups);
+  ssim_.dispatch(cmd, {image_.get(), target_.get(), fields_.get(), groupTotals_.get()}, SsimPush{w, h, gridW_}, tileCount_);
   vk::compute_barrier(cmd);
-  ssim_.dispatch(cmd, {moments_.get(), fields_.get(), rowTotals_.get()}, SsimPush{w, h}, rowGroups);
-  vk::compute_barrier(cmd);
-  lossH_.dispatch(cmd, {fields_.get(), moments_.get()}, SsimPush{w, h}, rowGroups);
-  vk::compute_barrier(cmd);
-  loss_.dispatch(cmd, {image_.get(), target_.get(), moments_.get(), adjoint_.get(), rowTotals_.get()},
-                 LossPush{w, h, options_.lambdaSsim}, rowGroups);
+  loss_.dispatch(cmd, {image_.get(), target_.get(), fields_.get(), adjoint_.get(), groupTotals_.get()},
+                 LossPush{w, h, gridW_, options_.lambdaSsim}, tileCount_);
   vk::compute_barrier(cmd);
   mark(cmd, "loss");
 
@@ -332,14 +335,14 @@ void Trainer::record_backward(VkCommandBuffer cmd) {
   vk::compute_barrier(cmd);
   const TilePush push{w, h, gridW_, tileCount_, {options_.background[0], options_.background[1], options_.background[2], 0.f}};
   if (fixedPoint_) {
-    backward_->dispatch(cmd, {splats_.get(), entryValues_.get(), ranges_.get(), image_.get(), adjoint_.get(), rawGradients_.get(), fixedScale_.get(), behind_.get()},
-                        push, vk::div_up(tileCount_, 16));
+    backward_->dispatch(cmd, {splats_.get(), entryValues_.get(), ranges_.get(), image_.get(), adjoint_.get(), rawGradients_.get(), fixedScale_.get()},
+                        push, tileCount_);
     vk::compute_barrier(cmd);
     const auto rawCount = static_cast<std::uint32_t>(count_ * kRawGradientsPerSplat);
     fixedToFloat_->dispatch(cmd, {rawGradients_.get()}, FixedPush{rawCount, fixedScale_->as<float>()[0]}, vk::div_up(rawCount, 256));
   } else {
-    backward_->dispatch(cmd, {splats_.get(), entryValues_.get(), ranges_.get(), image_.get(), adjoint_.get(), rawGradients_.get(), behind_.get()},
-                        push, vk::div_up(tileCount_, 16));
+    backward_->dispatch(cmd, {splats_.get(), entryValues_.get(), ranges_.get(), image_.get(), adjoint_.get(), rawGradients_.get()},
+                        push, tileCount_);
   }
   vk::compute_barrier(cmd);
   mark(cmd, "backward");
@@ -367,11 +370,55 @@ std::vector<float> Trainer::render(const Camera &camera) {
 }
 
 StepStats Trainer::compute_gradients(const Camera &camera, std::span<const std::uint8_t> target) {
+  return run(camera, target, nullptr);
+}
+
+void Trainer::wait_for_prefetch() {
+  std::unique_lock lock(prefetchMutex_);
+  prefetchChanged_.wait(lock, [&] { return !prefetchPending_; });
+}
+
+void Trainer::prefetch_target(std::span<const std::uint8_t> target) {
+  wait_for_prefetch();
+  if (!targetNext_ || targetNext_->size() < target.size()) {
+    targetNext_ = std::make_unique<Buffer>(ctx_, std::max<VkDeviceSize>(target.size(), 4), kStorage, MemoryUsage::Upload);
+  }
+  if (!prefetchWorker_.joinable()) {
+    prefetchWorker_ = std::jthread([this](std::stop_token stop) {
+      std::unique_lock lock(prefetchMutex_);
+      for (;;) {
+        prefetchChanged_.wait(lock, [&] { return prefetchPending_ || stop.stop_requested(); });
+        if (stop.stop_requested()) return;
+        std::memcpy(prefetchDestination_, prefetched_, prefetchedBytes_);
+        prefetchPending_ = false;
+        prefetchChanged_.notify_all();
+      }
+    });
+  }
+  {
+    const std::lock_guard lock(prefetchMutex_);
+    prefetched_ = target.data();
+    prefetchedBytes_ = target.size();
+    prefetchDestination_ = reinterpret_cast<std::uint8_t *>(targetNext_->mapped().data());
+    prefetchPending_ = true;
+  }
+  prefetchChanged_.notify_all();
+}
+
+StepStats Trainer::run(const Camera &camera, std::span<const std::uint8_t> target, const LearningRates *rates) {
   upload_camera(camera);
   const std::size_t bytes = static_cast<std::size_t>(width_) * height_ * 4;
   if (target.size() != bytes) throw std::runtime_error("the target image does not match the camera");
-  std::memcpy(target_->mapped().data(), target.data(), bytes);
-  target_->flush();
+  if (prefetched_ == target.data() && prefetchedBytes_ == bytes) {
+    // Started during the previous iteration, so normally long finished.
+    wait_for_prefetch();
+    std::swap(targetStaging_, targetNext_);
+    prefetched_ = nullptr;
+  } else {
+    // A prefetch of some other image carries on in the background.
+    std::memcpy(targetStaging_->mapped().data(), target.data(), bytes);
+  }
+  targetStaging_->flush();
   if (fixedPoint_) {
     // Per-pixel derivatives carry a factor 1 / (3 pixels), which this undoes.
     // The rest leaves a resolution of 1/64 and room for the sums.
@@ -382,19 +429,22 @@ StepStats Trainer::compute_gradients(const Camera &camera, std::span<const std::
   const std::uint32_t entries = record_prepare();
   ctx_.submit_and_wait([&](VkCommandBuffer cmd) {
     begin_timing(cmd);
+    const VkBufferCopy region{0, 0, bytes};
+    vkCmdCopyBuffer(cmd, targetStaging_->handle(), target_->handle(), 1, &region);
     record_forward(cmd, entries);
     record_backward(cmd);
+    if (rates != nullptr) record_adam(cmd, *rates);
   });
   finish_timing();
   ++timedIterations_;
 
-  rowTotals_->invalidate();
+  groupTotals_->invalidate();
   counters_->invalidate();
-  const auto rows = rowTotals_->as<float>();
+  const auto totals = groupTotals_->as<float>();
   double ssimSum = 0.0, l1Sum = 0.0;
-  for (int row = 0; row < height_; ++row) {
-    ssimSum += rows[static_cast<std::size_t>(row) * 2];
-    l1Sum += rows[static_cast<std::size_t>(row) * 2 + 1];
+  for (std::uint32_t g = 0; g < tileCount_; ++g) {
+    ssimSum += totals[static_cast<std::size_t>(g) * 2];
+    l1Sum += totals[static_cast<std::size_t>(g) * 2 + 1];
   }
   const double perValue = 1.0 / (3.0 * static_cast<double>(width_) * height_);
   StepStats stats;
@@ -406,30 +456,33 @@ StepStats Trainer::compute_gradients(const Camera &camera, std::span<const std::
   return stats;
 }
 
-void Trainer::apply_gradients(const LearningRates &rates) {
+void Trainer::record_adam(VkCommandBuffer cmd, const LearningRates &rates) {
   ++adamStep_;
   const float correction1 = 1.f - std::pow(kBeta1, static_cast<float>(adamStep_));
   const float correction2 = 1.f - std::pow(kBeta2, static_cast<float>(adamStep_));
   const float learning[5] = {rates.position, rates.scale, rates.rotation, rates.opacity, rates.sh};
+  for (std::size_t g = 0; g < groups_.size(); ++g) {
+    const Group &group = *groups_[g];
+    const auto floats = static_cast<std::uint32_t>(group.values->size() / sizeof(float));
+    const AdamPush push{floats, learning[g], kBeta1, kBeta2, kEpsilon, correction1, correction2,
+                        g == 4 ? shFloats_ : 0u, rates.shRestScale};
+    adam_.dispatch(cmd, {group.values.get(), group.gradients.get(), group.first.get(), group.second.get()}, push, vk::div_up(floats, 256));
+  }
+  vk::compute_barrier(cmd);
+  mark(cmd, "adam");
+}
+
+void Trainer::apply_gradients(const LearningRates &rates) {
   ctx_.submit_and_wait([&](VkCommandBuffer cmd) {
     begin_timing(cmd);
-    for (std::size_t g = 0; g < groups_.size(); ++g) {
-      const Group &group = *groups_[g];
-      const auto floats = static_cast<std::uint32_t>(group.values->size() / sizeof(float));
-      const AdamPush push{floats, learning[g], kBeta1, kBeta2, kEpsilon, correction1, correction2,
-                          g == 4 ? shFloats_ : 0u, rates.shRestScale};
-      adam_.dispatch(cmd, {group.values.get(), group.gradients.get(), group.first.get(), group.second.get()}, push, vk::div_up(floats, 256));
-    }
-    vk::compute_barrier(cmd);
-    mark(cmd, "adam");
+    record_adam(cmd, rates);
   });
   finish_timing();
 }
 
 StepStats Trainer::step(const Camera &camera, std::span<const std::uint8_t> target, const LearningRates &rates) {
-  const StepStats stats = compute_gradients(camera, target);
-  apply_gradients(rates);
-  return stats;
+  // One submission for the whole iteration, rather than one for the gradients and one for the step.
+  return run(camera, target, &rates);
 }
 
 void Trainer::set_active_sh_degree(int degree) { activeShDegree_ = std::clamp(degree, 0, shDegree_); }
@@ -465,21 +518,38 @@ void Trainer::apply_changes(const DensifyResult &result) {
   const std::size_t newCount = result.cloud.size();
   const std::vector<float> *newValues[5] = {&result.cloud.positions, &result.cloud.scales, &result.cloud.rotations,
                                             &result.cloud.opacities, &result.cloud.sh};
-  for (std::size_t g = 0; g < groups_.size(); ++g) {
-    const std::size_t perGaussian = newValues[g]->size() / newCount;
-    const std::vector<float> oldFirst = groups_[g]->first->download_as<float>(ctx_);
-    const std::vector<float> oldSecond = groups_[g]->second->download_as<float>(ctx_);
-    std::vector<float> first(newValues[g]->size(), 0.f), second(newValues[g]->size(), 0.f);
+
+  // The survivors keep their optimiser state: gathered on the GPU through
+  // this table, so that the moments never cross to the CPU. One old buffer is
+  // freed before the next new one is made, for the sake of the budget.
+  Buffer sourceTable(ctx_, std::max<VkDeviceSize>(newCount * sizeof(std::int32_t), 4), kStorage, MemoryUsage::Upload);
+  {
+    auto table = sourceTable.as<std::int32_t>();
     for (std::size_t i = 0; i < newCount; ++i) {
-      if (result.source[i] < 0) continue;
-      const auto from = static_cast<std::size_t>(result.source[i]);
-      std::copy_n(oldFirst.data() + from * perGaussian, perGaussian, first.data() + i * perGaussian);
-      std::copy_n(oldSecond.data() + from * perGaussian, perGaussian, second.data() + i * perGaussian);
+      table[i] = result.source[i] < 0 ? -1 : static_cast<std::int32_t>(result.source[i]);
     }
-    groups_[g].reset(); // Free the old buffers first, for the sake of the budget
-    groups_[g] = std::make_unique<Group>(ctx_, std::span<const float>(*newValues[g]));
-    groups_[g]->first->upload(ctx_, std::span<const float>(first));
-    groups_[g]->second->upload(ctx_, std::span<const float>(second));
+    sourceTable.flush();
+  }
+  const auto gather = [&](std::unique_ptr<Buffer> &from, std::uint32_t floats, std::uint32_t stride) {
+    std::unique_ptr<Buffer> to = gpu_buffer(ctx_, VkDeviceSize{floats} * sizeof(float));
+    ctx_.submit_and_wait([&](VkCommandBuffer cmd) {
+      gather_.dispatch(cmd, {&sourceTable, from.get(), to.get()}, GatherPush{floats, stride}, vk::div_up(floats, 256));
+      vk::compute_barrier(cmd);
+    });
+    from.reset();
+    return to;
+  };
+  for (std::size_t g = 0; g < groups_.size(); ++g) {
+    const auto stride = static_cast<std::uint32_t>(newValues[g]->size() / newCount);
+    const auto floats = static_cast<std::uint32_t>(newValues[g]->size());
+    auto moved = std::make_unique<Group>();
+    moved->first = gather(groups_[g]->first, floats, stride);
+    moved->second = gather(groups_[g]->second, floats, stride);
+    groups_[g].reset();
+    moved->values = gpu_buffer(ctx_, VkDeviceSize{floats} * sizeof(float));
+    moved->values->upload(ctx_, std::span<const float>(*newValues[g]));
+    moved->gradients = gpu_buffer(ctx_, VkDeviceSize{floats} * sizeof(float));
+    groups_[g] = std::move(moved);
   }
   count_ = static_cast<std::uint32_t>(newCount);
   allocate_per_gaussian();
@@ -504,7 +574,7 @@ std::uint64_t Trainer::bytes_per_gaussian() const noexcept {
 
 std::uint64_t Trainer::gpu_bytes() const {
   std::uint64_t total = bytes_per_gaussian() * count_;
-  for (const auto *buffer : {image_.get(), adjoint_.get(), fields_.get(), moments_.get(), behind_.get(), target_.get(), ranges_.get(), entryKeys_.get(),
+  for (const auto *buffer : {image_.get(), adjoint_.get(), fields_.get(), targetStaging_.get(), target_.get(), ranges_.get(), entryKeys_.get(),
                              entryValues_.get(), tmpEntryKeys_.get(), tmpEntryValues_.get()}) {
     if (buffer != nullptr) total += buffer->size();
   }

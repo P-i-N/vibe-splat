@@ -335,6 +335,8 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
   int lossCount = 0;
   int lastOpacityReset = -kCheckpointRecovery;
   bool checkpointDue = false;
+  double densifySeconds = 0.0;
+  int densifyRounds = 0;
   // CGC refuses NaN and infinity, which a few Gaussians can pick up after
   // densification has stopped pruning them, so those are left out of CGC files.
   const auto save_output = [&](const fs::path &path, const CgcOptions &cgcOptions) {
@@ -357,6 +359,13 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
     }
     const View &view = trainViews[order.back()];
     order.pop_back();
+    if (order.empty()) {
+      order.resize(trainViews.size());
+      std::iota(order.begin(), order.end(), std::size_t{0});
+      std::shuffle(order.begin(), order.end(), rng);
+    }
+    // The next view's image goes to the GPU while this one trains.
+    trainer.prefetch_target(trainViews[order.back()].rgba);
 
     const double progress = static_cast<double>(iteration - 1) / std::max(options.iterations - 1, 1);
     rates.position = static_cast<float>(positionStart * std::pow(positionEnd / positionStart, progress));
@@ -385,12 +394,15 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
       densifyOptions.pruneLarge = iteration > kOpacityResetInterval;
       densifyOptions.maxGaussians = available > pixelBytes ? static_cast<std::size_t>(static_cast<double>(available - pixelBytes) / perGaussian) : 0;
       if (options.maxGaussians > 0) densifyOptions.maxGaussians = std::min(densifyOptions.maxGaussians, options.maxGaussians);
+      const auto densifyStart = std::chrono::steady_clock::now();
       const DensifyResult result = trainer.densify(densifyOptions, densifyRng);
       report.heldBack += result.heldBack;
       if (iteration % kOpacityResetInterval == 0) {
         trainer.reset_opacity(kResetOpacity);
         lastOpacityReset = iteration;
       }
+      densifySeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - densifyStart).count();
+      ++densifyRounds;
     }
 
     if (iteration % options.reportEvery == 0 || iteration == options.iterations) {
@@ -451,6 +463,9 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
     profileTotal += ms;
   }
   std::println("GPU time per iteration: {:.1f} ms ({})", profileTotal, profile.substr(0, profile.size() > 2 ? profile.size() - 2 : 0));
+  if (densifyRounds > 0) {
+    std::println("Densification: {} rounds, {:.1f} s in total ({:.0f} ms each)", densifyRounds, densifySeconds, 1000.0 * densifySeconds / densifyRounds);
+  }
   std::println("Finished in {:.1f} s ({:.1f} it/s) -> {}", seconds, report.iterationsPerSecond, options.out.string());
   return report;
 }

@@ -4,6 +4,7 @@
 #define TRAIN_TYPES_GLSL
 
 const uint TILE_SIZE = 16u;
+const uint TILE_BATCH = TILE_SIZE * TILE_SIZE; // Splats staged through shared memory at a time
 const uint INVISIBLE = 0xFFFFFFFFu;
 
 struct TrainSplat {

@@ -2,10 +2,13 @@
 // The backward pass for GPUs with float atomics.
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_shader_atomic_float : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_shuffle : require
 
 layout(std430, binding = 5) buffer Gradients { float gradients[]; };
 
 void add_gradient(uint at, float value) { atomicAdd(gradients[at], value); }
 
-#define BEHIND_BINDING 6
 #include "train_backward.glsl"

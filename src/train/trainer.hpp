@@ -9,8 +9,11 @@
 
 #include <array>
 #include <cstdint>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <thread>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -78,6 +81,11 @@ public:
   // Both of the above.
   StepStats step(const Camera &camera, std::span<const std::uint8_t> target, const LearningRates &rates);
 
+  // Copies the next iteration's target into staging memory on a worker thread,
+  // so that the copy overlaps the GPU's work on this iteration. A following
+  // step() or compute_gradients() with the same span uses it.
+  void prefetch_target(std::span<const std::uint8_t> target);
+
   [[nodiscard]] GaussianCloud cloud() const;
 
   struct Gradients {
@@ -112,7 +120,7 @@ public:
   [[nodiscard]] std::uint64_t gpu_bytes() const;
   [[nodiscard]] std::uint64_t bytes_per_gaussian() const noexcept;
   static constexpr std::uint64_t kBytesPerTileEntry = 16;
-  static constexpr std::uint64_t kBytesPerPixel = 180;
+  static constexpr std::uint64_t kBytesPerPixel = 96;
 
 private:
   struct Group; // A flat parameter array with its gradient and Adam state
@@ -127,6 +135,9 @@ private:
   std::uint32_t record_prepare();
   void record_forward(VkCommandBuffer cmd, std::uint32_t entries);
   void record_backward(VkCommandBuffer cmd);
+  void record_adam(VkCommandBuffer cmd, const LearningRates &rates);
+  // Forward, loss, backward and, when rates are given, the Adam step, in one submission.
+  StepStats run(const Camera &camera, std::span<const std::uint8_t> target, const LearningRates *rates);
 
   vk::Context &ctx_;
   TrainerOptions options_;
@@ -139,7 +150,7 @@ private:
   int width_ = 0, height_ = 0;
   std::uint32_t gridW_ = 0, tileCount_ = 0;
 
-  vk::ComputePipeline preprocess_, binCount_, binEmit_, tileRanges_, forward_, ssimH_, ssim_, lossH_, loss_, gradient_, adam_;
+  vk::ComputePipeline preprocess_, binCount_, binEmit_, tileRanges_, forward_, ssim_, loss_, gradient_, adam_, gather_;
   std::optional<vk::ComputePipeline> backward_, fixedToFloat_;
   vk::RadixSorter sorter_;
 
@@ -148,7 +159,18 @@ private:
   std::unique_ptr<vk::Buffer> camera_, counters_, fixedScale_;
   std::unique_ptr<vk::Buffer> splats_, keys_, values_, tmpKeys_, tmpValues_, coverage_, rawGradients_, stats_;
   std::unique_ptr<vk::Buffer> entryKeys_, entryValues_, tmpEntryKeys_, tmpEntryValues_;
-  std::unique_ptr<vk::Buffer> ranges_, image_, adjoint_, fields_, moments_, behind_, target_, rowTotals_;
+  std::unique_ptr<vk::Buffer> ranges_, image_, adjoint_, fields_, targetStaging_, target_, groupTotals_;
+  // prefetch_target() hands one copy at a time to a worker thread that lives
+  // as long as the trainer, so that no thread is started per iteration.
+  std::unique_ptr<vk::Buffer> targetNext_;
+  const std::uint8_t *prefetched_ = nullptr;
+  std::size_t prefetchedBytes_ = 0;
+  std::mutex prefetchMutex_;
+  std::condition_variable prefetchChanged_;
+  bool prefetchPending_ = false; // A copy is queued or running
+  std::uint8_t *prefetchDestination_ = nullptr;
+  std::jthread prefetchWorker_;
+  void wait_for_prefetch();
 
   VkQueryPool timestamps_ = VK_NULL_HANDLE;
   double nanosecondsPerTick_ = 1.0;
