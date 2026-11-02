@@ -19,8 +19,8 @@ namespace splat {
 // docs/superpowers/specs/2026-11-02-cgc-v2-format.md.
 
 enum class CgcPreset {
-  Balanced, // about 29x smaller than PLY, about 42 dB against the original
-  Small,    // about 32x smaller, about 41 dB, with weaker close-ups
+  Balanced, // about 28x smaller than PLY, 40 to 43 dB against the original
+  Small,    // about 31x smaller, 39 to 41 dB, with weaker close-ups
 };
 
 struct CgcOptions {

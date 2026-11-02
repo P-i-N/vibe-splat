@@ -109,15 +109,16 @@ Figures are bytes per splat, against v1's 22.7.
   or k, so w can always be the largest, with no index and no decoder cost.
 - **YCoCg colour (2.29 -> 1.37).** RGB deltas between neighbours do not help;
   trained colours are too noisy.
-- **Importance layers (-12 to -20 %, no loss in the worst view at 40/80).** The
-  faintest, smallest splats tolerate far coarser values.
+- **Importance layers (-20 % at 40/80).** The faintest, smallest splats tolerate
+  far coarser values. Against a single layer at the top layer's precision, bonsai
+  lost nothing, while truck lost 0.8 dB in the mean and 1.7 dB in its worst view.
 - **lc = lp = pb = 0, LZMA preset 6.** Separate columns make contexts almost
   useless, and preset 9 extreme gained nothing here. Streams being independent lets a
   viewer decode them in parallel.
 
 Tried and left out:
 
-- **Dropping the least important splats.** Bonsai lost 0.3 dB for 30 % of the
+- **Dropping the least important splats.** Bonsai lost 0.8 dB for 30 % of the
   splats, but truck lost 4 dB for 10 %, so it is not safe as a default.
 - Hilbert order, colour and alpha deltas, octahedral normal plus angle rotations,
   and coarser rotations for round splats: no gain or a worse trade.
