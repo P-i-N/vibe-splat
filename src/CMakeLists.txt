@@ -9,6 +9,7 @@ add_library(splat_core STATIC
   core/vk_image.cpp
   splat/gaussian_cloud.cpp
   splat/lzma.cpp
+  splat/cgc.cpp
   render/camera.cpp
   render/splat_renderer.cpp
   render/offscreen.cpp
