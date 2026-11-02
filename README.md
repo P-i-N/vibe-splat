@@ -170,6 +170,26 @@ column in byte planes and compressed with LZMA. Training itself always works
 at full precision. The byte layout is in
 `docs/superpowers/specs/2026-11-02-cgc-format-design.md`.
 
+### Pruning floaters
+
+Trained scenes often contain a few "floaters": huge, nearly transparent
+Gaussians far outside the scene that render as long streaks from any viewpoint
+the training cameras did not cover. `splat convert` can drop them on the way
+to either format, with both tests off unless asked for:
+
+```
+splat convert scene.ply scene.cgc --prune-sigma 1 --prune-radius 4
+```
+
+`--prune-sigma <units>` removes every Gaussian whose largest axis (one standard
+deviation) is longer than that many world units. `--prune-radius <factor>`
+removes every Gaussian farther from the scene centre than that many times the
+radius holding 90% of all Gaussians; the centre is the per-axis median, so the
+floaters themselves do not move it. Either option alone enables its test, and
+`convert` prints how many Gaussians were removed. Start around `--prune-sigma
+1` for a room-sized scene in metres and look at a render; opaque, well-placed
+Gaussians are rarely that large.
+
 ## Running
 
 Users need nothing but a GPU driver with Vulkan 1.3. The program loads the
