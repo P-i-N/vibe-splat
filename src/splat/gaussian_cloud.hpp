@@ -54,6 +54,10 @@ struct Bounds {
 // other splat viewers.
 void save_ply(const GaussianCloud &cloud, const std::filesystem::path &path);
 
+// Removes every Gaussian with a NaN or infinite value in any attribute and
+// returns how many were removed. CGC refuses to save such values.
+std::size_t remove_non_finite(GaussianCloud &cloud);
+
 struct CgcOptions;
 
 // Splat file formats, chosen by extension: .cgc (any case) is the compressed

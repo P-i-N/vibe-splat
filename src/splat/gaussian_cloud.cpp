@@ -14,6 +14,7 @@
 #include <numbers>
 #include <optional>
 #include <random>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -367,6 +368,34 @@ void save_ply(const GaussianCloud &cloud, const std::filesystem::path &path) {
   if (!out) {
     throw std::runtime_error(std::format("Failed writing '{}'", path.string()));
   }
+}
+
+std::size_t remove_non_finite(GaussianCloud &cloud) {
+  const std::size_t n = cloud.size();
+  const std::size_t floats = static_cast<std::size_t>(3 * cloud.shCoeffs());
+  const auto finite = [](std::span<const float> values) { return std::ranges::all_of(values, [](float v) { return std::isfinite(v); }); };
+  std::size_t kept = 0;
+  for (std::size_t i = 0; i < n; ++i) {
+    if (!finite(std::span(cloud.positions).subspan(i * 3, 3)) || !finite(std::span(cloud.scales).subspan(i * 3, 3)) ||
+        !finite(std::span(cloud.rotations).subspan(i * 4, 4)) || !std::isfinite(cloud.opacities[i]) ||
+        !finite(std::span(cloud.sh).subspan(i * floats, floats))) {
+      continue;
+    }
+    if (kept != i) {
+      std::copy_n(cloud.positions.begin() + static_cast<std::ptrdiff_t>(i * 3), 3, cloud.positions.begin() + static_cast<std::ptrdiff_t>(kept * 3));
+      std::copy_n(cloud.scales.begin() + static_cast<std::ptrdiff_t>(i * 3), 3, cloud.scales.begin() + static_cast<std::ptrdiff_t>(kept * 3));
+      std::copy_n(cloud.rotations.begin() + static_cast<std::ptrdiff_t>(i * 4), 4, cloud.rotations.begin() + static_cast<std::ptrdiff_t>(kept * 4));
+      cloud.opacities[kept] = cloud.opacities[i];
+      std::copy_n(cloud.sh.begin() + static_cast<std::ptrdiff_t>(i * floats), floats, cloud.sh.begin() + static_cast<std::ptrdiff_t>(kept * floats));
+    }
+    ++kept;
+  }
+  cloud.positions.resize(kept * 3);
+  cloud.scales.resize(kept * 3);
+  cloud.rotations.resize(kept * 4);
+  cloud.opacities.resize(kept);
+  cloud.sh.resize(kept * floats);
+  return n - kept;
 }
 
 CloudFormat cloud_format(const std::filesystem::path &path) {

@@ -331,6 +331,18 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
   int lossCount = 0;
   int lastOpacityReset = -kCheckpointRecovery;
   bool checkpointDue = false;
+  // CGC refuses NaN and infinity, which a few Gaussians can pick up after
+  // densification has stopped pruning them, so those are left out of CGC files.
+  const auto save_output = [&](const fs::path &path, const CgcOptions &cgcOptions) {
+    GaussianCloud cloud = trainer.cloud();
+    const CloudFormat format = cloud_format(options.out);
+    if (format == CloudFormat::Cgc) {
+      if (const std::size_t removed = remove_non_finite(cloud); removed > 0) {
+        std::println("  left out {} Gaussians with NaN or infinite values", removed);
+      }
+    }
+    save_cloud(cloud, path, format, cgcOptions);
+  };
   const auto start = std::chrono::steady_clock::now();
   for (int iteration = 1; iteration <= options.iterations; ++iteration) {
     if (order.empty()) {
@@ -392,7 +404,7 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
       // Through a temporary file, so that a crash never leaves half a checkpoint.
       const fs::path temporary = fs::path(options.out).concat(".tmp");
       // A fast LZMA preset, so that CGC checkpoints don't hold up training.
-      save_cloud(trainer.cloud(), temporary, cloud_format(options.out), CgcOptions{.lzmaLevel = 1, .lzmaExtreme = false});
+      save_output(temporary, CgcOptions{.lzmaLevel = 1, .lzmaExtreme = false});
       fs::rename(temporary, options.out);
       std::println("  iteration {:6}: checkpoint saved to {}", iteration, options.out.string());
     }
@@ -411,7 +423,7 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
 
   trainer.set_active_sh_degree(options.shDegree);
   report.gaussians = trainer.gaussian_count();
-  save_cloud(trainer.cloud(), options.out);
+  save_output(options.out, CgcOptions{});
   write_preview(trainer.render(trainViews[0].camera), trainViews[0], options.project / "preview_train.png");
   if (!holdoutViews.empty()) {
     write_preview(trainer.render(holdoutViews[0].camera), holdoutViews[0], options.project / "preview_holdout.png");

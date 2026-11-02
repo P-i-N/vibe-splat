@@ -238,9 +238,12 @@ int cmd_convert(const GlobalOptions &opts) {
   }
   const std::filesystem::path in(args.positionals()[0]);
   const std::filesystem::path out(args.positionals()[1]);
-  const auto cloud = load_scene(in.string());
+  auto cloud = load_scene(in.string());
   const auto start = std::chrono::steady_clock::now();
   if (splat::cloud_format(out) == splat::CloudFormat::Cgc) {
+    if (const std::size_t removed = splat::remove_non_finite(cloud); removed > 0) {
+      std::println("Left out {} Gaussians with NaN or infinite values", removed);
+    }
     const auto stats = splat::save_cgc(cloud, out);
     std::println("SH degree per Gaussian: 0: {}, 1: {}, 2: {}, 3: {}", stats.degreeCounts[0], stats.degreeCounts[1],
                  stats.degreeCounts[2], stats.degreeCounts[3]);

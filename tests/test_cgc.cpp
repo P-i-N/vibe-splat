@@ -7,9 +7,11 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <random>
@@ -415,4 +417,118 @@ TEST_CASE("save_cloud and load_cloud follow the extension", "[cgc]") {
   save_cloud(cloud, temporary, CloudFormat::Cgc, CgcOptions{.lzmaLevel = 1, .lzmaExtreme = false});
   check_round_trip(cloud, load_cgc(temporary));
   std::filesystem::remove(temporary);
+}
+
+TEST_CASE("remove_non_finite drops only the broken Gaussians", "[cgc]") {
+  GaussianCloud cloud = random_cloud(6, 1, 91);
+  const GaussianCloud original = cloud;
+  cloud.positions[1 * 3 + 2] = NAN;
+  cloud.sh[4 * 12 + 5] = INFINITY;
+  CHECK(remove_non_finite(cloud) == 2);
+  REQUIRE(cloud.size() == 4);
+  cloud.validate();
+  for (const std::size_t kept : {0, 2, 3, 5}) {
+    const std::size_t j = kept < 1 ? 0 : kept < 4 ? kept - 1 : kept - 2;
+    CHECK(cloud.opacities[j] == original.opacities[kept]);
+  }
+  CHECK_NOTHROW(save_cgc(cloud, temp_file("splat_cgc_cleaned.cgc")));
+  std::filesystem::remove(temp_file("splat_cgc_cleaned.cgc"));
+  CHECK(remove_non_finite(cloud) == 0);
+}
+
+namespace {
+
+std::vector<std::uint8_t> slice(const std::vector<std::byte> &payload, std::size_t offset, std::size_t size) {
+  std::vector<std::uint8_t> out;
+  for (std::size_t i = 0; i < size; ++i) out.push_back(static_cast<std::uint8_t>(payload[offset + i]));
+  return out;
+}
+
+std::vector<std::uint8_t> planes_of(std::initializer_list<std::uint32_t> values) {
+  std::vector<std::uint8_t> out;
+  for (int b = 0; b < 4; ++b) {
+    for (const std::uint32_t v : values) out.push_back(static_cast<std::uint8_t>(v >> (8 * b)));
+  }
+  return out;
+}
+
+} // namespace
+
+// Pins the byte layout from the spec, independently of load_cgc, so that a
+// change on both the encoder and decoder side cannot slip through unnoticed.
+TEST_CASE("CGC payload bytes follow the spec layout", "[cgc]") {
+  GaussianCloud cloud;
+  cloud.resize(3, 2);
+  // Morton order is p0, p1, p2: p1 maxes out x (bit 0), p2 maxes out y (bit 1).
+  cloud.positions = {0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f, 0.f};
+  cloud.scales = {-1.f, -2.f, -2.f, -1.5f, -2.f, -2.f, -3.f, -2.f, -2.f};
+  cloud.rotations = {1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f};
+  cloud.opacities = {-10.f, 0.f, 10.f};
+  const std::array<std::array<float, 3>, 3> colours = {{{0.2f, 0.5f, 1.f}, {0.4f, 0.5f, 0.4f}, {1.f, 0.5f, 0.2f}}};
+  constexpr std::size_t coeffs = 9;
+  for (std::size_t i = 0; i < 3; ++i) {
+    for (int c = 0; c < 3; ++c) cloud.sh[i * coeffs * 3 + c] = (colours[i][c] - 0.5f) / kShC0;
+  }
+  // p1: band 1 only, all 0.3. p2: band 1 (k=1, c=1) = -0.3; band 2 (k=4, c=2) = 0.5.
+  for (std::size_t k = 1; k < 4; ++k) {
+    for (int c = 0; c < 3; ++c) cloud.sh[(1 * coeffs + k) * 3 + c] = 0.3f;
+  }
+  cloud.sh[(2 * coeffs + 1) * 3 + 1] = -0.3f;
+  cloud.sh[(2 * coeffs + 4) * 3 + 2] = 0.5f;
+
+  const auto path = temp_file("splat_cgc_layout.cgc");
+  save_cgc(cloud, path);
+  std::vector<char> file(std::filesystem::file_size(path));
+  std::ifstream(path, std::ios::binary).read(file.data(), static_cast<std::streamsize>(file.size()));
+  std::filesystem::remove(path);
+
+  // Outer header: magic, version, payload size, then the .lzma header.
+  REQUIRE(file.size() > 29);
+  CHECK(std::vector<char>(file.begin(), file.begin() + 4) == std::vector<char>{'C', 'G', 'C', '\0'});
+  std::uint32_t version = 0;
+  std::uint64_t payloadSize = 0;
+  std::memcpy(&version, file.data() + 4, 4);
+  std::memcpy(&payloadSize, file.data() + 8, 8);
+  CHECK(version == 1);
+  CHECK(payloadSize == 169);
+  std::uint64_t lzmaSize = 0;
+  std::memcpy(&lzmaSize, file.data() + 16 + 5, 8);
+  CHECK(lzmaSize == UINT64_MAX); // unknown size, ends with an end marker
+
+  const auto stream = std::as_bytes(std::span(file)).subspan(16);
+  const std::vector<std::byte> payload = lzma_decompress(stream, payloadSize);
+  REQUIRE(payload.size() == 169);
+
+  std::uint32_t count = 0;
+  std::array<float, 9> ranges{};
+  std::memcpy(&count, payload.data(), 4);
+  std::memcpy(ranges.data(), payload.data() + 4, 36);
+  CHECK(count == 3);
+  CHECK(std::abs(ranges[0] - 0.2f) < 1e-6f); // colorMin R
+  CHECK(std::abs(ranges[5] - 1.f) < 1e-6f);  // colorMax B
+  CHECK(std::abs(ranges[6] - 0.3f) < 1e-6f); // shRange band 1
+  CHECK(std::abs(ranges[7] - 0.5f) < 1e-6f); // shRange band 2
+  CHECK(ranges[8] == 0.f);                    // shRange band 3: unused
+
+  // Chunk table: one chunk, 12 floats in byte planes.
+  CHECK(slice(payload, 40, 48) ==
+        planes_of({std::bit_cast<std::uint32_t>(0.f), std::bit_cast<std::uint32_t>(0.f), std::bit_cast<std::uint32_t>(0.f),
+                   std::bit_cast<std::uint32_t>(1.f), std::bit_cast<std::uint32_t>(1.f), std::bit_cast<std::uint32_t>(0.f),
+                   std::bit_cast<std::uint32_t>(-3.f), std::bit_cast<std::uint32_t>(-2.f), std::bit_cast<std::uint32_t>(-2.f),
+                   std::bit_cast<std::uint32_t>(-1.f), std::bit_cast<std::uint32_t>(-2.f), std::bit_cast<std::uint32_t>(-2.f)}));
+  // Positions: x in bits 0-10, y in bits 11-20, z in bits 21-31.
+  CHECK(slice(payload, 88, 12) == planes_of({0u, 0x7FFu, 0x3FFu << 11}));
+  // Rotations: identity drops w (index 0); x, y, z sit at the symmetric zero 511.
+  const std::uint32_t identity = 511u | 511u << 10 | 511u << 20;
+  CHECK(slice(payload, 100, 12) == planes_of({identity, identity, identity}));
+  // Scales: all x, then all y, then all z.
+  CHECK(slice(payload, 112, 9) == std::vector<std::uint8_t>{255, 191, 0, 0, 0, 0, 0, 0, 0});
+  // Colour and opacity: all R, all G, all B, all A.
+  CHECK(slice(payload, 121, 12) == std::vector<std::uint8_t>{0, 64, 255, 0, 0, 0, 255, 64, 0, 0, 128, 255});
+  CHECK(slice(payload, 133, 3) == std::vector<std::uint8_t>{0, 1, 2});
+  // Band 1 for p1 and p2: coefficient outer, channel inner; 5 bits, zero at 15.
+  CHECK(slice(payload, 136, 18) ==
+        std::vector<std::uint8_t>{30, 15, 30, 0, 30, 15, 30, 15, 30, 15, 30, 15, 30, 15, 30, 15, 30, 15});
+  // Band 2 for p2 only: 4 bits, zero at 7.
+  CHECK(slice(payload, 154, 15) == std::vector<std::uint8_t>{7, 7, 14, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7});
 }
