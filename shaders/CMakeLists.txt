@@ -18,6 +18,10 @@ splat_add_shader_library(splat_shaders
     train_exposure_backward.comp
     train_error_mask.comp
     train_score.comp
+    train_pose.comp
+    train_hutchinson.comp
+    train_curvature.comp
+    train_second_order.comp
     train_loss.comp
     train_backward_float.comp
     train_backward_fixed.comp

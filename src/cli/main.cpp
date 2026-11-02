@@ -139,6 +139,12 @@ train options (writes project/splat.ply and project/preview_*.png):
                           ones at random (default 0)
   --significance-prune    Of the too transparent, remove the half adding least, and
                           remove none for their size
+  --adaptive-schedule     Choose the coarse-to-fine sizes from the photos' spectra, and
+                          grow the Gaussians with the image size
+  --refine-poses          Refine the training cameras along with the Gaussians
+  --second-order          After densification, step by estimated curvature, not Adam
+  --dense-init <n>        Start from up to n more points than the sparse model has,
+                          found by matching patches between the photos (default 0)
   --point-extent          Take the scene's extent from the sparse points, not the cameras
 
 make-test-views options:
@@ -457,11 +463,11 @@ int cmd_train(const GlobalOptions &opts) {
   for (auto &a : rest) {
     if (a == "-o") a = "--out";
   }
-  const splat::cli::Args args(rest, {"--no-densify", "--full-resolution", "--exposure", "--full-adam", "--significance-prune", "--point-extent"});
+  const splat::cli::Args args(rest, {"--no-densify", "--full-resolution", "--exposure", "--full-adam", "--significance-prune", "--point-extent", "--adaptive-schedule", "--refine-poses", "--second-order"});
   args.allow_only({"out", "iterations", "lambda-ssim", "sh-degree", "max-size", "max-views", "holdout", "seed", "report-every", "save-every",
                    "no-densify", "gradient-threshold", "vram-budget", "max-gaussians", "prune", "full-resolution", "exposure", "full-adam",
                    "threshold-rise", "split-threshold", "dense-fraction", "densify-interval", "score-views", "score-min-pixels", "explore",
-                   "significance-prune", "point-extent"});
+                   "significance-prune", "point-extent", "adaptive-schedule", "refine-poses", "second-order", "dense-init"});
   if (args.positionals().size() != 1) {
     std::println(stderr, "Usage: splat train <project> [options]  (see splat --help)");
     return 2;
@@ -495,6 +501,10 @@ int cmd_train(const GlobalOptions &opts) {
   options.explore = std::max(args.number("explore", options.explore), 0);
   options.significancePrune = args.has("significance-prune");
   options.pointExtent = args.has("point-extent");
+  options.adaptiveSchedule = args.has("adaptive-schedule");
+  options.refinePoses = args.has("refine-poses");
+  options.secondOrder = args.has("second-order");
+  options.densePoints = args.number<std::size_t>("dense-init", 0);
   splat::vk::Context ctx(opts.context);
   std::println("Device: {}", ctx.info().name);
   splat::run_train(ctx, options);

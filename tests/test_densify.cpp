@@ -2,7 +2,9 @@
 #include "sfm/test_views.hpp"
 #include "test_support.hpp"
 #include "train/densify.hpp"
+#include "train/dense_points.hpp"
 #include "train/reference.hpp"
+#include "train/schedule.hpp"
 #include "train/train.hpp"
 #include "train/trainer.hpp"
 #include "ingest/ingest.hpp"
@@ -270,6 +272,114 @@ TEST_CASE("Exploration splits large Gaussians and seeds new ones within the limi
   r = densify_cloud(cloud, stats, options, rng);
   CHECK(r.cloud.size() == 9);
   CHECK(r.seeded == 0);
+}
+
+TEST_CASE("The image sizes follow the photos' spectra", "[densify]") {
+  constexpr int size = 64;
+  std::mt19937 rng(9);
+  std::vector<std::uint8_t> noise(size * size * 4), smooth(size * size * 4);
+  for (int y = 0; y < size; ++y) {
+    for (int x = 0; x < size; ++x) {
+      const auto value = static_cast<std::uint8_t>(127.5 * (1.0 + std::sin(0.2 * x) * std::cos(0.1 * y)));
+      for (int c = 0; c < 3; ++c) {
+        noise[static_cast<std::size_t>(y * size + x) * 4 + static_cast<std::size_t>(c)] = static_cast<std::uint8_t>(rng() & 255u);
+        smooth[static_cast<std::size_t>(y * size + x) * 4 + static_cast<std::size_t>(c)] = value;
+      }
+    }
+  }
+  const auto switches = [&](const std::vector<std::uint8_t> &image) {
+    const std::vector<double> x = frequency_energy(image, size, size, {1, 2, 4});
+    CHECK(x[0] > x[1]);
+    CHECK(x[1] > x[2]);
+    return resolution_switches(x[0], x[1], x[2]);
+  };
+  // Noise is all high frequencies, so full size is needed at once. A smooth
+  // image holds its energy low, so small images serve it well for long.
+  const auto fromNoise = switches(noise), fromSmooth = switches(smooth);
+  CHECK(fromNoise[0] < 0.25);
+  CHECK(fromSmooth[0] > 0.7);
+  CHECK(fromSmooth[1] > 0.4);
+  CHECK(fromSmooth[1] <= fromSmooth[0]);
+
+  // The natural case of a spectrum falling as 1/f: half the energy per halving.
+  const auto natural = resolution_switches(4.0, 2.0, 1.0);
+  CHECK_THAT(natural[0], WithinAbs(0.5, 1e-9));
+  CHECK_THAT(natural[1], WithinAbs(0.0, 1e-9));
+}
+
+TEST_CASE("Gaussians are allowed to grow with the image size", "[densify]") {
+  GrowthBudget budget(1000);
+  CHECK(budget.final_count() == 5000.0);
+  CHECK(budget.limit(1.0, 0.0) == 5000);
+  CHECK(budget.limit(1.0, 0.9) == 5000);
+  CHECK(budget.limit(4.0, 0.0) == 1000 + 4000 / 16);
+  CHECK(budget.limit(2.0, 0.5) < budget.limit(1.0, 0.5));
+  // Asking for much raises what the scene needs; asking for little does not lower it.
+  budget.observe(1000);
+  CHECK(budget.final_count() == 0.98 * 5000.0 + 1000.0);
+  budget.observe(0);
+  CHECK(budget.final_count() == 0.98 * 5000.0 + 1000.0);
+}
+
+TEST_CASE("Patch matching finds points on a textured plane", "[densify]") {
+  // Blobs on the plane z = 5, seen by cameras shifted sideways.
+  std::mt19937 rng(11);
+  std::uniform_real_distribution<float> where(-4.f, 4.f), shade(0.f, 1.f);
+  struct Blob {
+    float x, y, value;
+  };
+  std::vector<Blob> blobs(1800);
+  for (Blob &b : blobs) b = {where(rng), where(rng), shade(rng)};
+  constexpr int width = 200, height = 160;
+  std::vector<std::vector<std::uint8_t>> images;
+  std::vector<DensePointsView> views;
+  std::vector<Camera> cameras;
+  for (int v = 0; v < 5; ++v) {
+    Camera camera;
+    camera.width = width;
+    camera.height = height;
+    camera.fx = camera.fy = 200.f;
+    camera.cx = 100.f;
+    camera.cy = 80.f;
+    camera.position = glm::vec3(0.25f * static_cast<float>(v), 0.f, 0.f);
+    camera.view = glm::mat4(1.f);
+    camera.view[3] = glm::vec4(-camera.position, 1.f);
+    cameras.push_back(camera);
+    std::vector<std::uint8_t> rgba(width * height * 4);
+    std::vector<float> sum(width * height, 0.f);
+    for (const Blob &b : blobs) {
+      const float px = 200.f * (b.x - camera.position.x) / 5.f + 100.f, py = 200.f * b.y / 5.f + 80.f;
+      for (int y = std::max(0, static_cast<int>(py) - 6); y < std::min(height, static_cast<int>(py) + 7); ++y) {
+        for (int x = std::max(0, static_cast<int>(px) - 6); x < std::min(width, static_cast<int>(px) + 7); ++x) {
+          const float dx = static_cast<float>(x) + 0.5f - px, dy = static_cast<float>(y) + 0.5f - py;
+          sum[static_cast<std::size_t>(y * width + x)] += (b.value - 0.5f) * std::exp(-(dx * dx + dy * dy) / 4.f);
+        }
+      }
+    }
+    for (std::size_t i = 0; i < sum.size(); ++i) {
+      const auto value = static_cast<std::uint8_t>(std::clamp(128.f + 110.f * sum[i], 0.f, 255.f));
+      rgba[i * 4] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = value;
+      rgba[i * 4 + 3] = 255;
+    }
+    images.push_back(std::move(rgba));
+  }
+  for (int v = 0; v < 5; ++v) views.push_back({cameras[static_cast<std::size_t>(v)], images[static_cast<std::size_t>(v)]});
+  std::vector<ColmapPoint> sparse(40);
+  for (std::size_t i = 0; i < sparse.size(); ++i) sparse[i].position = glm::dvec3(where(rng) * 0.3f, where(rng) * 0.3f, 3.5f + 3.f * shade(rng));
+
+  const std::vector<ColmapPoint> found = dense_points(views, sparse, 100000);
+  std::println("  patch matching found {} points", found.size());
+  REQUIRE(found.size() > 500);
+  std::size_t onPlane = 0;
+  for (const ColmapPoint &p : found) {
+    if (std::abs(p.position.z - 5.0) < 0.15) ++onPlane;
+  }
+  CHECK(static_cast<double>(onPlane) > 0.95 * static_cast<double>(found.size()));
+
+  // The limit holds.
+  CHECK(dense_points(views, sparse, 100).size() == 100);
+  // Too few views to check anything.
+  CHECK(dense_points(std::span(views).first(2), sparse, 100).empty());
 }
 
 TEST_CASE("The GPU collects densification statistics", "[densify][vulkan]") {

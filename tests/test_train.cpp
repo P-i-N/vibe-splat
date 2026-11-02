@@ -474,3 +474,69 @@ TEST_CASE("Scoring a view counts the high-error pixels each Gaussian reaches", "
     for (std::size_t i = 0; i < cpu.size(); ++i) CHECK(after.markedPixels[i] == scored.markedPixels[i]);
   }
 }
+
+TEST_CASE("Pose gradients match finite differences of the loss", "[train][vulkan]") {
+  vk::Context *ctx = test::context();
+  if (ctx == nullptr) SKIP("No usable Vulkan device");
+  const Camera camera = test_camera(72, 56);
+  const auto target = noise_target(camera.width, camera.height, 53);
+  const GaussianCloud cloud = random_cloud(300, 0, 59);
+  const auto loss_at = [&](const std::array<float, 6> &move) {
+    return reference_loss(reference_render(cloud, refined_pose(camera, move), {.noCutoffs = true}), target, 0.2).loss;
+  };
+  std::vector<double> numeric(6);
+  for (std::size_t k = 0; k < 6; ++k) {
+    std::array<float, 6> up{}, down{};
+    up[k] = 1e-3f;
+    down[k] = -1e-3f;
+    numeric[k] = (loss_at(up) - loss_at(down)) / 2e-3;
+  }
+  TrainerOptions options;
+  options.poseGradients = true;
+  Trainer trainer(*ctx, cloud, options);
+  const StepStats stats = trainer.compute_gradients(camera, target);
+  std::println("  pose:");
+  // Not exact: it leaves out how the camera turns each Gaussian's shape.
+  check_close(to_double(std::vector<float>(stats.poseGradient.begin(), stats.poseGradient.end())), numeric, "pose", 0.95, 0.3);
+
+  // The move is the one the gradient was taken for: a point in camera space turns and shifts.
+  const Camera moved = refined_pose(camera, {0.f, 0.1f, 0.f, 0.2f, 0.f, 0.f});
+  const glm::vec3 point = glm::vec3(moved.view * glm::vec4(0.f, 0.f, 3.f, 1.f));
+  CHECK_THAT(point.x, WithinAbs(3.f * std::sin(0.1f) + 0.2f, 1e-5));
+  CHECK_THAT(point.z, WithinAbs(3.f * std::cos(0.1f), 1e-5));
+  const glm::vec3 eye = glm::vec3(moved.view * glm::vec4(moved.position, 1.f));
+  CHECK_THAT(glm::length(eye), WithinAbs(0.f, 1e-5));
+}
+
+TEST_CASE("Second-order steps fit a view within their trust region", "[train][vulkan]") {
+  vk::Context *ctx = test::context();
+  if (ctx == nullptr) SKIP("No usable Vulkan device");
+  if (!ctx->info().floatAtomicAdd) SKIP("Needs float atomics");
+  const Camera camera = test_camera(72, 56);
+  const auto target = noise_target(camera.width, camera.height, 61);
+  const GaussianCloud cloud = random_cloud(120, 1, 67);
+  Trainer trainer(*ctx, cloud);
+  trainer.enable_second_order();
+  LearningRates rates;
+  rates.trustRegion = 1e-5f;
+
+  // The curvature of J^T J is never negative, and only exists for what is in view.
+  trainer.compute_gradients(camera, target);
+  trainer.update_curvature();
+  const GaussianCloud before = trainer.cloud();
+  const StepStats first = trainer.step(camera, target, rates);
+  const GaussianCloud after = trainer.cloud();
+  // The trust region holds: opacity at 0.5 moves no more than sqrt(4 * 0.5 * e) / 0.25 in logit.
+  for (std::size_t i = 0; i < after.size(); ++i) {
+    const float a = std::max(1.f / (1.f + std::exp(-before.opacities[i])), 1e-3f);
+    const float radius = std::sqrt(4.f * a * rates.trustRegion) / std::max(a * (1.f - a), 1e-3f);
+    REQUIRE(std::abs(after.opacities[i] - before.opacities[i]) <= radius * 1.001f);
+  }
+  float loss = first.loss;
+  for (int i = 0; i < 300; ++i) {
+    loss = trainer.step(camera, target, rates).loss;
+    if (i % 10 == 0) trainer.update_curvature();
+  }
+  REQUIRE(std::isfinite(loss));
+  CHECK(loss < first.loss);
+}

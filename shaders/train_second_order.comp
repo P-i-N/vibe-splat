@@ -1,0 +1,58 @@
+#version 460
+// A step of 3DGS^2-TR: the averaged gradient over the diagonal of the
+// curvature, clipped per parameter to how far it can move before the Gaussian's
+// contribution changes by more than epsilon in squared Hellinger distance.
+#extension GL_GOOGLE_include_directive : require
+#include "splat_types.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Parameters { float parameters[]; };
+layout(std430, binding = 1) readonly buffer Gradients { float gradients[]; };
+layout(std430, binding = 2) buffer FirstMoment { float m[]; };
+layout(std430, binding = 3) readonly buffer Curvature { float curvature[]; };
+layout(std430, binding = 4) readonly buffer Scales { float scales[]; };
+layout(std430, binding = 5) readonly buffer Opacities { float opacities[]; };
+layout(std430, binding = 6) readonly buffer SH { float sh[]; };
+
+layout(push_constant) uniform Push {
+  uint count;
+  float beta1;
+  float correction1;      // 1 - beta1^t
+  float curvatureScale;   // 1 / (1 - beta^k)
+  float epsilon;
+  uint kind;              // 0 position, 1 scale, 2 opacity, 3 SH
+  uint stride;            // Floats per Gaussian
+} pc;
+
+const float SH_C0 = 0.28209479177387814;
+
+void main() {
+  const uint i = gl_GlobalInvocationID.x;
+  if (i >= pc.count) {
+    return;
+  }
+  const float g = gradients[i];
+  if (g == 0.0) {
+    return;
+  }
+  m[i] = pc.beta1 * m[i] + (1.0 - pc.beta1) * g;
+
+  const uint gaussian = i / pc.stride;
+  const float alpha = max(1.0 / (1.0 + exp(-opacities[gaussian])), 1e-3);
+  float radius;
+  if (pc.kind == 0u) {
+    const vec3 s = exp(vec3(scales[gaussian * 3u], scales[gaussian * 3u + 1u], scales[gaussian * 3u + 2u]));
+    radius = sqrt(8.0 * dot(s, s) / 3.0 * pc.epsilon / alpha);
+  } else if (pc.kind == 1u) {
+    radius = sqrt(2.0 * pc.epsilon / alpha); // The parameter is the log of the scale
+  } else if (pc.kind == 2u) {
+    radius = sqrt(4.0 * alpha * pc.epsilon) / max(alpha * (1.0 - alpha), 1e-3); // The parameter is the logit
+  } else {
+    const float channel = (i - gaussian * pc.stride) % 3u;
+    const float colour = clamp(0.5 + SH_C0 * sh[gaussian * pc.stride + uint(channel)], 0.02, 1.0);
+    radius = sqrt(4.0 * colour * pc.epsilon / alpha) / SH_C0;
+  }
+  const float step = (m[i] / pc.correction1) / max(curvature[i] * pc.curvatureScale, 1e-30);
+  parameters[i] -= clamp(step, -radius, radius);
+}

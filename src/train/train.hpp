@@ -44,6 +44,14 @@ struct TrainOptions {
   float scoreMinPixels = 5.f;     // See DensifyOptions::minMarkedPixels
   int explore = 0;                // Random splits and random new Gaussians per round
   bool significancePrune = false; // Of the too transparent remove the half adding least, and none for size
+  // Image sizes from the photos' spectra, Gaussians growing with the size, and
+  // the position rate held until full size (DashGaussian).
+  bool adaptiveSchedule = false;
+  // Refine each training view's camera along with the Gaussians, for poses that are a little off.
+  bool refinePoses = false;
+  std::size_t densePoints = 0; // Start from up to this many more points, by patch matching
+  // After densification, steps from the curvature instead of Adam's second moment (3DGS^2-TR).
+  bool secondOrder = false;
   bool pointExtent = false;       // The scene's extent from the sparse points, not the cameras
 };
 

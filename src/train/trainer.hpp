@@ -29,6 +29,7 @@ struct TrainerOptions {
   // Adam leaves Gaussians out of view alone: a fifth faster on the test set,
   // but about 0.5 dB lower on held-out views than updating them all.
   bool selectiveAdam = true;
+  bool poseGradients = false; // Fill StepStats::poseGradient, for refining cameras
   std::uint64_t memoryBudget = ~std::uint64_t{0}; // Bytes; never allocates beyond this
 };
 
@@ -46,6 +47,9 @@ struct LearningRates {
   float opacity = 0.05f;
   float sh = 0.025f;
   float shRestScale = 0.05f; // SH above degree 0, relative to `sh`
+  // Above 0, once enable_second_order() was called: position, scale, opacity
+  // and SH step by curvature within this trust region, rotation still by Adam.
+  float trustRegion = 0.f;
 };
 
 struct StepStats {
@@ -56,11 +60,16 @@ struct StepStats {
   std::uint32_t tileEntries = 0;
   // dL/d(exposure transform), as set_exposure() takes it.
   std::array<float, 12> exposureGradient{};
+  // dL/d(rotation, translation) of the camera, in camera space. See refined_pose().
+  std::array<float, 6> poseGradient{};
 };
 
 // rgb' = A rgb + b for a view's camera, as rows (A row, b): identity by default.
 using Exposure = std::array<float, 12>;
 inline constexpr Exposure kNeutralExposure{1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f};
+
+// The camera moved by a rotation (axis times angle) and then a translation, both in camera space.
+[[nodiscard]] Camera refined_pose(const Camera &camera, const std::array<float, 6> &move);
 
 // Trains Gaussians with Vulkan compute only:
 //   forward   parameters -> splats -> depth sort -> per-tile lists -> composite
@@ -88,6 +97,12 @@ public:
   // error is above errorShare of this view's worst, each counting as
   // pixelWeight, for densification to use (FastGS).
   StepStats score_view(const Camera &camera, std::span<const std::uint8_t> target, float errorShare, float pixelWeight = 1.f);
+
+  // Second-order training: makes room for the curvature, and from then on
+  // update_curvature() adds an estimate to it from the view rendered last, on
+  // top of what compute_gradients() or step() left. Needs float atomics.
+  void enable_second_order();
+  void update_curvature();
 
   // One Adam step from the current gradients.
   void apply_gradients(const LearningRates &rates);
@@ -159,6 +174,7 @@ private:
   std::uint32_t record_prepare();
   void record_forward(VkCommandBuffer cmd, std::uint32_t entries);
   void record_backward(VkCommandBuffer cmd);
+  void record_backward_from_adjoint(VkCommandBuffer cmd);
   void record_adam(VkCommandBuffer cmd, const LearningRates &rates);
   // Forward, loss, backward and, when rates are given, the Adam step, in one submission.
   StepStats run(const Camera &camera, std::span<const std::uint8_t> target, const LearningRates *rates);
@@ -174,8 +190,9 @@ private:
   int width_ = 0, height_ = 0;
   std::uint32_t gridW_ = 0, tileCount_ = 0;
 
-  vk::ComputePipeline preprocess_, binCount_, binEmit_, tileRanges_, forward_, exposure_, ssim_, loss_, exposureBackward_, errorMask_, score_, gradient_,
+  vk::ComputePipeline preprocess_, binCount_, binEmit_, tileRanges_, forward_, exposure_, ssim_, loss_, exposureBackward_, errorMask_, score_, pose_, hutchinson_, curvature_, secondOrder_, gradient_,
       adam_, gather_;
+  std::uint32_t curvatureUpdates_ = 0;
   Exposure exposureValues_ = kNeutralExposure;
   bool exposing_ = false; // The last iteration ran the exposure passes
   float scoreErrorShare_ = 0.f; // Above 0: this iteration marks high-error pixels
@@ -187,7 +204,7 @@ private:
   std::unique_ptr<vk::Buffer> camera_, counters_, fixedScale_;
   std::unique_ptr<vk::Buffer> splats_, keys_, values_, tmpKeys_, tmpValues_, coverage_, rawGradients_, stats_;
   std::unique_ptr<vk::Buffer> entryKeys_, entryValues_, tmpEntryKeys_, tmpEntryValues_;
-  std::unique_ptr<vk::Buffer> ranges_, image_, stops_, exposed_, exposureTotals_, adjoint_, fields_, targetStaging_, target_, groupTotals_, errorMax_;
+  std::unique_ptr<vk::Buffer> ranges_, image_, stops_, exposed_, exposureTotals_, adjoint_, fields_, targetStaging_, target_, groupTotals_, errorMax_, poseTotals_;
   // prefetch_target() hands one copy at a time to a worker thread that lives
   // as long as the trainer, so that no thread is started per iteration.
   std::unique_ptr<vk::Buffer> targetNext_;
