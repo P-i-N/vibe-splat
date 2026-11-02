@@ -11,6 +11,7 @@ add_executable(splat_tests
   test_sfm.cpp
   test_train.cpp
   test_densify.cpp
+  test_progress.cpp
 )
 target_link_libraries(splat_tests PRIVATE splat_core Catch2::Catch2WithMain)
 splat_target_defaults(splat_tests)

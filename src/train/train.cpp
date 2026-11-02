@@ -1,5 +1,6 @@
 #include "train/train.hpp"
 
+#include "core/progress.hpp"
 #include "ingest/image.hpp"
 #include "render/camera.hpp"
 #include "sfm/colmap_model.hpp"
@@ -296,6 +297,9 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
   }
   Trainer trainer(ctx, initial_cloud(model, options.shDegree), trainerOptions);
 
+  // Drawn from the first iteration on. Output in the meantime goes through it.
+  Progress bar("Train", static_cast<std::size_t>(options.iterations));
+
   // A view that does not fit gives up its largest Gaussians, rather than the
   // run ending. They grow back where they are needed, within the budget.
   const auto fitting = [&](auto &&work) {
@@ -304,7 +308,7 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
         return work();
       } catch (const BudgetExceeded &e) {
         const std::size_t removed = trainer.remove_largest_gaussians(0.05);
-        std::println("  {}: removed the {} largest Gaussians", e.what(), removed);
+        bar.message(std::format("  {}: removed the {} largest Gaussians", e.what(), removed));
         if (removed == 0) throw;
       }
     }
@@ -338,12 +342,13 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
     const CloudFormat format = cloud_format(options.out);
     if (format == CloudFormat::Cgc) {
       if (const std::size_t removed = remove_non_finite(cloud); removed > 0) {
-        std::println("  left out {} Gaussians with NaN or infinite values", removed);
+        bar.message(std::format("  left out {} Gaussians with NaN or infinite values", removed));
       }
     }
     save_cloud(cloud, path, format, cgcOptions);
   };
   const auto start = std::chrono::steady_clock::now();
+  bar.start();
   for (int iteration = 1; iteration <= options.iterations; ++iteration) {
     if (order.empty()) {
       order.resize(trainViews.size());
@@ -392,9 +397,9 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
       const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
       const View &probe = holdoutViews.empty() ? trainViews[0] : holdoutViews[0];
       const double probePsnr = psnr_of(fitting([&] { return trainer.render(probe.camera); }), probe.rgba);
-      std::println("  iteration {:6}: loss {:.4f}, {} PSNR {:.2f} dB, {} Gaussians, {} visible, {} tile entries, {:.2f} GiB, {:.1f} it/s", iteration,
+      bar.message(std::format("  iteration {:6}: loss {:.4f}, {} PSNR {:.2f} dB, {} Gaussians, {} visible, {} tile entries, {:.2f} GiB, {:.1f} it/s", iteration,
                    lossSum / lossCount, holdoutViews.empty() ? "training view" : "held-out view", probePsnr, trainer.gaussian_count(), stats.visibleSplats, stats.tileEntries,
-                   static_cast<double>(trainer.gpu_bytes()) / (1024.0 * 1024.0 * 1024.0), iteration / seconds);
+                   static_cast<double>(trainer.gpu_bytes()) / (1024.0 * 1024.0 * 1024.0), iteration / seconds));
       lossSum = 0.0;
       lossCount = 0;
     }
@@ -406,9 +411,15 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
       // A fast LZMA preset, so that CGC checkpoints don't hold up training.
       save_output(temporary, CgcOptions{.lzmaLevel = 1, .lzmaExtreme = false});
       fs::rename(temporary, options.out);
-      std::println("  iteration {:6}: checkpoint saved to {}", iteration, options.out.string());
+      bar.message(std::format("  iteration {:6}: checkpoint saved to {}", iteration, options.out.string()));
+    }
+    if (iteration % 10 == 0 || iteration == options.iterations) {
+      const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+      bar.set(static_cast<std::size_t>(iteration),
+              std::format("loss {:.4f}  {} Gaussians  {:.1f} it/s", stats.loss, trainer.gaussian_count(), iteration / elapsed));
     }
   }
+  bar.finish();
   const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
   report.iterationsPerSecond = options.iterations / seconds;
 

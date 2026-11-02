@@ -4,6 +4,7 @@
 // a project folder, so any stage can be rerun on its own.
 
 #include "cli/args.hpp"
+#include "core/progress.hpp"
 #include "core/selftest.hpp"
 #include "core/vk_check.hpp"
 #include "core/vk_context.hpp"
@@ -520,9 +521,9 @@ int main(int argc, char **argv) {
     std::println(stderr, "Unknown command '{}'. Run 'splat --help'.", opts.command);
     return 2;
   } catch (const splat::vk::Error &e) {
-    std::println(stderr, "Vulkan error: {}", e.what());
+    std::println(stderr, "{} {}", splat::console::paint(splat::console::Color::Red, "Vulkan error:", stderr), e.what());
   } catch (const std::exception &e) {
-    std::println(stderr, "Error: {}", e.what());
+    std::println(stderr, "{} {}", splat::console::paint(splat::console::Color::Red, "Error:", stderr), e.what());
   }
   return 1;
 }

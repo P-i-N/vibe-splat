@@ -1,5 +1,7 @@
 #include "ingest/ingest.hpp"
 
+#include "core/progress.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -337,7 +339,7 @@ IngestReport run_ingest(const IngestOptions &options) {
       sources.push_back({file, true});
     } else {
       const std::string hint = is_unsupported_photo(file) ? " (convert it to JPEG or PNG first)" : "";
-      std::println(stderr, "Skipping {}: unsupported file type{}", file.string(), hint);
+      std::println(stderr, "{}", console::paint(console::Color::Yellow, std::format("Skipping {}: unsupported file type{}", file.string(), hint), stderr));
       ++report.failed;
     }
   }
@@ -357,9 +359,9 @@ IngestReport run_ingest(const IngestOptions &options) {
   // whatever order the threads finish in.
   std::vector<std::vector<IngestImage>> results(sources.size());
   std::mutex reportMutex;
-  const auto report_failure = [&](const fs::path &path, const std::exception &e) {
+  const auto report_failure = [&](Progress &bar, const fs::path &path, const std::exception &e) {
     const std::lock_guard lock(reportMutex);
-    std::println(stderr, "Skipping {}: {}", path.string(), e.what());
+    bar.message(console::paint(console::Color::Yellow, std::format("Skipping {}: {}", path.string(), e.what()), stderr), true);
     ++report.failed;
   };
 
@@ -369,6 +371,7 @@ IngestReport run_ingest(const IngestOptions &options) {
     if (!sources[i].video) photos.push_back(i);
   }
 
+  Progress photoBar("Photos", photos.size());
   std::atomic<std::size_t> next{0};
   const auto photo_worker = [&] {
     for (std::size_t job = next++; job < photos.size(); job = next++) {
@@ -380,8 +383,9 @@ IngestReport run_ingest(const IngestOptions &options) {
         RgbImage image = apply_orientation(decode_image(bytes), exif.orientation);
         results[index].push_back(store.store(std::move(image), std::format("photo_{:06}", job + 1), exif, path, std::nullopt));
       } catch (const std::exception &e) {
-        report_failure(path, e);
+        report_failure(photoBar, path, e);
       }
+      photoBar.advance(1, path.filename().string());
     }
   };
   const unsigned threadCount = options.threads > 0 ? static_cast<unsigned>(options.threads)
@@ -390,6 +394,7 @@ IngestReport run_ingest(const IngestOptions &options) {
     std::vector<std::jthread> workers;
     for (unsigned t = 0; t < std::min<std::size_t>(threadCount, photos.size()); ++t) workers.emplace_back(photo_worker);
   }
+  photoBar.finish();
 
   // Video decoding is already threaded inside FFmpeg.
   int videoNumber = 0;
@@ -397,14 +402,16 @@ IngestReport run_ingest(const IngestOptions &options) {
     if (!sources[i].video) continue;
     ++videoNumber;
     int frameNumber = 0;
+    Progress videoBar(std::format("Video {}", videoNumber), 0);
     try {
       extract_video_frames(sources[i].path, options.video, [&](VideoFrame &&frame) {
         ++frameNumber;
         const std::string name = std::format("video{:02}_{:06}", videoNumber, frameNumber);
         results[i].push_back(store.store(std::move(frame.image), name, ExifData{}, sources[i].path, frame.seconds));
+        videoBar.set(static_cast<std::size_t>(frameNumber), sources[i].path.filename().string());
       });
     } catch (const std::exception &e) {
-      report_failure(sources[i].path, e);
+      report_failure(videoBar, sources[i].path, e);
     }
   }
 

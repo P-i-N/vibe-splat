@@ -7,6 +7,7 @@ add_library(splat_core STATIC
   core/selftest.cpp
   core/radix_sort.cpp
   core/vk_image.cpp
+  core/progress.cpp
   splat/gaussian_cloud.cpp
   splat/lzma.cpp
   splat/cgc.cpp
