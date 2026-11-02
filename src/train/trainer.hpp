@@ -155,6 +155,8 @@ public:
   // What the buffers take now, and what one more Gaussian would take. The tile
   // entries it brings are not included, as they depend on the view.
   [[nodiscard]] std::uint64_t gpu_bytes() const;
+  // How large an image the staging memory can hold at the moment.
+  [[nodiscard]] std::uint64_t staging_bytes() const noexcept { return targetStaging_ ? targetStaging_->size() : 0; }
   [[nodiscard]] std::uint64_t bytes_per_gaussian() const noexcept;
   static constexpr std::uint64_t kBytesPerTileEntry = 16;
   // Image, exposed image and adjoint 16 each, SSIM fields 48, stops 4, and

@@ -544,25 +544,25 @@ TEST_CASE("Second-order steps fit a view within their trust region", "[train][vu
 TEST_CASE("A prefetched image of a smaller size does not spoil a larger one after it", "[train][vulkan]") {
   vk::Context *ctx = test::context();
   if (ctx == nullptr) SKIP("No usable Vulkan device");
-  const Camera small = test_camera(64, 48), large = test_camera(256, 192);
+  const Camera small = test_camera(64, 48), large = test_camera(1024, 768);
   const auto smallTarget = noise_target(small.width, small.height, 71);
   const auto largeTarget = noise_target(large.width, large.height, 73), otherTarget = noise_target(large.width, large.height, 79);
   const GaussianCloud cloud = random_cloud(60, 0, 83);
   Trainer reference(*ctx, cloud);
   const float expected = reference.compute_gradients(large, largeTarget).loss;
 
+  LearningRates still;
+  still.position = still.scale = still.rotation = still.opacity = still.sh = 0.f;
   Trainer trainer(*ctx, cloud);
   // Large enough image buffers come first, so that the size change below reallocates nothing.
   (void)trainer.render(large);
   // The prefetch of the small image becomes the staging buffer.
   trainer.prefetch_target(smallTarget);
   (void)trainer.compute_gradients(small, smallTarget);
-  // Now a large image, with another being copied at the same time.
-  trainer.prefetch_target(otherTarget);
-  CHECK_THAT(trainer.compute_gradients(large, largeTarget).loss, WithinAbs(expected, 1e-4));
-  // A prefetch is used, for the step after the one that started it.
-  LearningRates rates;
-  rates.position = rates.scale = rates.rotation = rates.opacity = rates.sh = 0.f;
-  (void)trainer.step(large, largeTarget, rates, largeTarget);
-  CHECK_THAT(trainer.step(large, largeTarget, rates).loss, WithinAbs(expected, 1e-4));
+  // Overflowing would show only by chance, in what lies next to it, so the size itself is checked.
+  CHECK_THAT(trainer.step(large, largeTarget, still, otherTarget).loss, WithinAbs(expected, 1e-4));
+  CHECK(trainer.staging_bytes() >= largeTarget.size());
+  // A prefetch is used, by the step after the one that started it.
+  (void)trainer.step(large, largeTarget, still, largeTarget);
+  CHECK_THAT(trainer.step(large, largeTarget, still).loss, WithinAbs(expected, 1e-4));
 }
