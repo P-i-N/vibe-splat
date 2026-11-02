@@ -36,7 +36,8 @@ jobs:
       - run: cmake --build --preset linux-release
       - run: ctest --preset linux-release
       - name: Check the window viewer was built
-        run: ./build/linux-release/src/splat view 2>&1 | grep -q "Usage: splat view"
+        run: |
+          ./build/linux-release/src/splat view 2>&1 | grep -q "Usage: splat view"
 
       - uses: actions/upload-artifact@v4
         with:
