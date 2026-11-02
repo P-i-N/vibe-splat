@@ -1,0 +1,43 @@
+#version 460
+// Feature matching, step 2: keeps the rows of A whose best match in B passes
+// Lowe's ratio test and whose best match points back (mutual nearest
+// neighbours), and appends them to the pair's match list. The list comes out
+// in no particular order; the CPU sorts it.
+
+layout(local_size_x = 256) in;
+
+struct Pair {
+  uint offsetA;
+  uint offsetB;
+  uint countA;
+  uint countB;
+};
+
+layout(std430, binding = 0) readonly buffer Pairs { Pair pairs[]; };
+layout(std430, binding = 1) readonly buffer BestOfA { uvec4 bestA[]; };
+layout(std430, binding = 2) readonly buffer BestOfB { uint bestB[]; };
+layout(std430, binding = 3) buffer Counts { uint counts[]; };
+layout(std430, binding = 4) writeonly buffer Matches { uvec2 matches[]; };
+
+layout(push_constant) uniform Push {
+  uint stride;
+  float ratioSquared;
+} pc;
+
+// Squared distance between unit vectors is 2 - 2 dot; the score is dot / 2 in
+// units of 1 / 255^2, so the distance is proportional to this.
+float distance_of(uint score) { return 32512.5 - float(score); }
+
+void main() {
+  const uint p = gl_WorkGroupID.y;
+  const Pair pair = pairs[p];
+  const uint i = gl_GlobalInvocationID.x;
+  if (i >= pair.countA) return;
+  const uvec4 best = bestA[p * pc.stride + i];
+  const uint j = best.z;
+  if (j == 0xFFFFu) return;
+  if (!(distance_of(best.x) < pc.ratioSquared * distance_of(best.y))) return;
+  if ((bestB[p * pc.stride + j] & 0xFFFFu) != 0xFFFFu - i) return;
+  const uint slot = atomicAdd(counts[p], 1u);
+  matches[p * pc.stride + slot] = uvec2(i, j);
+}

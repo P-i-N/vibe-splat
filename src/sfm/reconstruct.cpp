@@ -1,11 +1,15 @@
+#include "core/parallel.hpp"
+#include "core/progress.hpp"
 #include "ingest/ingest.hpp"
 #include "sfm/bundle.hpp"
 #include "sfm/features.hpp"
+#include "sfm/gpu_matcher.hpp"
 #include "sfm/sfm.hpp"
 #include "splat/gaussian_cloud.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <format>
 #include <fstream>
@@ -15,7 +19,9 @@
 #include <numeric>
 #include <optional>
 #include <print>
+#include <span>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 
 namespace splat {
@@ -32,18 +38,8 @@ constexpr double kPoseThresholdPixels = 4.0;
 constexpr double kPointThresholdPixels = 4.0;
 constexpr double kFinalThresholdPixels = 1.5; // Once the model has settled
 constexpr double kMinTriangulationAngleDeg = 1.5;
-constexpr std::size_t kExhaustiveLimit = 150;
-
-template <class Job> void parallel_for(std::size_t count, int threads, const Job &job) {
-  const unsigned wanted = threads > 0 ? static_cast<unsigned>(threads) : std::max(1u, std::thread::hardware_concurrency());
-  std::atomic<std::size_t> next{0};
-  std::vector<std::jthread> workers;
-  for (unsigned t = 0; t < std::min<std::size_t>(wanted, count); ++t) {
-    workers.emplace_back([&] {
-      for (std::size_t i = next++; i < count; i = next++) job(i);
-    });
-  }
-}
+constexpr std::size_t kExhaustiveLimit = 150;    // Photos matched every-against-every on the CPU
+constexpr std::size_t kGpuExhaustiveLimit = 500; // ... and on the GPU, where a pair costs about a millisecond
 
 double degrees_between(const Eigen::Vector3d &a, const Eigen::Vector3d &b) {
   return std::atan2(a.cross(b).norm(), a.dot(b)) * 180.0 / std::numbers::pi;
@@ -88,9 +84,11 @@ private:
 // Holds a growing reconstruction: which images have poses and which tracks have points.
 class Mapper {
 public:
-  Mapper(std::vector<Lens> lenses, std::vector<int> lensOfImage, const std::vector<ImageFeatures> &features, std::vector<Track> tracks)
+  Mapper(std::vector<Lens> lenses, std::vector<int> lensOfImage, const std::vector<ImageFeatures> &features, std::vector<Track> tracks,
+         int threads)
       : initialLenses_(lenses), lenses_(std::move(lenses)), lensOfImage_(std::move(lensOfImage)), features_(features),
-        tracks_(std::move(tracks)), poses_(features.size()), tracksOfImage_(features.size()), attempts_(features.size(), 0) {
+        tracks_(std::move(tracks)), poses_(features.size()), tracksOfImage_(features.size()), attempts_(features.size(), 0),
+        threads_(threads) {
     for (std::size_t t = 0; t < tracks_.size(); ++t) {
       for (const Observation &o : tracks_[t].observations) tracksOfImage_[static_cast<std::size_t>(o.image)].push_back(static_cast<int>(t));
     }
@@ -120,6 +118,8 @@ public:
 
   void grow() {
     std::size_t lastGlobal = registered_count();
+    Progress bar("Register", poses_.size());
+    bar.set(lastGlobal, std::format("{} points", point_count()));
     for (;;) {
       const auto image = next_image();
       if (!image) break;
@@ -134,7 +134,7 @@ public:
         filter();
         lastGlobal = count;
       }
-      std::println("  registered {} images, {} points", count, point_count());
+      bar.set(count, std::format("{} points", point_count()));
     }
   }
 
@@ -143,7 +143,7 @@ public:
     // what still misses by a few pixels is wrong: typically a false corner,
     // where edges at different depths cross. Left in, those bias everything.
     for (const double threshold : {kPointThresholdPixels, kFinalThresholdPixels, kFinalThresholdPixels}) {
-      const BundleResult result = bundle(true, 40);
+      const BundleResult result = bundle(true, 40, 1e-6);
       filter(threshold);
       std::println("  final bundle adjustment: {:.3f} -> {:.3f} px RMS in {} iterations", result.initialRms, result.finalRms, result.iterations);
     }
@@ -304,7 +304,9 @@ private:
     }
   }
 
-  BundleResult bundle(bool refineLenses, int iterations) {
+  // The model keeps changing while it grows, so intermediate rounds stop at
+  // a looser tolerance than the final ones.
+  BundleResult bundle(bool refineLenses, int iterations, double relativeTolerance = 1e-5) {
     std::vector<BundleView> views;
     std::vector<int> viewImages;
     std::map<int, int> viewOfImage;
@@ -331,6 +333,8 @@ private:
     BundleOptions options;
     options.iterations = iterations;
     options.refineLenses = refineLenses;
+    options.relativeTolerance = relativeTolerance;
+    options.threads = threads_;
     const BundleResult result = bundle_adjust(lenses_, views, points, observations, options);
     for (std::size_t v = 0; v < views.size(); ++v) poses_[static_cast<std::size_t>(viewImages[v])] = views[v].pose;
     for (std::size_t p = 0; p < points.size(); ++p) tracks_[static_cast<std::size_t>(pointTracks[p])].point = points[p];
@@ -347,12 +351,13 @@ private:
   std::vector<int> attempts_;
   std::map<std::size_t, int> attemptedAt_;
   int anchor_ = 0;
+  int threads_ = 0;
 };
 
-std::vector<std::pair<int, int>> choose_pairs(std::size_t count, const IngestManifest &manifest, const SfmOptions &options) {
+std::vector<std::pair<int, int>> choose_pairs(std::size_t count, const IngestManifest &manifest, const SfmOptions &options, bool gpu) {
   const bool anyVideo = std::any_of(manifest.images.begin(), manifest.images.end(), [](const IngestImage &i) { return i.videoSeconds.has_value(); });
   const bool exhaustive = options.matcher == Matcher::Exhaustive ||
-                          (options.matcher == Matcher::Auto && !anyVideo && count <= kExhaustiveLimit);
+                          (options.matcher == Matcher::Auto && !anyVideo && count <= (gpu ? kGpuExhaustiveLimit : kExhaustiveLimit));
   std::vector<std::pair<int, int>> pairs;
   const int n = static_cast<int>(count);
   if (exhaustive) {
@@ -462,10 +467,22 @@ SfmReport run_sfm(const SfmOptions &options) {
   std::vector<int> lensOfImage;
   for (const IngestImage &image : manifest.images) lensOfImage.push_back(lensOfCamera.at(image.cameraId));
 
+  const auto stageStart = std::chrono::steady_clock::now();
+  auto stageSeconds = [&] {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - stageStart).count();
+  };
+  double lastStage = 0.0;
+  auto stage_done = [&](std::string_view what) {
+    const double now = stageSeconds();
+    std::println("  {} took {:.1f} s", what, now - lastStage);
+    lastStage = now;
+  };
+
   std::println("Extracting features from {} images...", count);
   std::vector<ImageFeatures> features(count);
   std::mutex errorMutex;
   std::string firstError;
+  Progress featureBar("Features", count);
   parallel_for(count, options.threads, [&](std::size_t i) {
     try {
       features[i] = extract_features(decode_image(read_all(options.project / manifest.images[i].file)), options.maxFeatures);
@@ -473,18 +490,30 @@ SfmReport run_sfm(const SfmOptions &options) {
       const std::lock_guard lock(errorMutex);
       if (firstError.empty()) firstError = std::format("{}: {}", manifest.images[i].file, e.what());
     }
+    featureBar.advance(1, manifest.images[i].file);
   });
+  featureBar.finish();
   if (!firstError.empty()) throw std::runtime_error(firstError);
   std::size_t totalFeatures = 0;
   for (const ImageFeatures &f : features) totalFeatures += f.keypoints.size();
   std::println("  {:.0f} features per image", static_cast<double>(totalFeatures) / static_cast<double>(count));
+  stage_done("features");
 
-  const std::vector<std::pair<int, int>> pairs = choose_pairs(count, manifest, options);
-  std::println("Matching {} image pairs...", pairs.size());
+  std::optional<GpuMatcher> gpuMatcher;
+  if (options.gpu != nullptr) {
+    try {
+      gpuMatcher.emplace(*options.gpu, features);
+    } catch (const std::exception &e) {
+      std::println("  matching on the CPU instead of the GPU: {}", e.what());
+    }
+  }
+  const std::vector<std::pair<int, int>> pairs = choose_pairs(count, manifest, options, gpuMatcher.has_value());
+  std::println("Matching {} image pairs{}...", pairs.size(), gpuMatcher ? std::format(" on {}", options.gpu->info().name) : "");
   std::vector<std::optional<VerifiedPair>> verified(pairs.size());
-  parallel_for(pairs.size(), options.threads, [&](std::size_t p) {
+  Progress matchBar("Matching", pairs.size());
+  std::atomic<std::size_t> matched{0};
+  const auto verify_pair = [&](std::size_t p, const std::vector<std::pair<int, int>> &matches) {
     const auto [a, b] = pairs[p];
-    const auto matches = match_features(features[static_cast<std::size_t>(a)], features[static_cast<std::size_t>(b)]);
     if (matches.size() < kMinPairInliers) return;
     const Lens &lensA = lenses[static_cast<std::size_t>(lensOfImage[static_cast<std::size_t>(a)])];
     const Lens &lensB = lenses[static_cast<std::size_t>(lensOfImage[static_cast<std::size_t>(b)])];
@@ -496,7 +525,7 @@ SfmReport run_sfm(const SfmOptions &options) {
       x2.push_back(unproject_pixel(lensB, {kb.x, kb.y}));
     }
     std::mt19937 rng(static_cast<std::uint32_t>(p) * 2654435761u + 1u);
-    const auto result = estimate_relative_pose(x1, x2, kPairThresholdPixels / (0.5 * (lensA.f + lensB.f)), rng);
+    const auto result = estimate_relative_pose(x1, x2, kPairThresholdPixels / (0.5 * (lensA.f + lensB.f)), rng, kMinPairInliers);
     if (!result || result->inliers.size() < kMinPairInliers) return;
     VerifiedPair pair;
     pair.a = a;
@@ -505,12 +534,50 @@ SfmReport run_sfm(const SfmOptions &options) {
     pair.medianAngleDeg = result->medianAngleDeg;
     for (const int i : result->inliers) pair.inliers.push_back(matches[static_cast<std::size_t>(i)]);
     verified[p] = std::move(pair);
-  });
+    ++matched;
+  };
+  if (gpuMatcher) {
+    // The GPU matches one batch while the CPU threads verify the previous one.
+    std::vector<std::vector<std::pair<int, int>>> previous;
+    std::size_t previousStart = 0;
+    double gpuSeconds = 0.0;
+    // One extra round at the end verifies the last batch.
+    for (std::size_t start = 0;; start += GpuMatcher::kBatch) {
+      std::jthread verifier;
+      if (!previous.empty()) {
+        verifier = std::jthread([&] {
+          parallel_for(previous.size(), options.threads, [&](std::size_t k) {
+            verify_pair(previousStart + k, previous[k]);
+            matchBar.advance(1, std::format("{} verified", matched.load()));
+          });
+        });
+      }
+      std::vector<std::vector<std::pair<int, int>>> current;
+      if (start < pairs.size()) {
+        const auto gpuStart = std::chrono::steady_clock::now();
+        current = gpuMatcher->match(std::span(pairs).subspan(start, std::min(GpuMatcher::kBatch, pairs.size() - start)));
+        gpuSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - gpuStart).count();
+      }
+      verifier = {};
+      previous = std::move(current);
+      previousStart = start;
+      if (start >= pairs.size()) break;
+    }
+    std::println("  the GPU spent {:.1f} s matching", gpuSeconds);
+  } else {
+    parallel_for(pairs.size(), options.threads, [&](std::size_t p) {
+      const auto [a, b] = pairs[p];
+      verify_pair(p, match_features(features[static_cast<std::size_t>(a)], features[static_cast<std::size_t>(b)]));
+      matchBar.advance(1, std::format("{} verified", matched.load()));
+    });
+  }
+  matchBar.finish();
   std::vector<VerifiedPair> goodPairs;
   for (auto &pair : verified) {
     if (pair) goodPairs.push_back(std::move(*pair));
   }
   std::println("  {} pairs passed geometric verification", goodPairs.size());
+  stage_done("matching and verification");
   if (goodPairs.empty()) throw std::runtime_error("no image pair matched well enough; do the images overlap?");
 
   std::vector<Track> tracks = build_tracks(features, goodPairs);
@@ -518,7 +585,7 @@ SfmReport run_sfm(const SfmOptions &options) {
 
   // Start from the pair with the most matches among those with a wide baseline,
   // accepting a narrower one only if nothing better works.
-  Mapper mapper(lenses, lensOfImage, features, std::move(tracks));
+  Mapper mapper(lenses, lensOfImage, features, std::move(tracks), options.threads);
   std::vector<const VerifiedPair *> byInliers;
   for (const VerifiedPair &pair : goodPairs) byInliers.push_back(&pair);
   std::sort(byInliers.begin(), byInliers.end(), [](const VerifiedPair *a, const VerifiedPair *b) { return a->inliers.size() > b->inliers.size(); });
@@ -545,6 +612,7 @@ SfmReport run_sfm(const SfmOptions &options) {
   std::println("Registering images...");
   mapper.grow();
   mapper.finish();
+  stage_done("registration and bundle adjustment");
 
   // Store the result in COLMAP's format.
   ColmapModel model;

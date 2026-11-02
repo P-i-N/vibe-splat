@@ -98,6 +98,7 @@ sfm options (writes project/sparse/0 in COLMAP's format, plus preview.ply):
   --window <n>            Neighbours per image when sequential (default 8)
   --max-features <n>      Per image (default 4000)
   --threads <n>           0 uses all cores (default 0)
+  --cpu                   Match features on the CPU even when a GPU is available
   --import <dir>          Instead of estimating, import a COLMAP sparse model
 
 train options (writes project/splat.ply and project/preview_*.png):
@@ -369,8 +370,8 @@ int cmd_ingest(const GlobalOptions &opts) {
 }
 
 int cmd_sfm(const GlobalOptions &opts) {
-  const splat::cli::Args args(opts.rest, {});
-  args.allow_only({"import", "matcher", "window", "max-features", "threads"});
+  const splat::cli::Args args(opts.rest, {"--cpu"});
+  args.allow_only({"import", "matcher", "window", "max-features", "threads", "cpu"});
   if (args.positionals().size() != 1) {
     std::println(stderr, "Usage: splat sfm <project> [options]  (see splat --help)");
     return 2;
@@ -398,6 +399,17 @@ int cmd_sfm(const GlobalOptions &opts) {
   if (matcher == "exhaustive") options.matcher = splat::Matcher::Exhaustive;
   else if (matcher == "sequential") options.matcher = splat::Matcher::Sequential;
   else if (matcher != "auto") throw std::runtime_error(std::format("--matcher must be auto, exhaustive or sequential (got '{}')", matcher));
+
+  // Matching runs on the GPU when there is one; the rest is CPU work.
+  std::optional<splat::vk::Context> gpu;
+  if (!args.has("cpu")) {
+    try {
+      gpu.emplace(opts.context);
+      options.gpu = &*gpu;
+    } catch (const std::exception &e) {
+      std::println("No usable GPU, matching on the CPU: {}", e.what());
+    }
+  }
 
   const auto start = std::chrono::steady_clock::now();
   const auto report = splat::run_sfm(options);

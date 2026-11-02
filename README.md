@@ -37,7 +37,7 @@ That is the layout written by the original implementation and most trainers.
 | M0 Foundation | CMake + vcpkg, Vulkan core, CI on Linux and Windows |
 | M1 Viewer | Load `.ply` splats, GPU sort, render, window and controls |
 | M2 Ingest | Photos, video frames, EXIF and manual intrinsics |
-| M3 Camera poses | Our own structure from motion (CPU), COLMAP model import |
+| M3 Camera poses | Our own structure from motion (GPU matching, CPU otherwise), COLMAP model import |
 | M4 Trainer core | Vulkan forward, loss, backward, Adam |
 | M5 Full training | Densification, SH degree 3, 8 GB VRAM budget |
 | M6 Polish | GUI, live preview, gamepad, AppImage and Windows zip |
@@ -66,13 +66,16 @@ the later stages to read. Rerun it with `--force` to replace them.
 ## How pose estimation works
 
 `splat sfm` is a small incremental structure-from-motion pipeline written from
-scratch, needing only Eigen. It runs on the CPU:
+scratch, needing only Eigen and, for matching, Vulkan:
 
 1. **Features.** SIFT: extrema of a difference-of-Gaussians pyramid, described
    by gradient histograms (RootSIFT).
 2. **Matching.** Brute-force mutual nearest neighbours with Lowe's ratio test.
-   Every pair for up to 150 photos; for videos and larger sets, neighbours in
-   input order plus a few at growing distances (`--matcher` overrides this).
+   On the GPU, descriptors are quantised to 8 bits and compared with packed
+   integer dot products in a compute shader (`--cpu` keeps it on the CPU,
+   where Eigen matrix products do the same job more slowly). Every pair for up
+   to 150 photos; for videos and larger sets, neighbours in input order plus a
+   few at growing distances (`--matcher` overrides this).
 3. **Verification.** RANSAC around the five-point essential matrix solver,
    using ingest's intrinsics. Pairs that do not fit a rigid camera motion go.
 4. **Tracks.** Matches are chained into tracks that follow one 3D point.

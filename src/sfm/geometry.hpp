@@ -35,10 +35,14 @@ struct EssentialResult {
   double medianAngleDeg = 0.; // Median triangulation angle of the inliers
 };
 
-// RANSAC around the five-point solver. threshold is in normalised units.
+// RANSAC around the five-point solver. threshold is in normalised units. A
+// result with fewer than minInliers is of no use to the caller, so the search
+// stops once a solution with that many inliers would have been found with
+// 99.9% probability: pairs with few matches then cost a few iterations, not
+// hundreds.
 [[nodiscard]] std::optional<EssentialResult> estimate_relative_pose(const std::vector<Eigen::Vector3d> &x1,
                                                                     const std::vector<Eigen::Vector3d> &x2,
-                                                                    double threshold, std::mt19937 &rng);
+                                                                    double threshold, std::mt19937 &rng, int minInliers = 5);
 
 // Linear (DLT) triangulation from two or more views.
 [[nodiscard]] Eigen::Vector3d triangulate(const std::vector<Pose> &poses, const std::vector<Eigen::Vector3d> &bearings);

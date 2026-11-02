@@ -1,0 +1,85 @@
+#version 460
+// Feature matching, step 1: for one image pair, every descriptor of image A
+// against every descriptor of image B. Descriptors are 128 unsigned bytes
+// (RootSIFT scaled to 255), packed four per uint, so a dot product is 32
+// packed 4x8-bit dot instructions.
+//
+// A thread owns one row of A and tracks its best and second best match in B.
+// B's best row of A goes through atomicMax on a word packing the score above
+// the inverted index, so the highest score wins and ties go to the lowest row.
+// One dispatch handles a batch of pairs: gl_WorkGroupID.y picks the pair.
+#extension GL_EXT_integer_dot_product : require
+
+layout(local_size_x = 64) in;
+
+const uint WORDS = 32u;         // uints per descriptor
+const uint TILE = 64u;          // B descriptors per shared-memory tile
+const uint STRIDE = WORDS + 1u; // Padded so staggered threads hit different banks
+
+struct Pair {
+  uint offsetA; // First descriptor of image A
+  uint offsetB;
+  uint countA;
+  uint countB;
+};
+
+layout(std430, binding = 0) readonly buffer Descriptors { uint words[]; };
+layout(std430, binding = 1) readonly buffer Pairs { Pair pairs[]; };
+layout(std430, binding = 2) writeonly buffer BestOfA { uvec4 bestA[]; }; // first, second, index of first, unused
+layout(std430, binding = 3) buffer BestOfB { uint bestB[]; };            // score << 16 | (0xFFFF - row of A)
+
+layout(push_constant) uniform Push {
+  uint stride; // Rows per pair in bestA and bestB
+} pc;
+
+shared uint tile[TILE * STRIDE];
+
+void main() {
+  const Pair pair = pairs[gl_WorkGroupID.y];
+  const uint i = gl_GlobalInvocationID.x;
+  const bool inRange = i < pair.countA;
+  const uint local = gl_LocalInvocationID.x;
+  const uint outB = gl_WorkGroupID.y * pc.stride;
+
+  uint a[WORDS];
+  if (inRange) {
+    const uint base = (pair.offsetA + i) * WORDS;
+    for (uint k = 0u; k < WORDS; ++k) a[k] = words[base + k];
+  }
+  uint first = 0u, second = 0u, firstIndex = 0xFFFFu;
+
+  for (uint tileStart = 0u; tileStart < pair.countB; tileStart += TILE) {
+    barrier();
+    for (uint k = 0u; k < WORDS; ++k) {
+      const uint index = local + k * TILE; // Consecutive threads read consecutive words
+      const uint t = index / WORDS, w = index % WORDS;
+      const uint j = tileStart + t;
+      tile[t * STRIDE + w] = j < pair.countB ? words[(pair.offsetB + j) * WORDS + w] : 0u;
+    }
+    barrier();
+    if (!inRange) continue;
+    const uint count = min(TILE, pair.countB - tileStart);
+    for (uint step = 0u; step < count; ++step) {
+      // Threads start at different descriptors so their atomics do not collide.
+      const uint t = (step + local) % count;
+      const uint row = t * STRIDE;
+      uint dot = 0u;
+      for (uint k = 0u; k < WORDS; ++k) dot += dotPacked4x8EXT(a[k], tile[row + k]);
+      // At most 255^2 for unit vectors; halved to be safe in 16 bits with rounding.
+      const uint score = min(dot >> 1u, 0xFFFFu);
+      const uint j = tileStart + t;
+      if (score > first) {
+        second = first;
+        first = score;
+        firstIndex = j;
+      } else if (score == first) {
+        second = first;
+        firstIndex = min(firstIndex, j);
+      } else if (score > second) {
+        second = score;
+      }
+      atomicMax(bestB[outB + j], (score << 16u) | (0xFFFFu - i));
+    }
+  }
+  if (inRange) bestA[outB + i] = uvec4(first, second, firstIndex, 0u);
+}

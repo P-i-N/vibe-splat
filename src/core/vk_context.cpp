@@ -287,6 +287,7 @@ Context::Context(const ContextOptions &options) {
     v13.synchronization2 = VK_TRUE;
     v13.maintenance4 = VK_TRUE;
     v13.dynamicRendering = VK_TRUE;
+    v13.shaderIntegerDotProduct = VK_TRUE; // Required in 1.3; feature matching uses packed 8-bit dot products
     v13.pNext = info_.floatAtomicAdd ? &atomicFloat : nullptr;
     VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     v12.timelineSemaphore = VK_TRUE;

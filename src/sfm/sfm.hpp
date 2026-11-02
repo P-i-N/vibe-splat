@@ -7,6 +7,10 @@
 
 namespace splat {
 
+namespace vk {
+class Context;
+}
+
 struct SfmImportReport {
   ColmapStats stats;
   std::size_t ingested = 0;     // Images in the project
@@ -32,6 +36,7 @@ struct SfmOptions {
   Matcher matcher = Matcher::Auto;
   int window = 8;  // Neighbours per image for the sequential matcher
   int threads = 0; // 0 uses all cores
+  vk::Context *gpu = nullptr; // Matches features on this device when set, on the CPU otherwise
 };
 
 // One camera's intrinsics before and after bundle adjustment.

@@ -227,18 +227,28 @@ double sampson_squared(const Eigen::Matrix3d &E, const Eigen::Vector3d &x1, cons
 
 std::optional<EssentialResult> estimate_relative_pose(const std::vector<Eigen::Vector3d> &x1,
                                                       const std::vector<Eigen::Vector3d> &x2, double threshold,
-                                                      std::mt19937 &rng) {
+                                                      std::mt19937 &rng, int minInliers) {
   const int n = static_cast<int>(x1.size());
-  if (n < 5) return std::nullopt;
+  if (n < 5 || n < minInliers) return std::nullopt;
   const double thresholdSquared = threshold * threshold;
   std::uniform_int_distribution<int> pick(0, n - 1);
+
+  // Iterations for a 99.9% chance of one all-inlier sample at this inlier ratio.
+  const auto iterations_for = [](double inlierRatio) {
+    constexpr int kMaxIterations = 500;
+    const double noFailure = 1.0 - std::pow(inlierRatio, 5);
+    if (noFailure <= 0.0) return 1;
+    // Clamped before the cast: a low ratio asks for billions of iterations.
+    const double needed = std::clamp(std::ceil(std::log(0.001) / std::log(noFailure)), 1.0, static_cast<double>(kMaxIterations));
+    return static_cast<int>(needed);
+  };
 
   // On a plane, two different essential matrices fit all points equally well
   // and only the points' side of the cameras tells them apart. So keep every
   // close contender for the check below, not just the top one.
   std::vector<std::pair<int, Eigen::Matrix3d>> contenders;
   int bestCount = 0;
-  int maxIterations = 500;
+  int maxIterations = iterations_for(static_cast<double>(std::max(minInliers, 5)) / n);
   for (int iteration = 0; iteration < maxIterations; ++iteration) {
     std::array<int, 5> sample{};
     for (int i = 0; i < 5; ++i) {
@@ -261,13 +271,7 @@ std::optional<EssentialResult> estimate_relative_pose(const std::vector<Eigen::V
       if (count * 10 >= bestCount * 8 && count >= 5) contenders.emplace_back(count, E);
       if (count > bestCount) {
         bestCount = count;
-        const double inlierRatio = static_cast<double>(count) / n;
-        const double noFailure = 1.0 - std::pow(inlierRatio, 5);
-        if (noFailure <= 0.0) {
-          maxIterations = 0;
-        } else {
-          maxIterations = std::min(500, static_cast<int>(std::ceil(std::log(0.001) / std::log(noFailure))));
-        }
+        maxIterations = std::min(maxIterations, iterations_for(static_cast<double>(count) / n));
       }
     }
   }

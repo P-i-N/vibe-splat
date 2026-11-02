@@ -1,5 +1,7 @@
 #include "sfm/bundle.hpp"
 
+#include "core/parallel.hpp"
+
 #include <algorithm>
 #include <cmath>
 
@@ -93,9 +95,16 @@ BundleResult bundle_adjust(std::vector<Lens> &lenses, std::vector<BundleView> &v
     }
   }
 
-  std::vector<std::vector<int>> observationsOfPoint(points.size());
-  for (std::size_t i = 0; i < observations.size(); ++i) {
-    observationsOfPoint[static_cast<std::size_t>(observations[i].point)].push_back(static_cast<int>(i));
+  // Observations grouped by point: observationStart[p] .. observationStart[p + 1].
+  std::vector<int> observationStart(points.size() + 1, 0);
+  for (const BundleObservation &o : observations) ++observationStart[static_cast<std::size_t>(o.point) + 1];
+  for (std::size_t p = 0; p < points.size(); ++p) observationStart[p + 1] += observationStart[p];
+  std::vector<int> observationOfPoint(observations.size());
+  {
+    std::vector<int> fill(observationStart.begin(), observationStart.end() - 1);
+    for (std::size_t i = 0; i < observations.size(); ++i) {
+      observationOfPoint[static_cast<std::size_t>(fill[static_cast<std::size_t>(observations[i].point)]++)] = static_cast<int>(i);
+    }
   }
 
   BundleResult result;
@@ -103,34 +112,70 @@ BundleResult bundle_adjust(std::vector<Lens> &lenses, std::vector<BundleView> &v
   result.finalRms = result.initialRms;
 
   struct Block {
+    int view;
     int offset[2];
     Eigen::Matrix<double, 3, 8> W; // Point against view (6) and lens (2)
     Eigen::Matrix<double, 8, 1> g;
   };
+  using PairBlock = Eigen::Matrix<double, 8, 8>;
+
+  // The pairs of views (a <= b) that share a point, numbered, and a table from
+  // any such pair to its number (or -1). S is symmetric, so the block of
+  // (b, a) is the transpose of (a, b) and only one is accumulated. The pattern
+  // is fixed for the call, so the per-thread block sums are allocated once.
+  std::vector<std::pair<int, int>> pairs;
+  std::vector<int> pairIndex(views.size() * views.size(), -1);
+  for (std::size_t p = 0; p < points.size(); ++p) {
+    for (int i = observationStart[p]; i < observationStart[p + 1]; ++i) {
+      for (int j = observationStart[p]; j < observationStart[p + 1]; ++j) {
+        const int a = observations[static_cast<std::size_t>(observationOfPoint[static_cast<std::size_t>(i)])].view;
+        const int b = observations[static_cast<std::size_t>(observationOfPoint[static_cast<std::size_t>(j)])].view;
+        if (a > b) continue;
+        int &at = pairIndex[static_cast<std::size_t>(a) * views.size() + static_cast<std::size_t>(b)];
+        if (at < 0) {
+          at = static_cast<int>(pairs.size());
+          pairs.emplace_back(a, b);
+        }
+      }
+    }
+  }
+  const unsigned threads = static_cast<unsigned>(std::min<std::size_t>(thread_count(options.threads), std::max<std::size_t>(points.size(), 1)));
+  std::vector<std::vector<PairBlock>> partial(threads, std::vector<PairBlock>(pairs.size(), PairBlock::Zero()));
+  std::vector<Eigen::VectorXd> partialRhs(threads, Eigen::VectorXd::Zero(size));
+  std::vector<char> untouched(threads, 1); // Per thread: its sums still need zeroing this iteration
+
+  // Everything the point update needs later, stored per point / per observation.
+  std::vector<Eigen::Matrix3d> Vinv(points.size());
+  std::vector<Eigen::Vector3d> gPoint(points.size());
+  std::vector<Block> blocks(observations.size());
+  std::vector<int> blockCount(points.size(), 0);
 
   double lambda = 1e-4;
-  std::vector<Block> blocks;
   for (int iteration = 0; iteration < options.iterations; ++iteration) {
     result.iterations = iteration + 1;
-    Eigen::MatrixXd S = Eigen::MatrixXd::Zero(size, size);
-    Eigen::VectorXd rhs = Eigen::VectorXd::Zero(size);
 
-    // Everything the point update needs later, stored per point.
-    std::vector<Eigen::Matrix3d> Vinv(points.size());
-    std::vector<Eigen::Vector3d> gPoint(points.size());
-    std::vector<std::vector<Block>> pointBlocks(points.size());
+    // The reduced system is built per point, in parallel. Every thread sums
+    // its points into its own 8x8 blocks, one per pair of views (view 6 + lens
+    // 2 on each side), and the blocks are added up and scattered into S after.
+    std::fill(untouched.begin(), untouched.end(), 1);
+    parallel_for_threaded(points.size(), threads, [&](unsigned thread, std::size_t p) {
+      std::vector<PairBlock> &sums = partial[thread];
+      Eigen::VectorXd &rhs = partialRhs[thread];
+      if (untouched[thread]) {
+        for (PairBlock &sum : sums) sum.setZero();
+        rhs.setZero();
+        untouched[thread] = 0;
+      }
+      const auto add = [&](int viewA, int viewB, const Eigen::Matrix<double, 8, 8> &value) {
+        sums[static_cast<std::size_t>(pairIndex[static_cast<std::size_t>(viewA) * views.size() + static_cast<std::size_t>(viewB)])] += value;
+      };
 
-    const auto scatter = [&](int a, int aLen, int b, int bLen, const auto &value, int aFrom, int bFrom) {
-      if (a < 0 || b < 0) return;
-      S.block(a, b, aLen, bLen).noalias() += value.block(aFrom, bFrom, aLen, bLen);
-    };
-
-    for (std::size_t p = 0; p < points.size(); ++p) {
       Eigen::Matrix3d V = Eigen::Matrix3d::Zero();
       Eigen::Vector3d gp = Eigen::Vector3d::Zero();
-      blocks.clear();
-      for (const int index : observationsOfPoint[p]) {
-        const BundleObservation &o = observations[static_cast<std::size_t>(index)];
+      Block *own = blocks.data() + observationStart[p];
+      int count = 0;
+      for (int i = observationStart[p]; i < observationStart[p + 1]; ++i) {
+        const BundleObservation &o = observations[static_cast<std::size_t>(observationOfPoint[static_cast<std::size_t>(i)])];
         const BundleView &view = views[static_cast<std::size_t>(o.view)];
         const Lens &lens = lenses[static_cast<std::size_t>(view.lens)];
         const Eigen::Vector3d rotated = view.pose.R * points[p];
@@ -153,20 +198,17 @@ BundleResult bundle_adjust(std::vector<Lens> &lenses, std::vector<BundleView> &v
         V.noalias() += w * Jp.transpose() * Jp;
         gp.noalias() += w * Jp.transpose() * r;
 
-        Block block;
+        Block &block = own[count++];
+        block.view = o.view;
         block.offset[0] = viewOffset[static_cast<std::size_t>(o.view)];
         block.offset[1] = lensOffset[static_cast<std::size_t>(view.lens)];
         block.W.noalias() = w * Jp.transpose() * Jc;
         block.g.noalias() = w * Jc.transpose() * r;
-        const Eigen::Matrix<double, 8, 8> Hcc = w * Jc.transpose() * Jc;
-        scatter(block.offset[0], 6, block.offset[0], 6, Hcc, 0, 0);
-        scatter(block.offset[0], 6, block.offset[1], 2, Hcc, 0, 6);
-        scatter(block.offset[1], 2, block.offset[0], 6, Hcc, 6, 0);
-        scatter(block.offset[1], 2, block.offset[1], 2, Hcc, 6, 6);
+        add(o.view, o.view, w * Jc.transpose() * Jc);
         if (block.offset[0] >= 0) rhs.segment<6>(block.offset[0]) -= block.g.head<6>();
         if (block.offset[1] >= 0) rhs.segment<2>(block.offset[1]) -= block.g.tail<2>();
-        blocks.push_back(block);
       }
+      blockCount[p] = count;
 
       // Marginalise this point. Its damping belongs here, before inversion.
       V.diagonal() *= 1.0 + lambda;
@@ -174,20 +216,49 @@ BundleResult bundle_adjust(std::vector<Lens> &lenses, std::vector<BundleView> &v
       const Eigen::Matrix3d inverse = V.inverse();
       Vinv[p] = inverse;
       gPoint[p] = gp;
-      for (const Block &a : blocks) {
+      for (int i = 0; i < count; ++i) {
+        const Block &a = own[i];
         const Eigen::Matrix<double, 8, 3> WaVinv = a.W.transpose() * inverse;
         const Eigen::Matrix<double, 8, 1> toRhs = WaVinv * gp;
         if (a.offset[0] >= 0) rhs.segment<6>(a.offset[0]) += toRhs.head<6>();
         if (a.offset[1] >= 0) rhs.segment<2>(a.offset[1]) += toRhs.tail<2>();
-        for (const Block &b : blocks) {
-          const Eigen::Matrix<double, 8, 8> product = -(WaVinv * b.W);
-          scatter(a.offset[0], 6, b.offset[0], 6, product, 0, 0);
-          scatter(a.offset[0], 6, b.offset[1], 2, product, 0, 6);
-          scatter(a.offset[1], 2, b.offset[0], 6, product, 6, 0);
-          scatter(a.offset[1], 2, b.offset[1], 2, product, 6, 6);
+        for (int j = 0; j < count; ++j) {
+          const Block &b = own[j];
+          if (b.view >= a.view) add(a.view, b.view, -(WaVinv * b.W));
         }
       }
-      pointBlocks[p] = blocks;
+    });
+
+    Eigen::MatrixXd S = Eigen::MatrixXd::Zero(size, size);
+    Eigen::VectorXd rhs = Eigen::VectorXd::Zero(size);
+    for (unsigned t = 0; t < threads; ++t) {
+      if (untouched[t]) continue;
+      rhs += partialRhs[t];
+      if (t > 0) {
+        for (std::size_t k = 0; k < pairs.size(); ++k) partial[0][k] += partial[t][k];
+      }
+    }
+    const auto scatter = [&](int a, int aLen, int b, int bLen, const PairBlock &value, int aFrom, int bFrom) {
+      if (a < 0 || b < 0) return;
+      S.block(a, b, aLen, bLen).noalias() += value.block(aFrom, bFrom, aLen, bLen);
+    };
+    for (std::size_t k = 0; k < pairs.size(); ++k) {
+      const PairBlock &sum = partial[0][k];
+      const auto [viewA, viewB] = pairs[k];
+      const int a = viewOffset[static_cast<std::size_t>(viewA)], b = viewOffset[static_cast<std::size_t>(viewB)];
+      const int la = lensOffset[static_cast<std::size_t>(views[static_cast<std::size_t>(viewA)].lens)];
+      const int lb = lensOffset[static_cast<std::size_t>(views[static_cast<std::size_t>(viewB)].lens)];
+      scatter(a, 6, b, 6, sum, 0, 0);
+      scatter(a, 6, lb, 2, sum, 0, 6);
+      scatter(la, 2, b, 6, sum, 6, 0);
+      scatter(la, 2, lb, 2, sum, 6, 6);
+      if (viewA != viewB) {
+        const PairBlock mirrored = sum.transpose();
+        scatter(b, 6, a, 6, mirrored, 0, 0);
+        scatter(b, 6, la, 2, mirrored, 0, 6);
+        scatter(lb, 2, a, 6, mirrored, 6, 0);
+        scatter(lb, 2, la, 2, mirrored, 6, 6);
+      }
     }
 
     // Weak priors keep f and k sensible when the scene cannot determine them.
@@ -205,17 +276,26 @@ BundleResult bundle_adjust(std::vector<Lens> &lenses, std::vector<BundleView> &v
       }
     }
 
+
     // Try steps until one lowers the cost.
     bool improved = false;
     for (int attempt = 0; attempt < 8 && !improved; ++attempt) {
-      Eigen::MatrixXd damped = S;
-      for (int i = 0; i < size; ++i) {
-        damped(i, i) = damped(i, i) <= 1e-12 ? 1.0 : damped(i, i) * (1.0 + lambda);
-      }
       Eigen::VectorXd step = Eigen::VectorXd::Zero(size);
       if (size > 0) {
-        const Eigen::LDLT<Eigen::MatrixXd> solver(damped);
-        step = solver.solve(rhs);
+        Eigen::MatrixXd damped = S;
+        for (int i = 0; i < size; ++i) {
+          damped(i, i) = damped(i, i) <= 1e-12 ? 1.0 : damped(i, i) * (1.0 + lambda);
+        }
+        // Damped, S is positive definite, so a plain Cholesky factorisation
+        // does; the slower pivoted one is kept for when rounding says otherwise.
+        // (A sparse factorisation was tried and lost: views see each other
+        // too much for the fill-in to stay small.)
+        const Eigen::LLT<Eigen::MatrixXd> cholesky(damped);
+        if (cholesky.info() == Eigen::Success) {
+          step = cholesky.solve(rhs);
+        } else {
+          step = Eigen::LDLT<Eigen::MatrixXd>(damped).solve(rhs);
+        }
       }
       if (!step.allFinite()) {
         lambda *= 10.0;
@@ -239,7 +319,9 @@ BundleResult bundle_adjust(std::vector<Lens> &lenses, std::vector<BundleView> &v
       }
       for (std::size_t p = 0; p < points.size(); ++p) {
         Eigen::Vector3d b = -gPoint[p];
-        for (const Block &block : pointBlocks[p]) {
+        const Block *own = blocks.data() + observationStart[p];
+        for (int i = 0; i < blockCount[p]; ++i) {
+          const Block &block = own[i];
           if (block.offset[0] >= 0) b.noalias() -= block.W.leftCols<6>() * step.segment<6>(block.offset[0]);
           if (block.offset[1] >= 0) b.noalias() -= block.W.rightCols<2>() * step.segment<2>(block.offset[1]);
         }
@@ -257,7 +339,7 @@ BundleResult bundle_adjust(std::vector<Lens> &lenses, std::vector<BundleView> &v
         result.finalRms = rms;
         lambda = std::max(lambda * 0.3, 1e-9);
         improved = true;
-        if (relative < 1e-9) return result;
+        if (relative < options.relativeTolerance) return result;
       } else {
         lambda *= 10.0;
       }

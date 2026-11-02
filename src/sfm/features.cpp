@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <numbers>
 
@@ -21,6 +22,31 @@ constexpr int kDescriptorGrid = 4;
 constexpr int kDescriptorBins = 8;
 constexpr float kTwoPi = 2.f * std::numbers::pi_v<float>;
 
+// atan2 to within 2e-4 rad (a minimax polynomial on [0, 1] plus octant
+// folding). Histogram bins are 0.17 rad wide at the finest, so this is plenty,
+// and it is several times faster than the library call.
+float fast_atan2(float y, float x) {
+  const float ax = std::abs(x), ay = std::abs(y);
+  const float a = std::min(ax, ay) / (std::max(ax, ay) + 1e-30f);
+  const float s = a * a;
+  float r = ((-0.0464964749f * s + 0.15931422f) * s - 0.327622764f) * s * a + a;
+  if (ay > ax) r = 0.5f * std::numbers::pi_v<float> - r;
+  if (x < 0.f) r = std::numbers::pi_v<float> - r;
+  return y < 0.f ? -r : r;
+}
+
+// exp(-x) for x >= 0 to about 1e-4 relative: 2^-t split into integer and
+// fraction, the fraction by a quartic. Used for the Gaussian weights of samples.
+float fast_exp_neg(float x) {
+  const float t = std::min(x * std::numbers::log2e_v<float>, 126.f);
+  const float whole = std::floor(t), f = t - whole; // 2^-t = 2^-(whole + f)
+  const float p = 0.9999961f + f * (-0.6930294f + f * (0.2393854f + f * (-0.0531868f + f * 0.0068383f))); // 2^-f, fitted
+  float scale;
+  const auto bits = static_cast<std::uint32_t>((127 - static_cast<int>(whole)) << 23);
+  std::memcpy(&scale, &bits, sizeof scale);
+  return p * scale;
+}
+
 struct Plane {
   int width = 0;
   int height = 0;
@@ -32,6 +58,10 @@ struct Plane {
   [[nodiscard]] float &at(int x, int y) { return values[static_cast<std::size_t>(y) * width + x]; }
 };
 
+// Separable Gaussian blur, edges clamped. Both passes are written as a sum of
+// scaled, shifted rows so the compiler vectorises them: the horizontal pass
+// reads from a row padded with the edge values, so the inner loop has no
+// bounds checks.
 Plane blur(const Plane &source, float sigma) {
   const int radius = std::max(1, static_cast<int>(std::ceil(3.f * sigma)));
   std::vector<float> kernel(static_cast<std::size_t>(radius) * 2 + 1);
@@ -45,25 +75,28 @@ Plane blur(const Plane &source, float sigma) {
 
   const int w = source.width, h = source.height;
   Plane horizontal(w, h);
+  std::vector<float> padded(static_cast<std::size_t>(w + 2 * radius));
   for (int y = 0; y < h; ++y) {
-    for (int x = 0; x < w; ++x) {
-      float sum = 0.f;
-      for (int i = -radius; i <= radius; ++i) {
-        sum += kernel[static_cast<std::size_t>(i + radius)] * source.at(std::clamp(x + i, 0, w - 1), y);
-      }
-      horizontal.at(x, y) = sum;
+    const float *in = source.values.data() + static_cast<std::size_t>(y) * w;
+    std::copy_n(in, w, padded.begin() + radius);
+    std::fill_n(padded.begin(), radius, in[0]);
+    std::fill_n(padded.begin() + radius + w, radius, in[w - 1]);
+    float *out = horizontal.values.data() + static_cast<std::size_t>(y) * w;
+    std::fill_n(out, w, 0.f);
+    for (int i = 0; i < 2 * radius + 1; ++i) {
+      const float k = kernel[static_cast<std::size_t>(i)];
+      const float *shifted = padded.data() + i;
+      for (int x = 0; x < w; ++x) out[x] += k * shifted[x];
     }
   }
   Plane out(w, h);
-  std::vector<float> column(static_cast<std::size_t>(w));
   for (int y = 0; y < h; ++y) {
-    std::fill(column.begin(), column.end(), 0.f);
+    float *column = out.values.data() + static_cast<std::size_t>(y) * w;
     for (int i = -radius; i <= radius; ++i) {
       const float k = kernel[static_cast<std::size_t>(i + radius)];
       const float *row = horizontal.values.data() + static_cast<std::size_t>(std::clamp(y + i, 0, h - 1)) * w;
-      for (int x = 0; x < w; ++x) column[static_cast<std::size_t>(x)] += k * row[x];
+      for (int x = 0; x < w; ++x) column[x] += k * row[x];
     }
-    std::copy(column.begin(), column.end(), out.values.begin() + static_cast<std::ptrdiff_t>(static_cast<std::size_t>(y) * w));
   }
   return out;
 }
@@ -140,8 +173,8 @@ std::vector<float> orientations(const Plane &g, float px, float py, float sigma)
       const int x = cx + dx, y = cy + dy;
       if (x < 1 || y < 1 || x >= g.width - 1 || y >= g.height - 1) continue;
       const float gx = g.at(x + 1, y) - g.at(x - 1, y), gy = g.at(x, y + 1) - g.at(x, y - 1);
-      const float weight = std::exp(-0.5f * static_cast<float>(dx * dx + dy * dy) / (weightSigma * weightSigma));
-      float angle = std::atan2(gy, gx);
+      const float weight = fast_exp_neg(0.5f * static_cast<float>(dx * dx + dy * dy) / (weightSigma * weightSigma));
+      float angle = fast_atan2(gy, gx);
       if (angle < 0.f) angle += kTwoPi;
       const int bin = std::min(kOrientationBins - 1, static_cast<int>(angle / kTwoPi * kOrientationBins));
       histogram[bin] += weight * std::sqrt(gx * gx + gy * gy);
@@ -191,12 +224,12 @@ void describe(const Plane &g, float px, float py, float sigma, float angle, floa
       if (col <= -1.f || row <= -1.f || col >= kDescriptorGrid || row >= kDescriptorGrid) continue;
 
       const float gx = g.at(x + 1, y) - g.at(x - 1, y), gy = g.at(x, y + 1) - g.at(x, y - 1);
-      float relative = std::atan2(gy, gx) - angle;
+      float relative = fast_atan2(gy, gx) - angle;
       while (relative < 0.f) relative += kTwoPi;
       while (relative >= kTwoPi) relative -= kTwoPi;
       const float bin = relative / kTwoPi * kDescriptorBins;
       const float weightSigma = 0.5f * kDescriptorGrid;
-      const float magnitude = std::sqrt(gx * gx + gy * gy) * std::exp(-0.5f * (u * u + v * v) / (weightSigma * weightSigma));
+      const float magnitude = std::sqrt(gx * gx + gy * gy) * fast_exp_neg(0.5f * (u * u + v * v) / (weightSigma * weightSigma));
 
       // Share each sample between the 8 nearest histogram cells.
       const int r0 = static_cast<int>(std::floor(row)), c0 = static_cast<int>(std::floor(col));
@@ -333,33 +366,46 @@ std::vector<std::pair<int, int>> match_features(const ImageFeatures &a, const Im
   std::vector<std::pair<int, int>> matches;
   if (na == 0 || nb < 2) return matches;
 
-  // For unit vectors, the nearest neighbour has the largest dot product.
+  // For unit vectors, the nearest neighbour has the largest dot product. All
+  // dot products of a block of A's rows against B come from one matrix product,
+  // which Eigen vectorises and blocks for the cache; the block keeps the score
+  // matrix small.
+  using Descriptors = Eigen::Matrix<float, Eigen::Dynamic, kDescriptorSize, Eigen::RowMajor>;
+  using Scores = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+  const Eigen::Map<const Descriptors> da(a.descriptors.data(), na, kDescriptorSize);
+  const Eigen::Map<const Descriptors> db(b.descriptors.data(), nb, kDescriptorSize);
+  constexpr int kBlockRows = 128;
+  Scores scores(std::min(kBlockRows, na), nb);
+
   std::vector<int> bestOfA(static_cast<std::size_t>(na), -1);
   std::vector<float> bestDotOfB(static_cast<std::size_t>(nb), -2.f);
   std::vector<int> bestOfB(static_cast<std::size_t>(nb), -1);
   const float ratioSquared = ratio * ratio;
-  for (int i = 0; i < na; ++i) {
-    const float *da = a.descriptor(static_cast<std::size_t>(i));
-    float first = -2.f, second = -2.f;
-    int firstIndex = -1;
-    for (int j = 0; j < nb; ++j) {
-      const float *db = b.descriptor(static_cast<std::size_t>(j));
-      float dot = 0.f;
-      for (int k = 0; k < kDescriptorSize; ++k) dot += da[k] * db[k];
-      if (dot > first) {
-        second = first;
-        first = dot;
-        firstIndex = j;
-      } else if (dot > second) {
-        second = dot;
+  for (int start = 0; start < na; start += kBlockRows) {
+    const int rows = std::min(kBlockRows, na - start);
+    scores.topRows(rows).noalias() = da.middleRows(start, rows) * db.transpose();
+    for (int r = 0; r < rows; ++r) {
+      const int i = start + r;
+      const float *row = scores.data() + static_cast<std::ptrdiff_t>(r) * nb;
+      float first = -2.f, second = -2.f;
+      int firstIndex = -1;
+      for (int j = 0; j < nb; ++j) {
+        const float dot = row[j];
+        if (dot > first) {
+          second = first;
+          first = dot;
+          firstIndex = j;
+        } else if (dot > second) {
+          second = dot;
+        }
+        if (dot > bestDotOfB[static_cast<std::size_t>(j)]) {
+          bestDotOfB[static_cast<std::size_t>(j)] = dot;
+          bestOfB[static_cast<std::size_t>(j)] = i;
+        }
       }
-      if (dot > bestDotOfB[static_cast<std::size_t>(j)]) {
-        bestDotOfB[static_cast<std::size_t>(j)] = dot;
-        bestOfB[static_cast<std::size_t>(j)] = i;
-      }
+      // Squared distance is 2 - 2 dot.
+      if (2.f - 2.f * first < ratioSquared * (2.f - 2.f * second)) bestOfA[static_cast<std::size_t>(i)] = firstIndex;
     }
-    // Squared distance is 2 - 2 dot.
-    if (2.f - 2.f * first < ratioSquared * (2.f - 2.f * second)) bestOfA[static_cast<std::size_t>(i)] = firstIndex;
   }
   for (int i = 0; i < na; ++i) {
     const int j = bestOfA[static_cast<std::size_t>(i)];

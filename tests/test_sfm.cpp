@@ -2,9 +2,11 @@
 #include "ingest/ingest.hpp"
 #include "sfm/bundle.hpp"
 #include "sfm/features.hpp"
+#include "sfm/gpu_matcher.hpp"
 #include "sfm/sfm.hpp"
 #include "sfm/test_views.hpp"
 #include "splat/gaussian_cloud.hpp"
+#include "test_support.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
@@ -565,6 +567,22 @@ TEST_CASE("Poses are recovered from rendered images", "[sfm][pipeline]") {
     fs::remove_all(project);
   }
 
+  SECTION("known focal length, matching on the GPU") {
+    vk::Context *ctx = splat::test::context();
+    if (ctx == nullptr) SKIP("no Vulkan device");
+    const fs::path project = make_project("splat_sfm_gpu", views, kFocal, 1.0, FocalSource::Manual);
+    SfmOptions options;
+    options.project = project;
+    options.gpu = ctx;
+    const SfmReport report = run_sfm(options);
+    CHECK(report.unregistered == 0);
+    CHECK(report.pairsVerified > 30);
+    CHECK(report.stats.points > 300);
+    CHECK(report.stats.meanReprojectionError < 1.0);
+    check_against_truth(load_colmap_model(project / "sparse" / "0"), views);
+    fs::remove_all(project);
+  }
+
   SECTION("a focal length 15% off gets corrected, sequential matching") {
     const fs::path project = make_project("splat_sfm_guess", views, kFocal, 1.15, FocalSource::Default);
     SfmOptions options;
@@ -586,4 +604,69 @@ TEST_CASE("Poses are recovered from rendered images", "[sfm][pipeline]") {
     CHECK(load_ply(project / "sparse" / "0" / "preview.ply").size() == model.points.size());
     fs::remove_all(project);
   }
+}
+
+TEST_CASE("GPU matching agrees with the CPU matcher", "[sfm][features][gpu]") {
+  vk::Context *ctx = splat::test::context();
+  if (ctx == nullptr) SKIP("no Vulkan device");
+
+  const auto views = make_test_views(8, 640, 480, 500.0);
+  std::vector<ImageFeatures> features;
+  for (const auto &view : views) features.push_back(extract_features(view.image, 4000));
+  features.push_back({}); // An image without features must not break anything
+
+  std::vector<std::pair<int, int>> pairs;
+  for (int a = 0; a < static_cast<int>(features.size()); ++a) {
+    for (int b = a + 1; b < static_cast<int>(features.size()); ++b) pairs.emplace_back(a, b);
+  }
+  GpuMatcher matcher(*ctx, features);
+  const auto gpu = matcher.match(pairs);
+  REQUIRE(gpu.size() == pairs.size());
+
+  std::size_t cpuTotal = 0, agreed = 0;
+  for (std::size_t p = 0; p < pairs.size(); ++p) {
+    const auto cpu = match_features(features[static_cast<std::size_t>(pairs[p].first)], features[static_cast<std::size_t>(pairs[p].second)]);
+    cpuTotal += cpu.size();
+    for (const auto &m : gpu[p]) {
+      if (std::binary_search(cpu.begin(), cpu.end(), m)) ++agreed;
+    }
+    CHECK(std::is_sorted(gpu[p].begin(), gpu[p].end()));
+    if (pairs[p].second == static_cast<int>(features.size()) - 1) CHECK(gpu[p].empty());
+    // Quantisation shifts a few borderline ratio tests either way, never more.
+    if (cpu.size() >= 50) {
+      CHECK(gpu[p].size() * 10 >= cpu.size() * 9);
+      CHECK(gpu[p].size() * 9 <= cpu.size() * 10);
+    }
+  }
+  REQUIRE(cpuTotal > 300);
+  std::println("  GPU matching: {} of {} CPU matches found again", agreed, cpuTotal);
+  CHECK(agreed * 100 >= cpuTotal * 95);
+
+  // A second call must give the same lists: the compaction order is sorted away.
+  CHECK(matcher.match(pairs) == gpu);
+}
+
+TEST_CASE("Mutual nearest neighbours and the ratio test on a tiny set", "[sfm][features]") {
+  ImageFeatures a, b;
+  auto add = [](ImageFeatures &f, int hot, float spread) {
+    f.keypoints.push_back({});
+    std::vector<float> d(static_cast<std::size_t>(kDescriptorSize), spread);
+    d[static_cast<std::size_t>(hot)] = 1.f;
+    float norm = 0.f;
+    for (const float v : d) norm += v * v;
+    for (float &v : d) v /= std::sqrt(norm);
+    f.descriptors.insert(f.descriptors.end(), d.begin(), d.end());
+  };
+  add(a, 0, 0.f);  // Matches b0 cleanly
+  add(a, 5, 0.f);  // b1 and b2 are equally close: fails the ratio test
+  add(a, 9, 0.f);  // Prefers b3, but b3 prefers a3
+  add(a, 9, 0.01f);
+  add(b, 0, 0.f);
+  add(b, 5, 0.05f);
+  add(b, 5, 0.05f);
+  add(b, 9, 0.01f);
+  const auto matches = match_features(a, b);
+  REQUIRE(matches.size() == 2);
+  CHECK(matches[0] == std::pair{0, 0});
+  CHECK(matches[1] == std::pair{3, 3});
 }

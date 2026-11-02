@@ -21,6 +21,7 @@ add_library(splat_core STATIC
   sfm/colmap_model.cpp
   sfm/sfm.cpp
   sfm/features.cpp
+  sfm/gpu_matcher.cpp
   sfm/geometry.cpp
   sfm/bundle.cpp
   sfm/reconstruct.cpp
