@@ -53,9 +53,11 @@ void main() {
     const vec3 s = (n1 * n2) / (d1 * d2);
     rowSum += s.r + s.g + s.b;
 
-    const vec3 dMu = s * (2.0 * my / n1 - 2.0 * mx / d1);
+    // n1 and n2 are cancelled out of s by hand: n2 can be exactly zero, and
+    // s / n2 would then be NaN although the derivative is well defined.
+    const vec3 dMu = 2.0 * my * n2 / (d1 * d2) - s * 2.0 * mx / d1;
     const vec3 dVar = -s / d2;
-    const vec3 dCov = s * 2.0 / n2;
+    const vec3 dCov = 2.0 * n1 / (d1 * d2);
     const float norm = rowNorm * window_norm(int(px), int(pc.width));
     const uint at = row * pc.width + px;
     fields[at * 3u] = vec4((dMu - 2.0 * mx * dVar - my * dCov) / norm, 0.0);

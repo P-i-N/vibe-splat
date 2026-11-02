@@ -235,7 +235,7 @@ ReferenceLoss reference_loss(const ReferenceImage &image, const std::vector<std:
       const dvec3 n1 = 2.0 * mx * my + kC1, n2 = 2.0 * cxy + kC2, d1 = mx * mx + my * my + kC1, d2 = vx + vy + kC2;
       const dvec3 s = (n1 * n2) / (d1 * d2);
       ssimSum += s.r + s.g + s.b;
-      const dvec3 dMu = s * (2.0 * my / n1 - 2.0 * mx / d1), dVar = -s / d2, dCov = s * 2.0 / n2;
+      const dvec3 dMu = 2.0 * my * n2 / (d1 * d2) - s * 2.0 * mx / d1, dVar = -s / d2, dCov = 2.0 * n1 / (d1 * d2);
       const std::size_t at = static_cast<std::size_t>(row) * w + px;
       P[at] = (dMu - 2.0 * mx * dVar - my * dCov) / norm;
       Q[at] = dVar / norm;

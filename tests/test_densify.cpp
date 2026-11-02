@@ -13,6 +13,7 @@
 
 #include <cmath>
 #include <filesystem>
+#include <limits>
 #include <print>
 #include <random>
 
@@ -147,6 +148,18 @@ TEST_CASE("Pruning removes the transparent, and the oversized when asked", "[den
   r = densify_cloud(cloud, stats, options, rng);
   CHECK(r.pruned == 3);
   CHECK(r.source == std::vector<std::int64_t>{3});
+}
+
+TEST_CASE("Pruning removes Gaussians with NaN or infinite values", "[densify]") {
+  GaussianCloud cloud = line_of(4, 0.01f);
+  cloud.positions[3] = std::nanf("");
+  cloud.sh[2 * 3 + 1] = std::numeric_limits<float>::infinity();
+  std::mt19937 rng(1);
+  const DensifyResult result = densify_cloud(cloud, stats_of(4, 0.f), DensifyOptions{}, rng);
+  CHECK(result.pruned == 2);
+  REQUIRE(result.source.size() == 2);
+  CHECK(result.source[0] == 0);
+  CHECK(result.source[1] == 3);
 }
 
 TEST_CASE("The limit is kept, with the highest gradients first", "[densify]") {

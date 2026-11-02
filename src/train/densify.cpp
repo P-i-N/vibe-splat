@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <numeric>
+#include <span>
 #include <stdexcept>
 
 namespace splat {
@@ -24,6 +25,14 @@ void append_copy(GaussianCloud &to, const GaussianCloud &from, std::size_t i) {
   to.opacities.push_back(from.opacities[i]);
   to.sh.insert(to.sh.end(), from.sh.begin() + static_cast<std::ptrdiff_t>(i * floats),
                from.sh.begin() + static_cast<std::ptrdiff_t>((i + 1) * floats));
+}
+
+// NaN compares false with every limit, so without this such a Gaussian would stay for good.
+bool all_finite(const GaussianCloud &cloud, std::size_t i) {
+  const auto floats = static_cast<std::size_t>(3 * cloud.shCoeffs());
+  const auto finite = [](std::span<const float> values) { return std::ranges::all_of(values, [](float v) { return std::isfinite(v); }); };
+  return finite(std::span(cloud.positions).subspan(i * 3, 3)) && finite(std::span(cloud.scales).subspan(i * 3, 3)) &&
+         finite(std::span(cloud.rotations).subspan(i * 4, 4)) && std::isfinite(cloud.opacities[i]) && finite(std::span(cloud.sh).subspan(i * floats, floats));
 }
 
 // A sample from the Gaussian itself: rotated standard normal, scaled.
@@ -90,7 +99,7 @@ DensifyResult densify_cloud(const GaussianCloud &cloud, const DensifyStats &stat
     const float largest = std::exp(std::max({cloud.scales[i * 3], cloud.scales[i * 3 + 1], cloud.scales[i * 3 + 2]}));
     const bool transparent = sigmoid(cloud.opacities[i]) < options.pruneOpacity;
     const bool oversized = options.pruneLarge && (stats.maxRadius[i] > options.maxScreenRadius || largest > options.maxWorldScale);
-    if (transparent || oversized) {
+    if (transparent || oversized || !all_finite(cloud, i)) {
       actions[i] = Action::Prune;
       ++result.pruned;
       continue;
