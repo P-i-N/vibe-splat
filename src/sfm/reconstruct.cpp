@@ -102,7 +102,10 @@ public:
     poses_[static_cast<std::size_t>(pair.b)] = pair.pose;
     anchor_ = pair.a;
     triangulate_new(pair.b);
-    bundle(false, 20);
+    // A guessed focal length can be 25% off. Two views pin it down only
+    // roughly, but every registration before it is corrected loses half its
+    // points to the reprojection thresholds, so start correcting it here.
+    bundle(true, 40);
     filter();
     if (point_count() >= kMinInitialPoints) return true;
     reset();
@@ -122,7 +125,11 @@ public:
     std::size_t lastGlobal = registered_count();
     for (;;) {
       const auto image = next_image();
-      if (!image) break;
+      if (!image) {
+        const std::size_t left = poses_.size() - registered_count();
+        if (left > 0) std::println("  {} images see too few known points to register", left);
+        break;
+      }
       if (!register_image(*image)) continue;
       extend(*image);
       triangulate_new(*image);
@@ -372,7 +379,13 @@ std::vector<std::pair<int, int>> choose_pairs(std::size_t count, const IngestMan
   return pairs;
 }
 
-std::vector<Track> build_tracks(const std::vector<ImageFeatures> &features, const std::vector<VerifiedPair> &pairs) {
+struct TrackSet {
+  std::vector<Track> tracks;
+  std::vector<int> offsets;        // First global feature index of each image, plus the total at the end
+  std::vector<int> trackOfFeature; // Per global feature index, or -1
+};
+
+TrackSet build_tracks(const std::vector<ImageFeatures> &features, const std::vector<VerifiedPair> &pairs) {
   std::vector<int> offsets(features.size() + 1, 0);
   for (std::size_t i = 0; i < features.size(); ++i) offsets[i + 1] = offsets[i] + static_cast<int>(features[i].keypoints.size());
 
@@ -397,11 +410,30 @@ std::vector<Track> build_tracks(const std::vector<ImageFeatures> &features, cons
       track.observations.push_back({static_cast<int>(image), f - offsets[image], false});
     }
   }
-  std::vector<Track> tracks;
+  TrackSet set;
+  set.trackOfFeature.assign(static_cast<std::size_t>(offsets.back()), -1);
   for (auto &[root, track] : byRoot) {
-    if (track.observations.size() >= 2) tracks.push_back(std::move(track));
+    if (track.observations.size() < 2) continue;
+    for (const Observation &o : track.observations) {
+      set.trackOfFeature[static_cast<std::size_t>(offsets[static_cast<std::size_t>(o.image)] + o.feature)] = static_cast<int>(set.tracks.size());
+    }
+    set.tracks.push_back(std::move(track));
   }
-  return tracks;
+  set.offsets = std::move(offsets);
+  return set;
+}
+
+// How many of a pair's inliers a third image also sees. These are the points
+// the next image can register against. A pair with many matches but few of
+// these, typically in a poorly covered part of the scene, strands the model
+// after a handful of images, however good the pair itself is.
+std::size_t seed_support(const VerifiedPair &pair, const TrackSet &set) {
+  std::size_t support = 0;
+  for (const auto &[fa, fb] : pair.inliers) {
+    const int t = set.trackOfFeature[static_cast<std::size_t>(set.offsets[static_cast<std::size_t>(pair.a)] + fa)];
+    if (t >= 0 && set.tracks[static_cast<std::size_t>(t)].observations.size() >= 3) ++support;
+  }
+  return support;
 }
 
 std::vector<std::uint8_t> read_all(const fs::path &path) {
@@ -513,25 +545,31 @@ SfmReport run_sfm(const SfmOptions &options) {
   std::println("  {} pairs passed geometric verification", goodPairs.size());
   if (goodPairs.empty()) throw std::runtime_error("no image pair matched well enough; do the images overlap?");
 
-  std::vector<Track> tracks = build_tracks(features, goodPairs);
-  std::println("  {} tracks", tracks.size());
+  TrackSet trackSet = build_tracks(features, goodPairs);
+  std::println("  {} tracks", trackSet.tracks.size());
 
-  // Start from the pair with the most matches among those with a wide baseline,
-  // accepting a narrower one only if nothing better works.
-  Mapper mapper(lenses, lensOfImage, features, std::move(tracks));
-  std::vector<const VerifiedPair *> byInliers;
-  for (const VerifiedPair &pair : goodPairs) byInliers.push_back(&pair);
-  std::sort(byInliers.begin(), byInliers.end(), [](const VerifiedPair *a, const VerifiedPair *b) { return a->inliers.size() > b->inliers.size(); });
+  // Start from the best-connected pair among those with a wide baseline,
+  // accepting a narrower one only if nothing better works. The baseline is
+  // judged with the focal length guess, which inflates it for pairs that
+  // mostly rotate, so the number of matches alone is no guide: the pair with
+  // the most can sit at a dead end of the photo set.
+  std::vector<std::pair<std::size_t, const VerifiedPair *>> bySupport;
+  for (const VerifiedPair &pair : goodPairs) bySupport.emplace_back(seed_support(pair, trackSet), &pair);
+  std::sort(bySupport.begin(), bySupport.end(), [](const auto &a, const auto &b) {
+    return a.first != b.first ? a.first > b.first : a.second->inliers.size() > b.second->inliers.size();
+  });
+  Mapper mapper(lenses, lensOfImage, features, std::move(trackSet.tracks));
 
   bool started = false;
   for (const double minAngle : {8.0, 4.0, 2.0}) {
     int attempts = 0;
-    for (const VerifiedPair *pair : byInliers) {
+    for (const auto &[support, pair] : bySupport) {
       if (pair->medianAngleDeg < minAngle) continue;
       if (++attempts > 20) break;
       if (mapper.initialize(*pair)) {
-        std::println("Starting from {} and {}: {} matches, {:.1f} degree baseline, {} points", manifest.images[static_cast<std::size_t>(pair->a)].file,
-                     manifest.images[static_cast<std::size_t>(pair->b)].file, pair->inliers.size(), pair->medianAngleDeg, mapper.point_count());
+        std::println("Starting from {} and {}: {} matches, {} seen by other images too, {:.1f} degree baseline, {} points",
+                     manifest.images[static_cast<std::size_t>(pair->a)].file, manifest.images[static_cast<std::size_t>(pair->b)].file,
+                     pair->inliers.size(), support, pair->medianAngleDeg, mapper.point_count());
         started = true;
         break;
       }
