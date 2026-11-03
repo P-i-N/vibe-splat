@@ -36,6 +36,18 @@ struct GpuCamera {
 };
 static_assert(sizeof(GpuCamera) == 128);
 
+// Must match the push constants of shaders/preprocess.comp.
+struct PreprocessPush {
+  float splatScale;
+  std::uint32_t maxShDegree;
+  std::uint32_t pointMode;
+  float pointRadius;
+};
+
+struct PackPush {
+  std::uint32_t count;
+};
+
 struct DrawArgs {
   std::uint32_t vertexCount, instanceCount, firstVertex, firstInstance;
 };
@@ -47,7 +59,8 @@ float sigmoid(float x) { return 1.f / (1.f + std::exp(-x)); }
 } // namespace
 
 SplatRenderer::SplatRenderer(vk::Context &ctx, VkFormat colorFormat)
-    : ctx_(ctx), preprocess_(ctx, shaders::preprocess_comp, 7), sorter_(ctx) {
+    : ctx_(ctx), preprocess_(ctx, shaders::preprocess_comp, 7, sizeof(PreprocessPush)),
+      pack_(ctx, shaders::pack_gaussians_comp, 5, sizeof(PackPush)), sorter_(ctx) {
   camera_ = std::make_unique<Buffer>(ctx_, sizeof(GpuCamera), kStorage, MemoryUsage::Upload);
   drawArgs_ = std::make_unique<Buffer>(ctx_, sizeof(DrawArgs),
                                        kStorage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, MemoryUsage::GpuOnly);
@@ -168,20 +181,46 @@ void SplatRenderer::set_scene(const GaussianCloud &cloud) {
     }
   }
 
-  const VkDeviceSize n = count_;
-  gaussians_ = std::make_unique<Buffer>(ctx_, n * sizeof(GpuGaussian), kStorage, MemoryUsage::GpuOnly);
+  capacity_ = 0;
+  allocate(count_);
   gaussians_->upload(ctx_, std::span<const GpuGaussian>(gpu));
   sh_ = std::make_unique<Buffer>(ctx_, cloud.sh.size() * sizeof(float), kStorage, MemoryUsage::GpuOnly);
   sh_->upload(ctx_, std::span<const float>(cloud.sh));
+  shExternal_ = nullptr;
+}
+
+void SplatRenderer::allocate(std::size_t count) {
+  if (count <= capacity_) return;
+  // Room to grow, so that a trainer adding Gaussians does not reallocate every time.
+  const VkDeviceSize n = capacity_ == 0 ? count : count + count / 4;
+  gaussians_.reset();
+  splats2d_.reset();
+  gaussians_ = std::make_unique<Buffer>(ctx_, n * sizeof(GpuGaussian), kStorage, MemoryUsage::GpuOnly);
   splats2d_ = std::make_unique<Buffer>(ctx_, n * sizeof(GpuSplat2D), kStorage, MemoryUsage::GpuOnly);
   keys_ = std::make_unique<Buffer>(ctx_, n * 4, kStorage, MemoryUsage::GpuOnly);
   values_ = std::make_unique<Buffer>(ctx_, n * 4, kStorage, MemoryUsage::GpuOnly);
   tmpKeys_ = std::make_unique<Buffer>(ctx_, n * 4, kStorage, MemoryUsage::GpuOnly);
   tmpValues_ = std::make_unique<Buffer>(ctx_, n * 4, kStorage, MemoryUsage::GpuOnly);
+  capacity_ = n;
+}
+
+void SplatRenderer::set_scene(VkCommandBuffer cmd, const GpuCloud &cloud) {
+  count_ = cloud.count;
+  shDegree_ = std::min(cloud.activeDegree, cloud.shDegree);
+  shFloats_ = static_cast<std::uint32_t>(3 * (cloud.shDegree + 1) * (cloud.shDegree + 1));
+  sh_.reset();
+  shExternal_ = cloud.sh;
+  if (count_ == 0) return;
+  allocate(count_);
+  vk::compute_barrier(cmd);
+  const auto count = static_cast<std::uint32_t>(count_);
+  pack_.dispatch(cmd, {cloud.positions, cloud.scales, cloud.rotations, cloud.opacities, gaussians_.get()}, PackPush{count},
+                 vk::div_up(count, 256));
+  vk::compute_barrier(cmd);
 }
 
 void SplatRenderer::record(VkCommandBuffer cmd, const Camera &camera, VkImageView target, VkExtent2D extent,
-                           std::array<float, 4> clearColor) {
+                           std::array<float, 4> clearColor, bool clear) {
   const auto count = static_cast<std::uint32_t>(count_);
 
   if (count > 0) {
@@ -199,7 +238,7 @@ void SplatRenderer::record(VkCommandBuffer cmd, const Camera &camera, VkImageVie
     gc.viewport[2] = 0.5f * static_cast<float>(extent.width) / camera.fx;
     gc.viewport[3] = 0.5f * static_cast<float>(extent.height) / camera.fy;
     gc.counts[0] = count;
-    gc.counts[1] = static_cast<std::uint32_t>(shDegree_);
+    gc.counts[1] = static_cast<std::uint32_t>(std::max(std::min(shDegree_, settings.maxShDegree), 0));
     gc.counts[2] = shFloats_;
     std::memcpy(camera_->mapped().data(), &gc, sizeof(gc));
     camera_->flush();
@@ -208,9 +247,11 @@ void SplatRenderer::record(VkCommandBuffer cmd, const Camera &camera, VkImageVie
     vkCmdUpdateBuffer(cmd, drawArgs_->handle(), 0, sizeof(args), &args);
     vk::compute_barrier(cmd);
 
-    preprocess_.dispatch(cmd, {gaussians_.get(), sh_.get(), camera_.get(), splats2d_.get(), keys_.get(),
-                               values_.get(), drawArgs_.get()},
-                         std::span<const std::byte>{}, vk::div_up(count, 256));
+    const PreprocessPush push{settings.splatScale, static_cast<std::uint32_t>(std::max(settings.maxShDegree, 0)),
+                              settings.points ? 1u : 0u, settings.pointRadius};
+    const Buffer *sh = sh_ ? sh_.get() : shExternal_;
+    preprocess_.dispatch(cmd, {gaussians_.get(), sh, camera_.get(), splats2d_.get(), keys_.get(), values_.get(), drawArgs_.get()},
+                         push, vk::div_up(count, 256));
     vk::compute_barrier(cmd);
     sorter_.record(cmd, *keys_, *values_, *tmpKeys_, *tmpValues_, count);
   }
@@ -218,7 +259,7 @@ void SplatRenderer::record(VkCommandBuffer cmd, const Camera &camera, VkImageVie
   VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
   color.imageView = target;
   color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-  color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  color.loadOp = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
   color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
   std::memcpy(color.clearValue.color.float32, clearColor.data(), sizeof(float) * 4);
   VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};

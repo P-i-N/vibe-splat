@@ -12,6 +12,28 @@
 
 namespace splat {
 
+// Gaussians already on the GPU, in GaussianCloud's raw layout (the trainer's
+// parameter buffers). The renderer reads `sh` in place, so it must outlive
+// every frame recorded with it.
+struct GpuCloud {
+  const vk::Buffer *positions = nullptr;
+  const vk::Buffer *scales = nullptr;
+  const vk::Buffer *rotations = nullptr;
+  const vk::Buffer *opacities = nullptr;
+  const vk::Buffer *sh = nullptr;
+  std::size_t count = 0;
+  int shDegree = 0;     // Of the data
+  int activeDegree = 0; // Degrees that hold anything yet
+};
+
+// How to draw, for the viewer. The defaults render a scene as trained.
+struct RenderSettings {
+  float splatScale = 1.f;
+  int maxShDegree = 3;
+  bool points = false;     // Every Gaussian as an opaque dot at its centre
+  float pointRadius = 2.f; // Pixels
+};
+
 // Renders Gaussian splats with Vulkan:
 //   1. preprocess (compute): cull, project, SH colour, depth keys
 //   2. GPU radix sort by depth (back to front)
@@ -28,12 +50,19 @@ public:
   // Uploads a scene (activating opacity, scale and rotation). Waits for the
   // GPU. Must not be called while a frame using this renderer is in flight.
   void set_scene(const GaussianCloud &cloud);
+  // Records the conversion of Gaussians already on the GPU. Waits for nothing:
+  // no frame using this renderer may be in flight.
+  void set_scene(VkCommandBuffer cmd, const GpuCloud &cloud);
   [[nodiscard]] std::size_t splat_count() const noexcept { return count_; }
+  [[nodiscard]] int sh_degree() const noexcept { return shDegree_; }
+
+  RenderSettings settings;
 
   // Records a full frame. `target` must be in COLOR_ATTACHMENT_OPTIMAL layout
-  // and stays in it. Only one frame may be in flight at a time.
+  // and stays in it. Only one frame may be in flight at a time. With `clear`
+  // false, the splats are drawn over what the target holds.
   void record(VkCommandBuffer cmd, const Camera &camera, VkImageView target, VkExtent2D extent,
-              std::array<float, 4> clearColor = {0.f, 0.f, 0.f, 1.f});
+              std::array<float, 4> clearColor = {0.f, 0.f, 0.f, 1.f}, bool clear = true);
 
   // Number of splats drawn in the last completed frame (reads GPU memory;
   // call after the frame's fence has signalled).
@@ -41,9 +70,11 @@ public:
 
 private:
   void create_graphics_pipeline(VkFormat colorFormat);
+  void allocate(std::size_t count);
 
   vk::Context &ctx_;
   vk::ComputePipeline preprocess_;
+  vk::ComputePipeline pack_;
   vk::RadixSorter sorter_;
 
   VkDescriptorSetLayout drawSetLayout_ = VK_NULL_HANDLE;
@@ -51,6 +82,8 @@ private:
   VkPipeline drawPipeline_ = VK_NULL_HANDLE;
 
   std::size_t count_ = 0;
+  std::size_t capacity_ = 0;
+  const vk::Buffer *shExternal_ = nullptr; // From set_scene(cmd, GpuCloud), instead of sh_
   int shDegree_ = 0;
   std::uint32_t shFloats_ = 3;
   std::unique_ptr<vk::Buffer> gaussians_;

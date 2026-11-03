@@ -87,4 +87,17 @@ void OrbitCamera::move(float forward, float right, float upward) {
   target += (f * forward + r * right - d * upward) * distance;
 }
 
+void OrbitCamera::look_along(glm::vec3 eye, glm::vec3 forward, float targetDistance) {
+  const glm::vec3 u = glm::normalize(up);
+  // The same frame as eye() builds.
+  glm::vec3 ref = std::abs(u.z) < 0.9f ? glm::vec3(0.f, 0.f, 1.f) : glm::vec3(1.f, 0.f, 0.f);
+  const glm::vec3 a = glm::normalize(ref - u * glm::dot(ref, u));
+  const glm::vec3 b = glm::cross(u, a);
+  const glm::vec3 dir = -glm::normalize(forward); // From the target to the eye
+  pitchDeg = std::clamp(glm::degrees(std::asin(std::clamp(glm::dot(dir, u), -1.f, 1.f))), -89.f, 89.f);
+  yawDeg = glm::degrees(std::atan2(glm::dot(dir, b), glm::dot(dir, a)));
+  distance = std::max(targetDistance, 1e-3f);
+  target = eye - dir * distance;
+}
+
 } // namespace splat
