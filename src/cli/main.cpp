@@ -81,7 +81,7 @@ ingest options (inputs are image files, video files or folders of them):
   --max-size <px>         Longest side of stored images, 0 keeps it (default 1600)
   --png                   Store PNG instead of JPEG
   --jpeg-quality <1-100>  Default 95
-  --fps <n>               Video frames kept per second, 0 keeps all (default 2)
+  --fps <n>               Video frames kept per second, 0 keeps all (default 4)
   --max-frames <n>        Frames kept per video, lowering --fps to fit
   --threads <n>           Photo threads, 0 uses all cores (default 0)
   --force                 Replace a previous ingest in this project
