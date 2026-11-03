@@ -3,6 +3,7 @@
 #include "core/vk_context.hpp"
 #include "render/camera.hpp"
 #include "sfm/colmap_model.hpp"
+#include "splat/cgc.hpp"
 #include "train/trainer.hpp"
 
 #include <chrono>
@@ -30,10 +31,20 @@ struct TrainOptions {
   int saveEvery = 5000; // 0 only saves at the end
 
   bool densify = true;
+  // Learn each view's exposure, so that the Gaussians need not take it up.
+  // For photos whose exposure varies, as auto exposure in video does; on
+  // evenly exposed photos it costs about 0.5 dB on held-out views.
+  bool exposure = false;
+  bool fullAdam = false;       // Update every Gaussian each step, not only those in view: slower, sharper
+  bool fullResolution = false; // Train at full size throughout, without the coarse start
   float gradientThreshold = 2e-4f;
   double vramBudgetGiB = 0.0; // 0: a share of the GPU's free memory, see vramShare
   double vramShare = 0.9;     // Of the free memory, when no budget is given
   std::size_t maxGaussians = 0; // 0: as many as the budget allows
+  // Share of the Gaussians removed, those adding least to the training views,
+  // at the end of densification and again halfway through the rest. 0: none.
+  // 70% each time leaves a tenth, for about 0.1 dB of PSNR on held-out views.
+  double pruneShare = 0.7;
 };
 
 struct TrainReport {
@@ -59,6 +70,9 @@ struct TrainView {
 struct TrainData {
   ColmapModel model;
   std::vector<TrainView> trainViews, holdoutViews;
+  // Coarse to fine: smallerViews[l][i] is trainViews[i] at 1 / 2^(l + 1) of its
+  // size. Empty with TrainOptions::fullResolution.
+  std::vector<std::vector<TrainView>> smallerViews;
   double extent = 1.0;       // Radius of the camera positions around their mean
   double typicalDepth = 1.0; // Median distance of the points, plus the extent
 };
@@ -107,7 +121,12 @@ public:
   [[nodiscard]] double budget_gib() const noexcept { return budgetGiB_; }
 
 private:
+  struct ViewExposure; // What each view's camera did to its photo, learned
   template <class F> auto fitting(F &&work);
+  // The view to train on, at the size the schedule asks for at `iteration`.
+  [[nodiscard]] const TrainView &view_at(std::size_t index, int iteration) const;
+  void refill_order();
+  void save_output(const std::filesystem::path &path, const CgcOptions &cgcOptions) const;
 
   vk::Context &ctx_;
   TrainOptions options_;
@@ -117,7 +136,8 @@ private:
   std::unique_ptr<Trainer> trainer_;
   double budgetGiB_ = 0.0;
 
-  int densifyFrom_ = 0, densifyUntil_ = 0, shInterval_ = 1;
+  int densifyFrom_ = 0, densifyUntil_ = 0, pruneAgainAt_ = 0, shInterval_ = 1;
+  std::vector<ViewExposure> exposures_;
   std::mt19937 rng_, densifyRng_;
   std::vector<std::size_t> order_;
   LearningRates rates_;
@@ -131,6 +151,8 @@ private:
   std::size_t lastView_ = 0;
   double lastPsnr_ = 0.0;
   double trainingSeconds_ = 0.0;
+  double densifySeconds_ = 0.0, pruneSeconds_ = 0.0;
+  int densifyRounds_ = 0;
   TrainReport report_;
 };
 

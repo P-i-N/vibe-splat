@@ -33,6 +33,8 @@ struct BundleOptions {
   int iterations = 20;
   double huberPixels = 2.0;
   bool refineLenses = true;
+  double relativeTolerance = 1e-6; // Stops once a step lowers the cost by less than this fraction
+  int threads = 0;                 // 0 uses all cores
 };
 
 struct BundleResult {

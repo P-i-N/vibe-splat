@@ -12,6 +12,7 @@ namespace {
 constexpr double kWeights[11] = {0.00102838, 0.00759876, 0.03600077, 0.10936069, 0.21300554, 0.26601172,
                                  0.21300554, 0.10936069, 0.03600077, 0.00759876, 0.00102838};
 constexpr double kC1 = 0.0001, kC2 = 0.0009;
+constexpr double kLogMinTransmittance = -9.210340372; // LOG_MIN_TRANSMITTANCE in train_types.glsl
 
 using glm::dmat2;
 using glm::dmat3;
@@ -174,16 +175,20 @@ double trace_term(const dmat2 &G, const dmat3x2 &A, const dmat3 &X, const dmat3x
   return product[0][0] + product[1][1];
 }
 
-} // namespace
-
-ReferenceImage reference_render(const GaussianCloud &cloud, const Camera &camera, const ReferenceOptions &options) {
+// train_forward.comp. Adds each splat's weight in each pixel to `contributions`, if given.
+ReferenceImage composite(const GaussianCloud &cloud, const Camera &camera, const ReferenceOptions &options, std::vector<double> *contributions) {
   ReferenceImage image;
   image.width = camera.width;
   image.height = camera.height;
   const std::size_t pixels = static_cast<std::size_t>(camera.width) * camera.height;
-  image.rgb.assign(pixels, dvec3(options.background[0], options.background[1], options.background[2]));
+  image.rgb.assign(pixels, dvec3(0.0));
   image.logTransmittance.assign(pixels, 0.0);
-  for (const Splat &s : prepare(cloud, camera, options)) {
+  image.stop.assign(pixels, 0);
+  std::vector<bool> done(pixels, false);
+  // Front to back, so from the end of the sorted list.
+  const std::vector<Splat> splats = prepare(cloud, camera, options);
+  for (std::size_t j = splats.size(); j-- > 0;) {
+    const Splat &s = splats[j];
     const double reach = options.noCutoffs ? 1e6 : s.radius;
     const int x0 = std::max(0, static_cast<int>(std::floor(s.center.x - reach)) - 1);
     const int x1 = std::min(camera.width - 1, static_cast<int>(std::ceil(s.center.x + reach)) + 1);
@@ -195,12 +200,34 @@ ReferenceImage reference_render(const GaussianCloud &cloud, const Camera &camera
         double power = 0.0, alpha = 0.0;
         if (!splat_at(s, x, y, d, power, alpha, options.noCutoffs)) continue;
         const std::size_t at = static_cast<std::size_t>(y) * camera.width + x;
-        image.rgb[at] = glm::mix(image.rgb[at], s.color, alpha);
-        image.logTransmittance[at] += std::log(1.0 - alpha);
+        if (done[at]) continue;
+        const double logRest = std::log(1.0 - alpha);
+        if (!options.noCutoffs && image.logTransmittance[at] + logRest < kLogMinTransmittance) {
+          image.stop[at] = j + 1;
+          done[at] = true;
+          continue;
+        }
+        image.rgb[at] += std::exp(image.logTransmittance[at]) * alpha * s.color;
+        if (contributions != nullptr) (*contributions)[s.index] += std::exp(image.logTransmittance[at]) * alpha;
+        image.logTransmittance[at] += logRest;
       }
     }
   }
+  const dvec3 background(options.background[0], options.background[1], options.background[2]);
+  for (std::size_t at = 0; at < pixels; ++at) image.rgb[at] += std::exp(image.logTransmittance[at]) * background;
   return image;
+}
+
+} // namespace
+
+ReferenceImage reference_render(const GaussianCloud &cloud, const Camera &camera, const ReferenceOptions &options) {
+  return composite(cloud, camera, options, nullptr);
+}
+
+std::vector<double> reference_contributions(const GaussianCloud &cloud, const Camera &camera, const ReferenceOptions &options) {
+  std::vector<double> contributions(cloud.size(), 0.0);
+  (void)composite(cloud, camera, options, &contributions);
+  return contributions;
 }
 
 ReferenceLoss reference_loss(const ReferenceImage &image, const std::vector<std::uint8_t> &target, double lambda) {
@@ -287,7 +314,9 @@ ParameterGradients reference_gradients(const GaussianCloud &cloud, const Camera 
 
   // train_backward.glsl
   std::vector<std::array<double, 9>> raw(n, std::array<double, 9>{});
-  for (const Splat &s : prepare(cloud, cam, options)) {
+  const std::vector<Splat> splats = prepare(cloud, cam, options);
+  for (std::size_t j = 0; j < splats.size(); ++j) {
+    const Splat &s = splats[j];
     auto &g = raw[s.index];
     const double reach = options.noCutoffs ? 1e6 : s.radius;
     const int x0 = std::max(0, static_cast<int>(std::floor(s.center.x - reach)) - 1);
@@ -300,6 +329,7 @@ ParameterGradients reference_gradients(const GaussianCloud &cloud, const Camera 
         double power = 0.0, alpha = 0.0;
         if (!splat_at(s, x, y, d, power, alpha, options.noCutoffs)) continue;
         const std::size_t at = static_cast<std::size_t>(y) * cam.width + x;
+        if (j < total.stop[at]) continue;
         const double logRest = std::log(1.0 - alpha);
         const double T = std::exp(total.logTransmittance[at] - logBehind[at] - logRest);
         const dvec3 A = adjoint[at], B = behind[at];

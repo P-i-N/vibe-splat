@@ -23,6 +23,10 @@ struct ViewerOptions {
   std::optional<TrainOptions> train;
 };
 
+// The trained scene of a project folder: splat.ply or splat.cgc, the newer if
+// both are there. Empty if neither is.
+[[nodiscard]] std::filesystem::path project_scene(const std::filesystem::path &project);
+
 // Opens a window and shows the scene until the user closes it. Returns the
 // process exit code.
 int run_viewer(const ViewerOptions &options);

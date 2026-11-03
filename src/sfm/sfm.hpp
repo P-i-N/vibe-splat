@@ -1,10 +1,15 @@
 #pragma once
 
+#include "ingest/ingest.hpp"
 #include "sfm/colmap_model.hpp"
 
 #include <filesystem>
 
 namespace splat {
+
+namespace vk {
+class Context;
+}
 
 struct SfmImportReport {
   ColmapStats stats;
@@ -31,9 +36,22 @@ struct SfmOptions {
   Matcher matcher = Matcher::Auto;
   int window = 8;  // Neighbours per image for the sequential matcher
   int threads = 0; // 0 uses all cores
+  vk::Context *gpu = nullptr; // Matches features on this device when set, on the CPU otherwise
+};
+
+// One camera's intrinsics before and after bundle adjustment.
+struct SfmCameraReport {
+  int id = 0;
+  int width = 0;
+  int height = 0;
+  FocalSource focalSource = FocalSource::Default; // Where the initial focal came from
+  double initialFocal = 0.0;                      // Pixels, from ingest
+  double focal = 0.0;                             // Pixels, after refinement (equal when manual)
+  double radial = 0.0;                            // SIMPLE_RADIAL k
 };
 
 struct SfmReport {
+  std::vector<SfmCameraReport> cameras;
   ColmapStats stats;
   std::size_t ingested = 0;
   std::size_t unregistered = 0;

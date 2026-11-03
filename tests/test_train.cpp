@@ -7,8 +7,11 @@
 #include "train/trainer.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <glm/gtc/constants.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <print>
 #include <random>
@@ -205,6 +208,98 @@ TEST_CASE("GPU loss and gradients match the CPU reference", "[train][vulkan]") {
   }
 }
 
+TEST_CASE("GPU forward and gradients match the CPU reference where pixels stop early", "[train][vulkan]") {
+  vk::Context *ctx = test::context();
+  if (ctx == nullptr) SKIP("No usable Vulkan device");
+  const Camera camera = test_camera(80, 60);
+  const auto target = noise_target(camera.width, camera.height, 19);
+  GaussianCloud cloud = random_cloud(400, 1, 17);
+  for (float &opacity : cloud.opacities) opacity = 5.f; // Nearly opaque, so most pixels stop early
+
+  const ReferenceImage image = reference_render(cloud, camera, {});
+  const auto stopped = std::count_if(image.stop.begin(), image.stop.end(), [](std::size_t stop) { return stop > 0; });
+  std::println("  {} of {} pixels stop early", stopped, image.stop.size());
+  REQUIRE(stopped > static_cast<std::ptrdiff_t>(image.stop.size() / 10));
+
+  Trainer trainer(*ctx, cloud);
+  const std::vector<float> gpu = trainer.render(camera);
+  double worst = 0.0, worstLog = 0.0;
+  for (std::size_t i = 0; i < image.rgb.size(); ++i) {
+    for (int c = 0; c < 3; ++c) worst = std::max(worst, std::abs(gpu[i * 4 + static_cast<std::size_t>(c)] - image.rgb[i][c]));
+    worstLog = std::max(worstLog, std::abs(gpu[i * 4 + 3] - image.logTransmittance[i]));
+  }
+  std::println("  forward: worst difference from CPU {:.6f}, log transmittance {:.6f}", worst, worstLog);
+  CHECK(worst < 1e-3);
+  CHECK(worstLog < 1e-2);
+
+  const ReferenceLoss cpuLoss = reference_loss(image, target, 0.2);
+  const ParameterGradients cpu = reference_gradients(cloud, camera, cpuLoss.adjoint, {});
+  for (const bool fixedPoint : {false, true}) {
+    TrainerOptions options;
+    options.forceFixedPoint = fixedPoint;
+    if (!fixedPoint && !ctx->info().floatAtomicAdd) continue;
+    Trainer gradients(*ctx, cloud, options);
+    const StepStats stats = gradients.compute_gradients(camera, target);
+    INFO("fixed point: " << fixedPoint);
+    CHECK_THAT(stats.loss, WithinAbs(cpuLoss.loss, 1e-3));
+    const auto g = gradients.gradients();
+    std::println("  {} atomics:", fixedPoint ? "fixed-point" : "float");
+    const double cosine = fixedPoint ? 0.97 : 0.999, ratio = fixedPoint ? 0.1 : 0.02;
+    const DensifyStats densifyStats = gradients.densify_stats();
+    check_close(to_double(densifyStats.contribution), reference_contributions(cloud, camera, {}), "contribution", cosine, ratio);
+    check_close(to_double(g.positions), cpu.positions, "positions", cosine, ratio);
+    check_close(to_double(g.scales), cpu.scales, "scales", cosine, ratio);
+    check_close(to_double(g.rotations), cpu.rotations, "rotations", cosine, ratio);
+    check_close(to_double(g.opacities), cpu.opacities, "opacities", cosine, ratio);
+    check_close(to_double(g.sh), cpu.sh, "sh", cosine, ratio);
+  }
+}
+
+TEST_CASE("The exposure transform's gradients match the CPU", "[train][vulkan]") {
+  vk::Context *ctx = test::context();
+  if (ctx == nullptr) SKIP("No usable Vulkan device");
+  const Camera camera = test_camera(72, 56);
+  const auto target = noise_target(camera.width, camera.height, 23);
+  const GaussianCloud cloud = random_cloud(60, 1, 29);
+  const Exposure exposure{1.1f, 0.05f, -0.02f, 0.03f, 0.02f, 0.9f, 0.04f, -0.01f, -0.03f, 0.06f, 1.05f, 0.02f};
+
+  const ReferenceImage image = reference_render(cloud, camera, {});
+  const auto exposed = [&](const Exposure &e) {
+    ReferenceImage out = image;
+    for (glm::dvec3 &rgb : out.rgb) {
+      const glm::dvec3 c = rgb;
+      for (int r = 0; r < 3; ++r) rgb[r] = e[r * 4] * c.r + e[r * 4 + 1] * c.g + e[r * 4 + 2] * c.b + e[r * 4 + 3];
+    }
+    return out;
+  };
+  // Central differences of the loss over the 12 values.
+  std::vector<double> numeric(12);
+  for (std::size_t k = 0; k < 12; ++k) {
+    Exposure up = exposure, down = exposure;
+    up[k] += 1e-3f;
+    down[k] -= 1e-3f;
+    numeric[k] = (reference_loss(exposed(up), target, 0.2).loss - reference_loss(exposed(down), target, 0.2).loss) / (static_cast<double>(up[k]) - down[k]);
+  }
+  // The Gaussians see the adjoint taken back through the transform.
+  ReferenceLoss loss = reference_loss(exposed(exposure), target, 0.2);
+  for (glm::dvec3 &g : loss.adjoint) {
+    const glm::dvec3 a = g;
+    for (int c = 0; c < 3; ++c) g[c] = a.r * exposure[c] + a.g * exposure[4 + c] + a.b * exposure[8 + c];
+  }
+  const ParameterGradients cpu = reference_gradients(cloud, camera, loss.adjoint, {});
+
+  Trainer trainer(*ctx, cloud);
+  trainer.set_exposure(exposure);
+  const StepStats stats = trainer.compute_gradients(camera, target);
+  CHECK_THAT(stats.loss, WithinAbs(loss.loss, 1e-3));
+  std::println("  exposure:");
+  check_close(to_double(std::vector<float>(stats.exposureGradient.begin(), stats.exposureGradient.end())), numeric, "transform", 0.999, 0.02);
+  const auto gpu = trainer.gradients();
+  const double cosine = trainer.uses_fixed_point() ? 0.97 : 0.999, ratio = trainer.uses_fixed_point() ? 0.1 : 0.02;
+  check_close(to_double(gpu.positions), cpu.positions, "positions", cosine, ratio);
+  check_close(to_double(gpu.sh), cpu.sh, "sh", cosine, ratio);
+}
+
 TEST_CASE("Adam matches a hand-computed step", "[train][vulkan]") {
   vk::Context *ctx = test::context();
   if (ctx == nullptr) SKIP("No usable Vulkan device");
@@ -232,6 +327,16 @@ TEST_CASE("Adam matches a hand-computed step", "[train][vulkan]") {
     if (g.opacities[i] == 0.f) continue;
     CHECK_THAT(after.opacities[i], WithinAbs(cloud.opacities[i] - (g.opacities[i] > 0.f ? rates.opacity : -rates.opacity), 2e-5));
   }
+
+  // A view that sees none of them moves nothing, despite the momentum.
+  Camera away = camera;
+  away.view = glm::rotate(glm::mat4(1.f), glm::pi<float>(), glm::vec3(0.f, 1.f, 0.f)) * camera.view;
+  trainer.compute_gradients(away, target);
+  trainer.apply_gradients(rates);
+  const GaussianCloud unseen = trainer.cloud();
+  CHECK(unseen.positions == after.positions);
+  CHECK(unseen.opacities == after.opacities);
+  CHECK(unseen.sh == after.sh);
 }
 
 TEST_CASE("Training overfits a single rendered view", "[train][vulkan]") {

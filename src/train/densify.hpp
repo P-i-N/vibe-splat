@@ -13,6 +13,7 @@ struct DensifyStats {
   std::vector<float> gradientSum; // Sum of |dLoss/dScreenPosition| over views that saw it, per half image
   std::vector<float> visits;      // How many views saw it
   std::vector<float> maxRadius;   // Largest size on screen, in pixels
+  std::vector<float> contribution; // Its blending weight T alpha summed over the pixels of those views
 };
 
 struct DensifyOptions {
@@ -44,6 +45,12 @@ struct DensifyResult {
 // Removes the given share of Gaussians, largest first: those cover the most
 // tiles, so they free the most memory. For when a view would not fit the budget.
 [[nodiscard]] DensifyResult remove_largest(const GaussianCloud &cloud, double share);
+
+// Removes the given share of Gaussians that add least to the images, by their
+// blending weight summed over every pixel of every training view (the global
+// significance of LightGaussian and Mini-Splatting). Most of a trained cloud
+// adds almost nothing: faint, hidden or tiny Gaussians the others cover.
+[[nodiscard]] DensifyResult remove_least_contributing(const GaussianCloud &cloud, const std::vector<float> &contribution, double share);
 
 [[nodiscard]] DensifyResult densify_cloud(const GaussianCloud &cloud, const DensifyStats &stats, const DensifyOptions &options,
                                           std::mt19937 &rng);

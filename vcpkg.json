@@ -12,6 +12,7 @@
     "stb",
     "nlohmann-json",
     "eigen3",
+    "liblzma",
     {
       "name": "imgui",
       "features": [

@@ -49,14 +49,15 @@ public:
   void upload(Context &ctx, std::span<const std::byte> data, VkDeviceSize offset = 0) const;
   // Reads the whole buffer back to the CPU and waits for completion.
   [[nodiscard]] std::vector<std::byte> download(Context &ctx) const;
+  // The same into `out`, which must hold the whole buffer.
+  void download_into(Context &ctx, std::span<std::byte> out) const;
 
   template <class T> void upload(Context &ctx, std::span<const T> data) const {
     upload(ctx, std::as_bytes(data));
   }
   template <class T> [[nodiscard]] std::vector<T> download_as(Context &ctx) const {
-    const auto bytes = download(ctx);
-    std::vector<T> out(bytes.size() / sizeof(T));
-    std::memcpy(out.data(), bytes.data(), out.size() * sizeof(T));
+    std::vector<T> out(static_cast<std::size_t>(size_) / sizeof(T));
+    download_into(ctx, std::as_writable_bytes(std::span(out)));
     return out;
   }
 

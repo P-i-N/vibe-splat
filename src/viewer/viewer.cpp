@@ -583,13 +583,17 @@ void Viewer::open_project(const fs::path &project) {
     points_->set_scene(GaussianCloud{});
   }
   trainOptions_.project = project;
-  if (trainOptions_.out.empty() || !options_.train) trainOptions_.out = project / "splat.ply";
+  if (trainOptions_.out.empty() || !options_.train) {
+    // Trained again in the format it was trained in before.
+    const fs::path previous = project_scene(project);
+    trainOptions_.out = project / (previous.empty() ? fs::path("splat.ply") : previous.filename());
+  }
   sceneName_ = project.filename().string();
 }
 
 void Viewer::open_scene(const fs::path &path) {
   const auto start = std::chrono::steady_clock::now();
-  const GaussianCloud cloud = load_ply(path);
+  const GaussianCloud cloud = load_cloud(path);
   const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
   std::println("Loaded {} Gaussians (SH degree {}) from {} in {:.0f} ms", cloud.size(), cloud.shDegree, path.string(), ms);
   renderer_->set_scene(cloud);
@@ -612,9 +616,9 @@ void Viewer::open_dropped(const fs::path &path) {
     renderer_->set_scene(GaussianCloud{});
     if (fs::is_directory(path)) {
       open_project(path);
-      if (fs::exists(path / "splat.ply")) open_scene(path / "splat.ply");
+      if (const fs::path scene = project_scene(path); !scene.empty()) open_scene(scene);
     } else {
-      // A .ply inside a project brings its cameras along.
+      // A scene inside a project brings its cameras along.
       const fs::path parent = path.parent_path();
       if (fs::exists(parent / "sparse" / "0" / "images.bin")) {
         open_project(parent);
@@ -846,7 +850,12 @@ void Viewer::handle_event(const SDL_Event &e) {
     const float panScale = 2.f * std::tan(glm::radians(orbit_.fovDeg * 0.5f)) / h * pixels_per_point();
     if (e.motion.state & SDL_BUTTON_LMASK) {
       unsnap();
-      orbit_.orbit(e.motion.xrel * 0.3f, e.motion.yrel * 0.3f);
+      // Looking around in place by default; Ctrl swings around the target instead.
+      if (SDL_GetModState() & SDL_KMOD_CTRL) {
+        orbit_.orbit(e.motion.xrel * 0.3f, e.motion.yrel * 0.3f);
+      } else {
+        orbit_.look(-e.motion.xrel * 0.2f, e.motion.yrel * 0.2f);
+      }
     } else if (e.motion.state & (SDL_BUTTON_RMASK | SDL_BUTTON_MMASK)) {
       unsnap();
       orbit_.pan(-e.motion.xrel * panScale, -e.motion.yrel * panScale);
@@ -1351,7 +1360,7 @@ void Viewer::build_ui() {
   overlay_photo();
   if (renderer_->splat_count() == 0 && points_->splat_count() == 0 && state_ != TrainState::Loading) {
     const ImGuiViewport *vp = ImGui::GetMainViewport();
-    const char *hint = "Drop a .ply or a project folder here";
+    const char *hint = "Drop a .ply, a .cgc or a project folder here";
     const ImVec2 size = ImGui::CalcTextSize(hint);
     ImGui::GetBackgroundDrawList()->AddText(ImVec2(vp->Pos.x + 0.5f * (vp->Size.x - size.x), vp->Pos.y + 0.5f * (vp->Size.y - size.y)),
                                             ImGui::GetColorU32(kDim), hint);
@@ -1409,7 +1418,7 @@ void Viewer::panel_help() {
       ImGui::TextColored(kDim, "H  help");
     } else {
       static constexpr const char *kRows[][2] = {
-          {"L / R drag", "orbit / pan"},
+          {"L / R drag", "look / pan  +Ctrl: orbit"},
           {"wheel", "zoom   +Ctrl: field of view"},
           {"WASD QE", "move   +Shift: faster"},
           {"F R T", "frame / reset / turntable"},
@@ -1466,6 +1475,14 @@ void Viewer::panel_training() {
     trainOptions_.iterations = std::max(trainOptions_.iterations, 1);
     trainOptions_.maxSize = std::max(trainOptions_.maxSize, 0);
     trainOptions_.holdout = std::max(trainOptions_.holdout, 0);
+    // CGC is far smaller; training itself is the same either way.
+    int format = cloud_format(trainOptions_.out) == CloudFormat::Cgc ? 1 : 0;
+    ImGui::TextColored(kDim, "save as");
+    ImGui::SameLine();
+    const bool ply = ImGui::RadioButton(".ply", &format, 0);
+    ImGui::SameLine();
+    const bool cgc = ImGui::RadioButton(".cgc (compressed)", &format, 1);
+    if (ply || cgc) trainOptions_.out.replace_extension(format == 1 ? ".cgc" : ".ply");
     ImGui::TextColored(kDim, "-> %s", trainOptions_.out.filename().string().c_str());
     if (ImGui::Button("Start training", ImVec2(width * 0.6f, 0.f))) pending_.push_back([this] { start_training(); });
     ImGui::TreePop();
@@ -1627,6 +1644,17 @@ void Viewer::overlay_toast() {
 }
 
 } // namespace
+
+fs::path project_scene(const fs::path &project) {
+  fs::path best;
+  for (const char *name : {"splat.ply", "splat.cgc"}) {
+    const fs::path candidate = project / name;
+    std::error_code error;
+    if (!fs::is_regular_file(candidate, error)) continue;
+    if (best.empty() || fs::last_write_time(candidate, error) > fs::last_write_time(best, error)) best = candidate;
+  }
+  return best;
+}
 
 int run_viewer(const ViewerOptions &options) {
   SdlSession sdl;

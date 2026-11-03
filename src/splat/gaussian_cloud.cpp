@@ -1,8 +1,11 @@
 #include "splat/gaussian_cloud.hpp"
 
+#include "splat/cgc.hpp"
+
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cctype>
 #include <charconv>
 #include <cmath>
 #include <cstring>
@@ -12,6 +15,7 @@
 #include <numbers>
 #include <optional>
 #include <random>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -365,6 +369,100 @@ void save_ply(const GaussianCloud &cloud, const std::filesystem::path &path) {
   if (!out) {
     throw std::runtime_error(std::format("Failed writing '{}'", path.string()));
   }
+}
+
+namespace {
+
+// Keeps the Gaussians for which keep(i) is true, in their current order, and
+// returns how many were dropped.
+template <class Keep> std::size_t compact(GaussianCloud &cloud, Keep keep) {
+  const std::size_t n = cloud.size();
+  const std::size_t floats = static_cast<std::size_t>(3 * cloud.shCoeffs());
+  std::size_t kept = 0;
+  for (std::size_t i = 0; i < n; ++i) {
+    if (!keep(i)) {
+      continue;
+    }
+    if (kept != i) {
+      std::copy_n(cloud.positions.begin() + static_cast<std::ptrdiff_t>(i * 3), 3, cloud.positions.begin() + static_cast<std::ptrdiff_t>(kept * 3));
+      std::copy_n(cloud.scales.begin() + static_cast<std::ptrdiff_t>(i * 3), 3, cloud.scales.begin() + static_cast<std::ptrdiff_t>(kept * 3));
+      std::copy_n(cloud.rotations.begin() + static_cast<std::ptrdiff_t>(i * 4), 4, cloud.rotations.begin() + static_cast<std::ptrdiff_t>(kept * 4));
+      cloud.opacities[kept] = cloud.opacities[i];
+      std::copy_n(cloud.sh.begin() + static_cast<std::ptrdiff_t>(i * floats), floats, cloud.sh.begin() + static_cast<std::ptrdiff_t>(kept * floats));
+    }
+    ++kept;
+  }
+  cloud.positions.resize(kept * 3);
+  cloud.scales.resize(kept * 3);
+  cloud.rotations.resize(kept * 4);
+  cloud.opacities.resize(kept);
+  cloud.sh.resize(kept * floats);
+  return n - kept;
+}
+
+} // namespace
+
+std::size_t remove_non_finite(GaussianCloud &cloud) {
+  const std::size_t floats = static_cast<std::size_t>(3 * cloud.shCoeffs());
+  const auto finite = [](std::span<const float> values) { return std::ranges::all_of(values, [](float v) { return std::isfinite(v); }); };
+  return compact(cloud, [&](std::size_t i) {
+    return finite(std::span(cloud.positions).subspan(i * 3, 3)) && finite(std::span(cloud.scales).subspan(i * 3, 3)) &&
+           finite(std::span(cloud.rotations).subspan(i * 4, 4)) && std::isfinite(cloud.opacities[i]) &&
+           finite(std::span(cloud.sh).subspan(i * floats, floats));
+  });
+}
+
+std::size_t prune_floaters(GaussianCloud &cloud, const PruneOptions &options) {
+  const bool bySize = options.maxSigma > 0.f;
+  const bool byDistance = options.maxRadiusFactor > 0.f;
+  if (!bySize && !byDistance) {
+    return 0;
+  }
+  // Scales are logs, so compare in log space and skip the exp per Gaussian.
+  const float maxLogScale = bySize ? std::log(options.maxSigma) : 0.f;
+  const Bounds bounds = byDistance ? compute_bounds(cloud) : Bounds{};
+  const float maxDistanceSq = byDistance ? (options.maxRadiusFactor * bounds.radius) * (options.maxRadiusFactor * bounds.radius) : 0.f;
+  return compact(cloud, [&](std::size_t i) {
+    if (bySize) {
+      const float *s = &cloud.scales[i * 3];
+      if (std::max({s[0], s[1], s[2]}) > maxLogScale) {
+        return false;
+      }
+    }
+    if (byDistance) {
+      const float dx = cloud.positions[i * 3 + 0] - bounds.center[0];
+      const float dy = cloud.positions[i * 3 + 1] - bounds.center[1];
+      const float dz = cloud.positions[i * 3 + 2] - bounds.center[2];
+      if (dx * dx + dy * dy + dz * dz > maxDistanceSq) {
+        return false;
+      }
+    }
+    return true;
+  });
+}
+
+CloudFormat cloud_format(const std::filesystem::path &path) {
+  std::string ext = path.extension().string();
+  std::ranges::transform(ext, ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return ext == ".cgc" ? CloudFormat::Cgc : CloudFormat::Ply;
+}
+
+void save_cloud(const GaussianCloud &cloud, const std::filesystem::path &path) { save_cloud(cloud, path, cloud_format(path)); }
+
+void save_cloud(const GaussianCloud &cloud, const std::filesystem::path &path, CloudFormat format) {
+  save_cloud(cloud, path, format, CgcOptions{});
+}
+
+void save_cloud(const GaussianCloud &cloud, const std::filesystem::path &path, CloudFormat format, const CgcOptions &options) {
+  if (format == CloudFormat::Cgc) {
+    save_cgc(cloud, path, options);
+  } else {
+    save_ply(cloud, path);
+  }
+}
+
+GaussianCloud load_cloud(const std::filesystem::path &path) {
+  return cloud_format(path) == CloudFormat::Cgc ? load_cgc(path) : load_ply(path);
 }
 
 GaussianCloud make_test_scene(std::size_t count, std::uint32_t seed) {
