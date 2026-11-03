@@ -28,6 +28,10 @@ struct TrainerOptions {
   bool forceFixedPoint = false; // Use the path for GPUs without float atomics
   // Adam leaves Gaussians out of view alone, which is about a tenth faster.
   bool selectiveAdam = true;
+  // 3DGS-MCMC's penalties on the loss: opacityReg * mean(sigmoid(opacity)) and
+  // scaleReg * mean(exp(scale)) over the Gaussians. 0 is off.
+  float opacityReg = 0.f;
+  float scaleReg = 0.f;
   bool poseGradients = false; // Fill StepStats::poseGradient, for refining cameras
   std::uint64_t memoryBudget = ~std::uint64_t{0}; // Bytes; never allocates beyond this
 };

@@ -67,6 +67,10 @@ struct ErrorMaskPush {
   std::uint32_t pixels;
   float share;
 };
+struct GradientPush {
+  float opacityReg, scaleReg; // Per Gaussian: the option divided by the count
+};
+
 struct ScorePush {
   std::uint32_t count;
   float toPixels, loss;
@@ -157,7 +161,7 @@ Trainer::Trainer(vk::Context &ctx, const GaussianCloud &initial, const TrainerOp
       score_(ctx, shaders::train_score_comp, 2, sizeof(ScorePush)), pose_(ctx, shaders::train_pose_comp, 4),
       hutchinson_(ctx, shaders::train_hutchinson_comp, 1, sizeof(HutchinsonPush)),
       curvature_(ctx, shaders::train_curvature_comp, 2, sizeof(CurvaturePush)),
-      secondOrder_(ctx, shaders::train_second_order_comp, 7, sizeof(SecondOrderPush)), gradient_(ctx, shaders::train_gradient_comp, 14),
+      secondOrder_(ctx, shaders::train_second_order_comp, 7, sizeof(SecondOrderPush)), gradient_(ctx, shaders::train_gradient_comp, 14, sizeof(GradientPush)),
       adam_(ctx, shaders::train_adam_comp, 4, sizeof(AdamPush)), gather_(ctx, shaders::train_gather_comp, 3, sizeof(GatherPush)),
       sorter_(ctx) {
   initial.validate();
@@ -432,7 +436,8 @@ void Trainer::record_backward_from_adjoint(VkCommandBuffer cmd) {
                       groups_[4]->values.get(), camera_.get(), rawGradients_.get(), groups_[0]->gradients.get(),
                       groups_[1]->gradients.get(), groups_[2]->gradients.get(), groups_[3]->gradients.get(), groups_[4]->gradients.get(),
                       splats_.get(), stats_.get()},
-                     std::span<const std::byte>{}, vk::div_up(count_, 256));
+                     GradientPush{options_.opacityReg / static_cast<float>(count_), options_.scaleReg / static_cast<float>(count_)},
+                     vk::div_up(count_, 256));
   vk::compute_barrier(cmd);
   if (options_.poseGradients) {
     pose_.dispatch(cmd, {groups_[0]->values.get(), groups_[0]->gradients.get(), camera_.get(), poseTotals_.get()}, std::span<const std::byte>{}, vk::div_up(count_, 256));

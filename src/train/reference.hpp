@@ -22,6 +22,8 @@ struct ReferenceOptions {
   // transmittance 1e-4. They are steps, which finite differences see and true
   // derivatives do not, so checking gradients needs them gone.
   bool noCutoffs = false;
+  float opacityReg = 0.f; // The 3DGS-MCMC penalties, as TrainerOptions
+  float scaleReg = 0.f;
 };
 
 struct ReferenceImage {

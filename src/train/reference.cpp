@@ -471,6 +471,15 @@ ParameterGradients reference_gradients(const GaussianCloud &cloud, const Camera 
       for (int c = 0; c < 3; ++c) out.sh[at + static_cast<std::size_t>(c)] = colour[c] > 0.0 ? basis[k] * gColour[c] : 0.0;
     }
   }
+  // 3DGS-MCMC's penalties, on every Gaussian whether or not a pixel saw it.
+  if (options.opacityReg > 0.f || options.scaleReg > 0.f) {
+    const double n = static_cast<double>(cloud.size());
+    for (std::size_t i = 0; i < cloud.size(); ++i) {
+      const double o = 1.0 / (1.0 + std::exp(-static_cast<double>(cloud.opacities[i])));
+      out.opacities[i] += options.opacityReg / n * o * (1.0 - o);
+      for (std::size_t a = 0; a < 3; ++a) out.scales[i * 3 + a] += options.scaleReg / n * std::exp(static_cast<double>(cloud.scales[i * 3 + a]));
+    }
+  }
   return out;
 }
 

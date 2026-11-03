@@ -53,6 +53,11 @@ struct TrainOptions {
   // The Gaussian count may grow to this multiple of the starting points (with
   // the adaptive schedule, raised by what the scene asks for); 0: no such cap.
   double maxGrowth = 4.0;
+  // 3DGS-MCMC's penalties on the loss, reg * mean(sigmoid(opacity)) and
+  // reg * mean(exp(scale)) over the Gaussians, so that unneeded ones fade and
+  // shrink. 0 is off.
+  float opacityReg = 0.f;
+  float scaleReg = 0.f;
   // Refine each training view's camera along with the Gaussians, for poses that are a little off.
   bool refinePoses = false;
   std::size_t densePoints = 50000;  // Start from up to this many more points, by patch matching

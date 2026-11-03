@@ -389,6 +389,8 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
   trainerOptions.lambdaSsim = options.lambdaSsim;
   trainerOptions.selectiveAdam = !options.fullAdam;
   trainerOptions.poseGradients = options.refinePoses;
+  trainerOptions.opacityReg = options.opacityReg;
+  trainerOptions.scaleReg = options.scaleReg;
   trainerOptions.nearPlane = static_cast<float>(typicalDepth * 0.01);
   // Asked for before anything is allocated, so that it is all ours to spend.
   double budgetGiB = options.vramBudgetGiB;

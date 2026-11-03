@@ -182,13 +182,18 @@ TEST_CASE("GPU loss and gradients match the CPU reference", "[train][vulkan]") {
   const auto target = noise_target(camera.width, camera.height, 11);
   const GaussianCloud cloud = random_cloud(60, 1, 13);
 
+  ReferenceOptions referenceOptions;
+  referenceOptions.opacityReg = 0.01f; // The penalties ride along, so that the twin is pinned too
+  referenceOptions.scaleReg = 0.01f;
   const ReferenceImage image = reference_render(cloud, camera, {});
   const ReferenceLoss cpuLoss = reference_loss(image, target, 0.2);
-  const ParameterGradients cpu = reference_gradients(cloud, camera, cpuLoss.adjoint, {});
+  const ParameterGradients cpu = reference_gradients(cloud, camera, cpuLoss.adjoint, referenceOptions);
 
   for (const bool fixedPoint : {false, true}) {
     TrainerOptions options;
     options.forceFixedPoint = fixedPoint;
+    options.opacityReg = referenceOptions.opacityReg;
+    options.scaleReg = referenceOptions.scaleReg;
     if (!fixedPoint && !ctx->info().floatAtomicAdd) continue;
     Trainer trainer(*ctx, cloud, options);
     CHECK(trainer.uses_fixed_point() == fixedPoint);
@@ -206,6 +211,34 @@ TEST_CASE("GPU loss and gradients match the CPU reference", "[train][vulkan]") {
     check_close(to_double(gpu.rotations), cpu.rotations, "rotations", cosine, ratio);
     check_close(to_double(gpu.opacities), cpu.opacities, "opacities", cosine, ratio);
     check_close(to_double(gpu.sh), cpu.sh, "sh", cosine, ratio);
+  }
+}
+
+TEST_CASE("Opacity and scale penalties add their gradient to every Gaussian", "[train][vulkan]") {
+  vk::Context *ctx = test::context();
+  if (ctx == nullptr) SKIP("No usable Vulkan device");
+  const Camera camera = test_camera(64, 48);
+  const auto target = noise_target(camera.width, camera.height, 5);
+  GaussianCloud cloud = random_cloud(20, 1, 9);
+  // Behind the camera: no pixel touches them, so the penalties are the whole gradient.
+  for (std::size_t i = 0; i < cloud.size(); ++i) cloud.positions[i * 3 + 2] = -5.f;
+  const auto n = static_cast<double>(cloud.size());
+  for (const float reg : {0.f, 0.5f}) {
+    TrainerOptions options;
+    options.opacityReg = reg;
+    options.scaleReg = reg * 0.5f;
+    Trainer trainer(*ctx, cloud, options);
+    trainer.compute_gradients(camera, target);
+    const auto g = trainer.gradients();
+    INFO("reg " << reg);
+    for (std::size_t i = 0; i < cloud.size(); ++i) {
+      const double o = 1.0 / (1.0 + std::exp(-static_cast<double>(cloud.opacities[i])));
+      CHECK_THAT(g.opacities[i], WithinAbs(reg / n * o * (1.0 - o), 1e-6));
+      for (std::size_t a = 0; a < 3; ++a) {
+        CHECK_THAT(g.scales[i * 3 + a], WithinAbs(options.scaleReg / n * std::exp(static_cast<double>(cloud.scales[i * 3 + a])), 1e-6));
+      }
+      CHECK(g.positions[i * 3] == 0.f);
+    }
   }
 }
 

@@ -132,6 +132,9 @@ train options (writes project/splat.ply and project/preview_*.png):
                           opposite ways do not cancel, above this (default 0.0012; 0: off)
   --dense-fraction <x>    Larger than this share of the scene: split; smaller: clone
                           (default 0.001)
+  --opacity-reg <x>       Penalise opacity by this times its mean, so that unneeded
+                          Gaussians fade (3DGS-MCMC uses 0.01; default 0)
+  --scale-reg <x>         Penalise size the same way (3DGS-MCMC uses 0.01; default 0)
   --densify-interval <n>  Iterations between densification rounds (default 100)
   --score-views <n>       Densify only Gaussians reaching many high-error pixels in
                           this many views per round (default 10; 0: off)
@@ -473,7 +476,7 @@ int cmd_train(const GlobalOptions &opts) {
   args.allow_only({"out", "iterations", "lambda-ssim", "sh-degree", "max-size", "max-views", "holdout", "seed", "report-every", "save-every",
                    "no-densify", "gradient-threshold", "vram-budget", "max-gaussians", "prune", "full-resolution", "exposure", "full-adam",
                    "threshold-rise", "split-threshold", "dense-fraction", "densify-interval", "score-views", "score-min-pixels", "explore",
-                   "significance-prune", "point-extent", "adaptive-schedule", "max-growth", "refine-poses", "second-order", "dense-init", "no-align"});
+                   "significance-prune", "point-extent", "adaptive-schedule", "max-growth", "opacity-reg", "scale-reg", "refine-poses", "second-order", "dense-init", "no-align"});
   if (args.positionals().size() != 1) {
     std::println(stderr, "Usage: splat train <project> [options]  (see splat --help)");
     return 2;
@@ -509,6 +512,8 @@ int cmd_train(const GlobalOptions &opts) {
   options.pointExtent = args.has("point-extent");
   options.adaptiveSchedule = args.has("adaptive-schedule");
   options.maxGrowth = std::max(args.number("max-growth", options.maxGrowth), 0.0);
+  options.opacityReg = std::max(args.number("opacity-reg", options.opacityReg), 0.f);
+  options.scaleReg = std::max(args.number("scale-reg", options.scaleReg), 0.f);
   options.refinePoses = args.has("refine-poses");
   options.secondOrder = args.has("second-order");
   options.densePoints = args.number<std::size_t>("dense-init", options.densePoints);

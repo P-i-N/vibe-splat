@@ -23,6 +23,13 @@ layout(std430, binding = 11) writeonly buffer GradSH { float gradSh[]; };
 layout(std430, binding = 12) readonly buffer Splats { TrainSplat splats[]; };
 layout(std430, binding = 13) buffer DensifyStats { DensifyStat densifyStats[]; };
 
+// 3DGS-MCMC's penalties, reg * mean(sigmoid(opacity)) and reg * mean(exp(scale))
+// over the Gaussians, already divided by their count.
+layout(push_constant) uniform Push {
+  float opacityReg;
+  float scaleReg;
+} pc;
+
 // tr(G A X J^T) for 2x2 symmetric G, with A and J 2x3 and X 3x3.
 float trace_term(mat2 G, mat3x2 A, mat3 X, mat3x2 J) {
   const mat2 product = G * (A * X * transpose(J));
@@ -41,6 +48,14 @@ void main() {
     touched = touched || raw[i * RAW_PER_SPLAT + k] != 0.0;
   }
   if (!touched) {
+    // Nothing from the pixels, but the penalties still apply.
+    if (pc.opacityReg > 0.0 || pc.scaleReg > 0.0) {
+      const float o = 1.0 / (1.0 + exp(-opacities[i]));
+      gradOpacities[i] = pc.opacityReg * o * (1.0 - o);
+      for (uint a = 0u; a < 3u; ++a) {
+        gradScales[i * 3u + a] = pc.scaleReg * exp(scales[i * 3u + a]);
+      }
+    }
     return;
   }
 
@@ -96,7 +111,7 @@ void main() {
   const mat3 G3 = transpose(T) * G * T;
   for (int a = 0; a < 3; ++a) {
     const vec3 axis = R[a];
-    gradScales[i * 3u + uint(a)] = 2.0 * s2[a] * dot(axis, G3 * axis);
+    gradScales[i * 3u + uint(a)] = 2.0 * s2[a] * dot(axis, G3 * axis) + pc.scaleReg * exp(logScale[a]); // Plus the penalty
   }
 
   // Rotation: dL = tr(P^T dR). The matrices are dR/dw, dR/dx, dR/dy, dR/dz of
@@ -119,7 +134,7 @@ void main() {
   gradRotations[i * 4u + 3u] = tangent.w;
 
   const float opacity = 1.0 / (1.0 + exp(-opacities[i]));
-  gradOpacities[i] = raw[at] * opacity * (1.0 - opacity);
+  gradOpacities[i] = (raw[at] + pc.opacityReg) * opacity * (1.0 - opacity);
 
   const vec3 gColour = vec3(raw[at + 6u], raw[at + 7u], raw[at + 8u]);
   float basis[16];
