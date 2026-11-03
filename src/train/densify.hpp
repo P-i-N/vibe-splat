@@ -74,4 +74,18 @@ struct DensifyResult {
 [[nodiscard]] DensifyResult densify_cloud(const GaussianCloud &cloud, const DensifyStats &stats, const DensifyOptions &options,
                                           std::mt19937 &rng);
 
+struct RelocateOptions {
+  float minOpacity = 0.005f; // At or below: dead, to be relocated
+  double growth = 0.05;      // Share of the count added per round, within maxGaussians
+  std::size_t maxGaussians = ~std::size_t{0};
+};
+
+// 3DGS-MCMC: dead Gaussians move onto live ones drawn in proportion to opacity,
+// then the count grows by `growth` the same way. A target that becomes N copies
+// gets opacity o' = 1 - (1 - o)^(1/N) and scale s * o / D, with
+// D = sum_{i=1..N} sum_{k=0..i-1} C(i-1, k) (-1)^k o'^(k+1) / sqrt(k+1), as in
+// gsplat. Every copy and its target start with fresh optimiser moments.
+// `cloned` counts the relocated dead, `seeded` the growth.
+[[nodiscard]] DensifyResult relocate_cloud(const GaussianCloud &cloud, const RelocateOptions &options, std::mt19937 &rng);
+
 } // namespace splat

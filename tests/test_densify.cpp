@@ -335,6 +335,84 @@ TEST_CASE("A growth factor of zero never caps", "[densify]") {
   CHECK(std::isinf(budget.final_count()));
 }
 
+namespace {
+float logit(float p) { return std::log(p / (1.f - p)); }
+// 3DGS-MCMC's scale divisor for a Gaussian that becomes n copies of opacity o.
+double relocation_divisor(int n, double o) {
+  double d = 0.0;
+  for (int i = 1; i <= n; ++i) {
+    for (int k = 0; k < i; ++k) {
+      double binom = 1.0;
+      for (int j = 1; j <= k; ++j) binom = binom * static_cast<double>(i - 1 - k + j) / j;
+      d += binom * (k % 2 == 0 ? 1.0 : -1.0) * std::pow(o, k + 1) / std::sqrt(static_cast<double>(k + 1));
+    }
+  }
+  return d;
+}
+} // namespace
+
+TEST_CASE("A dead Gaussian is relocated onto a live one", "[densify]") {
+  GaussianCloud cloud = line_of(2, 0.1f);
+  cloud.opacities[0] = logit(0.9f);
+  cloud.opacities[1] = logit(0.001f);
+  std::mt19937 rng(1);
+  RelocateOptions options;
+  options.maxGaussians = 2;
+  const DensifyResult result = relocate_cloud(cloud, options, rng);
+  REQUIRE(result.cloud.size() == 2);
+  CHECK(result.cloned == 1);
+  CHECK(result.seeded == 0);
+  const double newOpacity = 1.0 - std::sqrt(1.0 - 0.9);
+  const double newScale = 0.1 * 0.9 / relocation_divisor(2, newOpacity);
+  for (std::size_t i = 0; i < 2; ++i) {
+    INFO("Gaussian " << i);
+    CHECK(result.cloud.positions[i * 3] == 0.f);
+    CHECK_THAT(1.0 / (1.0 + std::exp(-result.cloud.opacities[i])), WithinAbs(newOpacity, 1e-5));
+    CHECK_THAT(std::exp(result.cloud.scales[i * 3]), WithinAbs(newScale, 1e-5));
+    CHECK(result.source[i] == -1);
+  }
+}
+
+TEST_CASE("Relocation targets are drawn in proportion to opacity", "[densify]") {
+  GaussianCloud cloud = line_of(1002, 0.1f);
+  cloud.opacities[0] = logit(0.9f);
+  cloud.opacities[1] = logit(0.09f);
+  for (std::size_t i = 2; i < 1002; ++i) cloud.opacities[i] = logit(0.001f);
+  std::mt19937 rng(1);
+  RelocateOptions options;
+  options.maxGaussians = 1002;
+  const DensifyResult result = relocate_cloud(cloud, options, rng);
+  REQUIRE(result.cloud.size() == 1002);
+  std::size_t onFirst = 0;
+  for (std::size_t i = 2; i < 1002; ++i) onFirst += result.cloud.positions[i * 3] == 0.f ? 1 : 0;
+  CHECK(onFirst > 850);
+  CHECK(onFirst < 950);
+}
+
+TEST_CASE("Growth adds five percent within the cap", "[densify]") {
+  const GaussianCloud cloud = line_of(1000, 0.1f);
+  std::mt19937 rng(1);
+  RelocateOptions options;
+  options.maxGaussians = 1030;
+  const DensifyResult grown = relocate_cloud(cloud, options, rng);
+  CHECK(grown.cloud.size() == 1030);
+  CHECK(grown.seeded == 30);
+  CHECK(grown.cloned == 0);
+  options.maxGaussians = 1000;
+  const DensifyResult capped = relocate_cloud(cloud, options, rng);
+  CHECK(capped.cloud.size() == 1000);
+  CHECK(capped.seeded == 0);
+}
+
+TEST_CASE("Relocation with no live Gaussian leaves the cloud alone", "[densify]") {
+  const GaussianCloud cloud = line_of(5, 0.1f, 0.001f);
+  std::mt19937 rng(1);
+  const DensifyResult result = relocate_cloud(cloud, RelocateOptions{}, rng);
+  CHECK(result.cloud.positions == cloud.positions);
+  CHECK(result.cloud.opacities == cloud.opacities);
+  CHECK(result.cloned == 0);
+}
+
 TEST_CASE("Patch matching finds points on a textured plane", "[densify]") {
   // Blobs on the plane z = 5, seen by cameras shifted sideways.
   std::mt19937 rng(11);

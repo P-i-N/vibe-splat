@@ -23,6 +23,10 @@ struct TrainOptions {
   int saveEvery = 5000; // 0 only saves at the end
 
   bool densify = true;
+  // How Gaussians are added and removed: the paper's clone, split and prune
+  // (Adc), or 3DGS-MCMC's relocation within the cap, with no opacity reset (Mcmc).
+  enum class DensifyMode { Adc, Mcmc };
+  DensifyMode densifyMode = DensifyMode::Adc;
   // Learn each view's exposure, so that the Gaussians need not take it up.
   // For photos whose exposure varies, as auto exposure in video does.
   bool exposure = false;

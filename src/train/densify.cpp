@@ -276,4 +276,99 @@ DensifyResult densify_cloud(const GaussianCloud &cloud, const DensifyStats &stat
   return result;
 }
 
+DensifyResult relocate_cloud(const GaussianCloud &cloud, const RelocateOptions &options, std::mt19937 &rng) {
+  const std::size_t n = cloud.size();
+  DensifyResult result;
+  result.cloud = cloud;
+  result.source.resize(n);
+  std::iota(result.source.begin(), result.source.end(), std::int64_t{0});
+  std::vector<std::size_t> alive, dead;
+  for (std::size_t i = 0; i < n; ++i) {
+    (sigmoid(cloud.opacities[i]) <= options.minOpacity || !all_finite(cloud, i) ? dead : alive).push_back(i);
+  }
+  if (alive.empty()) return result;
+  GaussianCloud &out = result.cloud;
+  const auto floats = static_cast<std::size_t>(3 * cloud.shCoeffs());
+
+  // Turns each drawn target into 1 + (times drawn) copies of equal weight.
+  constexpr int kMaxCopies = 51; // Beyond this the alternating sum below is numerically useless (gsplat's limit)
+  const auto update_targets = [&](const std::vector<std::size_t> &targets) {
+    std::vector<int> times(out.size(), 0);
+    for (const std::size_t t : targets) ++times[t];
+    for (std::size_t t = 0; t < out.size(); ++t) {
+      if (times[t] == 0) continue;
+      const int copies = std::min(times[t] + 1, kMaxCopies);
+      const double o = sigmoid(out.opacities[t]);
+      const double fresh = 1.0 - std::pow(1.0 - o, 1.0 / copies);
+      double divisor = 0.0;
+      for (int i = 1; i <= copies; ++i) {
+        double binom = 1.0; // C(i - 1, k), updated as k grows
+        for (int k = 0; k < i; ++k) {
+          if (k > 0) binom = binom * static_cast<double>(i - k) / k;
+          divisor += binom * (k % 2 == 0 ? 1.0 : -1.0) * std::pow(fresh, k + 1) / std::sqrt(static_cast<double>(k + 1));
+        }
+      }
+      const double clamped = std::clamp(fresh, static_cast<double>(options.minOpacity), 1.0 - 1e-6);
+      out.opacities[t] = static_cast<float>(std::log(clamped / (1.0 - clamped)));
+      const double factor = divisor > 0.0 ? o / divisor : 1.0;
+      for (std::size_t a = 0; a < 3; ++a) out.scales[t * 3 + a] += static_cast<float>(std::log(factor));
+      result.source[t] = -1;
+    }
+  };
+  const auto copy_into = [&](std::size_t from, std::size_t to) {
+    std::copy_n(out.positions.begin() + static_cast<std::ptrdiff_t>(from * 3), 3, out.positions.begin() + static_cast<std::ptrdiff_t>(to * 3));
+    std::copy_n(out.scales.begin() + static_cast<std::ptrdiff_t>(from * 3), 3, out.scales.begin() + static_cast<std::ptrdiff_t>(to * 3));
+    std::copy_n(out.rotations.begin() + static_cast<std::ptrdiff_t>(from * 4), 4, out.rotations.begin() + static_cast<std::ptrdiff_t>(to * 4));
+    out.opacities[to] = out.opacities[from];
+    std::copy_n(out.sh.begin() + static_cast<std::ptrdiff_t>(from * floats), floats, out.sh.begin() + static_cast<std::ptrdiff_t>(to * floats));
+  };
+  const auto draw = [&](const std::vector<std::size_t> &from, std::size_t count) {
+    std::vector<double> weights;
+    weights.reserve(from.size());
+    for (const std::size_t i : from) weights.push_back(sigmoid(out.opacities[i]));
+    std::discrete_distribution<std::size_t> pick(weights.begin(), weights.end());
+    std::vector<std::size_t> targets(count);
+    for (std::size_t &t : targets) t = from[pick(rng)];
+    return targets;
+  };
+
+  // The dead move onto live Gaussians.
+  if (!dead.empty()) {
+    const std::vector<std::size_t> targets = draw(alive, dead.size());
+    update_targets(targets);
+    for (std::size_t j = 0; j < dead.size(); ++j) {
+      copy_into(targets[j], dead[j]);
+      result.source[dead[j]] = -1;
+    }
+    result.cloned = dead.size();
+  }
+
+  // Growth, by the same draw over everything now alive.
+  const std::size_t room = options.maxGaussians > n ? options.maxGaussians - n : 0;
+  const auto wanted = std::min(static_cast<std::size_t>(options.growth * static_cast<double>(n)), room);
+  if (wanted > 0) {
+    std::vector<std::size_t> everyone(n);
+    std::iota(everyone.begin(), everyone.end(), std::size_t{0});
+    const std::vector<std::size_t> targets = draw(everyone, wanted);
+    update_targets(targets);
+    out.positions.reserve((n + wanted) * 3);
+    out.scales.reserve((n + wanted) * 3);
+    out.rotations.reserve((n + wanted) * 4);
+    out.opacities.reserve(n + wanted);
+    out.sh.reserve((n + wanted) * floats);
+    for (const std::size_t t : targets) {
+      const std::size_t at = out.size();
+      out.positions.resize(at * 3 + 3);
+      out.scales.resize(at * 3 + 3);
+      out.rotations.resize(at * 4 + 4);
+      out.opacities.resize(at + 1);
+      out.sh.resize((at + 1) * floats);
+      copy_into(t, at);
+      result.source.push_back(-1);
+    }
+    result.seeded = wanted;
+  }
+  return result;
+}
+
 } // namespace splat

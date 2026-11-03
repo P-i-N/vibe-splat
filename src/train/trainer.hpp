@@ -138,6 +138,8 @@ public:
   // Replaces Gaussians by densify_cloud() from what has been collected, keeping
   // the optimiser state of survivors, and starts collecting anew.
   DensifyResult densify(DensifyOptions options, std::mt19937 &rng);
+  // 3DGS-MCMC relocation and growth in place of densify(); see relocate_cloud().
+  DensifyResult relocate(const RelocateOptions &options, std::mt19937 &rng);
 
   // Caps opacity, so that Gaussians no longer needed fade below the prune limit.
   void reset_opacity(float maximum);

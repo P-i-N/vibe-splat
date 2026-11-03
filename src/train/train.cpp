@@ -619,14 +619,20 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
         // times the starting points, and 4 keeps 7000 iterations above 100 it/s.
         densifyOptions.maxGaussians = std::min(densifyOptions.maxGaussians, growth.limit(1.0, 1.0));
       }
-      const DensifyResult result = trainer.densify(densifyOptions, densifyRng);
-      if (options.adaptiveSchedule) growth.observe(result.cloned + result.split + result.heldBack);
-      report.heldBack += result.heldBack;
-      // Not on the last round: as in the paper, and the cloud would have
-      // no densification left to recover with.
-      if (iteration % kOpacityResetInterval == 0 && iteration < densifyUntil) {
-        trainer.reset_opacity(kResetOpacity);
-        lastOpacityReset = iteration;
+      if (options.densifyMode == TrainOptions::DensifyMode::Mcmc) {
+        RelocateOptions relocateOptions;
+        relocateOptions.maxGaussians = densifyOptions.maxGaussians;
+        trainer.relocate(relocateOptions, densifyRng);
+      } else {
+        const DensifyResult result = trainer.densify(densifyOptions, densifyRng);
+        if (options.adaptiveSchedule) growth.observe(result.cloned + result.split + result.heldBack);
+        report.heldBack += result.heldBack;
+        // Not on the last round: as in the paper, and the cloud would have
+        // no densification left to recover with.
+        if (iteration % kOpacityResetInterval == 0 && iteration < densifyUntil) {
+          trainer.reset_opacity(kResetOpacity);
+          lastOpacityReset = iteration;
+        }
       }
       densifySeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - densifyStart).count();
       ++densifyRounds;

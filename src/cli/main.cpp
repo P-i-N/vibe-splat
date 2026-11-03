@@ -115,6 +115,8 @@ train options (writes project/splat.ply and project/preview_*.png):
   --report-every <n>      Default 500
   --save-every <n>        Save the output this often, 0 only at the end (default 5000)
   --no-densify            Keep the initial Gaussians, without adding or removing any
+  --densify <mode>        adc: clone, split and prune as in the paper (default);
+                          mcmc: relocate the transparent and grow by sampling (3DGS-MCMC)
   --full-resolution       Train at full size from the start, rather than coarse to fine
   --full-adam             Update every Gaussian each step, not only those in view:
                           about a tenth slower, with no clear gain in quality
@@ -474,7 +476,7 @@ int cmd_train(const GlobalOptions &opts) {
   }
   const splat::cli::Args args(rest, {"--no-densify", "--full-resolution", "--exposure", "--full-adam", "--significance-prune", "--point-extent", "--adaptive-schedule", "--refine-poses", "--second-order", "--no-align"});
   args.allow_only({"out", "iterations", "lambda-ssim", "sh-degree", "max-size", "max-views", "holdout", "seed", "report-every", "save-every",
-                   "no-densify", "gradient-threshold", "vram-budget", "max-gaussians", "prune", "full-resolution", "exposure", "full-adam",
+                   "no-densify", "densify", "gradient-threshold", "vram-budget", "max-gaussians", "prune", "full-resolution", "exposure", "full-adam",
                    "threshold-rise", "split-threshold", "dense-fraction", "densify-interval", "score-views", "score-min-pixels", "explore",
                    "significance-prune", "point-extent", "adaptive-schedule", "max-growth", "opacity-reg", "scale-reg", "refine-poses", "second-order", "dense-init", "no-align"});
   if (args.positionals().size() != 1) {
@@ -494,6 +496,12 @@ int cmd_train(const GlobalOptions &opts) {
   options.reportEvery = std::max(args.number("report-every", options.reportEvery), 1);
   options.saveEvery = std::max(args.number("save-every", options.saveEvery), 0);
   options.densify = !args.has("no-densify");
+  if (const std::string mode = args.get("densify", "adc"); mode == "mcmc") {
+    options.densifyMode = splat::TrainOptions::DensifyMode::Mcmc;
+  } else if (mode != "adc") {
+    std::println(stderr, "--densify must be adc or mcmc, not {}", mode);
+    return 2;
+  }
   options.fullResolution = args.has("full-resolution");
   options.exposure = args.has("exposure");
   options.fullAdam = args.has("full-adam");

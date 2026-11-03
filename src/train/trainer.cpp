@@ -683,6 +683,13 @@ DensifyResult Trainer::densify(DensifyOptions options, std::mt19937 &rng) {
   return result;
 }
 
+DensifyResult Trainer::relocate(const RelocateOptions &options, std::mt19937 &rng) {
+  DensifyResult result = relocate_cloud(cloud(), options, rng);
+  if (result.cloud.empty()) throw std::runtime_error("relocation removed every Gaussian");
+  apply_changes(result);
+  return result;
+}
+
 void Trainer::reset_densify_stats() {
   ctx_.submit_and_wait([&](VkCommandBuffer cmd) {
     clear(cmd, *stats_);
