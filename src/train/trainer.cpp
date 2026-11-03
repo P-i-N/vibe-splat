@@ -720,6 +720,12 @@ std::size_t Trainer::remove_least_contributing_gaussians(double share) {
   return result.pruned;
 }
 
+std::size_t Trainer::remove_least_opaque_gaussians(double share) {
+  const DensifyResult result = remove_least_opaque(cloud(), share);
+  apply_changes(result);
+  return result.pruned;
+}
+
 std::size_t Trainer::remove_largest_gaussians(double share) {
   const DensifyResult result = remove_largest(cloud(), share);
   apply_changes(result);

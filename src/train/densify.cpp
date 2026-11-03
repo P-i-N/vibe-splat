@@ -106,6 +106,12 @@ DensifyResult remove_least_contributing(const GaussianCloud &cloud, const std::v
   return remove_highest(cloud, keys, share);
 }
 
+DensifyResult remove_least_opaque(const GaussianCloud &cloud, double share) {
+  std::vector<float> keys(cloud.size());
+  for (std::size_t i = 0; i < cloud.size(); ++i) keys[i] = -cloud.opacities[i];
+  return remove_highest(cloud, keys, share);
+}
+
 DensifyResult densify_cloud(const GaussianCloud &cloud, const DensifyStats &stats, const DensifyOptions &options, std::mt19937 &rng) {
   const std::size_t n = cloud.size();
   if (stats.gradientSum.size() != n || stats.visits.size() != n || stats.maxRadius.size() != n) {

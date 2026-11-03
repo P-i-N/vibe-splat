@@ -145,6 +145,8 @@ train options (writes project/splat.ply and project/preview_*.png):
                           (--mip-filter-2d and --mip-filter-3d: one of the two)
   --edge-split            Split in proportion to the edges a Gaussian covers, into two
                           children along its longest axis (Improving Densification)
+  --recovery-prune <x>    300 iterations after each opacity reset, remove this share of
+                          Gaussians, the least opaque (Improving Densification; default 0)
   --densify-interval <n>  Iterations between densification rounds (default 100)
   --score-views <n>       Densify only Gaussians reaching many high-error pixels in
                           this many views per round (default 10; 0: off)
@@ -486,7 +488,7 @@ int cmd_train(const GlobalOptions &opts) {
   args.allow_only({"out", "iterations", "lambda-ssim", "sh-degree", "max-size", "max-views", "holdout", "seed", "report-every", "save-every",
                    "no-densify", "densify", "gradient-threshold", "vram-budget", "max-gaussians", "prune", "full-resolution", "exposure", "full-adam",
                    "threshold-rise", "split-threshold", "dense-fraction", "densify-interval", "score-views", "score-min-pixels", "explore",
-                   "significance-prune", "point-extent", "adaptive-schedule", "max-growth", "opacity-reg", "scale-reg", "position-noise", "mip-filter", "mip-filter-2d", "mip-filter-3d", "edge-split", "refine-poses", "second-order", "dense-init", "no-align"});
+                   "significance-prune", "point-extent", "adaptive-schedule", "max-growth", "opacity-reg", "scale-reg", "position-noise", "mip-filter", "mip-filter-2d", "mip-filter-3d", "edge-split", "recovery-prune", "refine-poses", "second-order", "dense-init", "no-align"});
   if (args.positionals().size() != 1) {
     std::println(stderr, "Usage: splat train <project> [options]  (see splat --help)");
     return 2;
@@ -534,6 +536,7 @@ int cmd_train(const GlobalOptions &opts) {
   options.mipFilter2d = args.has("mip-filter") || args.has("mip-filter-2d");
   options.mipFilter3d = args.has("mip-filter") || args.has("mip-filter-3d");
   options.edgeSplit = args.has("edge-split");
+  options.recoveryPrune = std::clamp(args.number("recovery-prune", options.recoveryPrune), 0.0, 0.95);
   options.refinePoses = args.has("refine-poses");
   options.secondOrder = args.has("second-order");
   options.densePoints = args.number<std::size_t>("dense-init", options.densePoints);

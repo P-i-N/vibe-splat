@@ -76,6 +76,11 @@ struct DensifyResult {
 // adds almost nothing: faint, hidden or tiny Gaussians the others cover.
 [[nodiscard]] DensifyResult remove_least_contributing(const GaussianCloud &cloud, const std::vector<float> &contribution, double share);
 
+// Removes the given share of Gaussians, the least opaque first. Some time after
+// an opacity reset, those still faint have not recovered: they were fitting
+// single views (recovery-aware pruning, Improving Densification in 3DGS).
+[[nodiscard]] DensifyResult remove_least_opaque(const GaussianCloud &cloud, double share);
+
 [[nodiscard]] DensifyResult densify_cloud(const GaussianCloud &cloud, const DensifyStats &stats, const DensifyOptions &options,
                                           std::mt19937 &rng);
 

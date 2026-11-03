@@ -659,6 +659,14 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
       ++densifyRounds;
     }
 
+    constexpr int kRecoveryDelay = 300;
+    if (options.recoveryPrune > 0.0 && lastOpacityReset > 0 && iteration == lastOpacityReset + kRecoveryDelay) {
+      const std::size_t before = trainer.gaussian_count();
+      const std::size_t removed = trainer.remove_least_opaque_gaussians(options.recoveryPrune);
+      bar.message(std::format("  iteration {}: removed {} of {} Gaussians, the least opaque since the reset", iteration, removed, before));
+      refresh_filter(iteration);
+    }
+
     if (reportDue) {
       const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
       report.progressPsnr.emplace_back(iteration, probePsnr);

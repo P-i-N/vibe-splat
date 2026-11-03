@@ -163,6 +163,8 @@ public:
   // Removes the given share of Gaussians that contributed least since the
   // statistics started. See remove_least_contributing().
   std::size_t remove_least_contributing_gaussians(double share);
+  // Removes the least opaque share, see remove_least_opaque().
+  std::size_t remove_least_opaque_gaussians(double share);
 
   // Average GPU time per iteration in milliseconds, by stage, in order.
   [[nodiscard]] std::vector<std::pair<std::string, double>> timings() const;

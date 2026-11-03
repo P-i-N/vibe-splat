@@ -470,6 +470,18 @@ TEST_CASE("All edge scores zero splits every candidate", "[densify]") {
   CHECK(result.cloud.size() == 200);
 }
 
+TEST_CASE("Recovery-aware pruning removes the least opaque share", "[densify]") {
+  GaussianCloud cloud = line_of(10, 0.1f);
+  for (std::size_t i = 0; i < 10; ++i) cloud.opacities[i] = logit(0.1f * static_cast<float>(i + 1) - 0.05f);
+  const DensifyResult result = remove_least_opaque(cloud, 0.2);
+  REQUIRE(result.cloud.size() == 8);
+  CHECK(result.pruned == 2);
+  for (std::size_t i = 0; i < 8; ++i) {
+    CHECK(result.cloud.positions[i * 3] == static_cast<float>(i + 2)); // The two least opaque, at x = 0 and 1, are gone
+    CHECK(result.source[i] == static_cast<std::int64_t>(i + 2));
+  }
+}
+
 TEST_CASE("The smoothing filter is the smallest footprint of the cameras that see a Gaussian", "[densify]") {
   const auto camera_at = [](float z) {
     Camera camera = Camera::look_at(glm::vec3(0.f, 0.f, z), glm::vec3(0.f), glm::vec3(0.f, -1.f, 0.f), 60.f, 64, 48);

@@ -71,6 +71,9 @@ struct TrainOptions {
   bool mipFilter3d = false;
   // Edge-aware long-axis splitting, see DensifyOptions::edgeSplit.
   bool edgeSplit = false;
+  // This share of Gaussians, the least opaque, is removed 300 iterations after
+  // each opacity reset (recovery-aware pruning, Improving Densification in 3DGS). 0: none.
+  double recoveryPrune = 0.0;
   // Refine each training view's camera along with the Gaussians, for poses that are a little off.
   bool refinePoses = false;
   std::size_t densePoints = 50000;  // Start from up to this many more points, by patch matching
