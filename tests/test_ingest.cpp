@@ -1,13 +1,16 @@
 #include "ingest/exif.hpp"
 #include "ingest/image.hpp"
 #include "ingest/ingest.hpp"
+#include "ingest/video.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <random>
 #include <string>
@@ -445,9 +448,9 @@ TEST_CASE("Ingesting photos applies EXIF, downscaling and manual intrinsics", "[
   fs::remove_all(dir);
 }
 
-#ifdef SPLAT_WITH_VIDEO
-
 namespace {
+
+#ifdef SPLAT_WITH_VIDEO
 
 // Writes a short MPEG-4 video: a moving checkerboard, blurred except for one
 // frame in each second, with an optional rotation flag like a phone would set.
@@ -523,9 +526,25 @@ void write_test_video(const fs::path &path, int seconds, int fps, int rotationCc
   avformat_free_context(format);
 }
 
+#else
+
+// The same video, made by the ffmpeg program that this build reads videos with.
+void write_test_video(const fs::path &path, int seconds, int fps, int rotationCcw) {
+  REQUIRE(rotationCcw == 0);
+  const std::string command = std::format(
+      "ffmpeg -y -hide_banner -loglevel error -f lavfi -i testsrc2=size=320x240:rate={0}:duration={1} "
+      "-vf \"drawbox=x=0:y=0:w=iw:h=ih:color=gray:t=fill:enable='not(eq(mod(n,{0}),{2}))'\" "
+      "-c:v mpeg4 -q:v 2 -g 1 -pix_fmt yuv420p \"{3}\"",
+      fps, seconds, fps / 2, path.string());
+  REQUIRE(std::system(command.c_str()) == 0);
+}
+
+#endif
+
 } // namespace
 
 TEST_CASE("Video extraction keeps the sharpest frame of each interval", "[ingest][video]") {
+  if (!video_supported()) SKIP("ffmpeg is not on PATH");
   const fs::path dir = temp_dir("splat_ingest_video");
   write_test_video(dir / "clip.mp4", 4, 10, 0);
 
@@ -556,6 +575,8 @@ TEST_CASE("Video extraction keeps the sharpest frame of each interval", "[ingest
   fs::remove_all(dir);
 }
 
+#ifdef SPLAT_WITH_VIDEO
+
 TEST_CASE("Video rotation metadata is applied", "[ingest][video]") {
   const fs::path dir = temp_dir("splat_ingest_rotated");
   // Phones shooting portrait store landscape frames with a -90 degree matrix.
@@ -570,7 +591,10 @@ TEST_CASE("Video rotation metadata is applied", "[ingest][video]") {
   fs::remove_all(dir);
 }
 
+#endif
+
 TEST_CASE("Ingesting a video writes frames and a manifest", "[ingest][video]") {
+  if (!video_supported()) SKIP("ffmpeg is not on PATH");
   const fs::path dir = temp_dir("splat_ingest_full_video");
   write_test_video(dir / "clip.mp4", 3, 10, 0);
   IngestOptions options;
@@ -590,5 +614,3 @@ TEST_CASE("Ingesting a video writes frames and a manifest", "[ingest][video]") {
   CHECK(m.cameras[0].width == 320);
   fs::remove_all(dir);
 }
-
-#endif

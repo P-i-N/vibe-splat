@@ -49,7 +49,7 @@ the later stages to read. Rerun it with `--force` to replace them.
 
 - **Photos** can be JPEG, PNG, BMP or TGA. HEIC and raw files need converting
   first. EXIF orientation is applied, so stored images are always upright.
-- **Videos** (needs a build with FFmpeg) keep the sharpest frame of each interval
+- **Videos** (needs a build with FFmpeg, or `ffmpeg` 5.1+ on PATH) keep the sharpest frame of each interval
   of 1/`--fps` seconds, since motion blur ruins training images. Rotation
   metadata is applied.
 - **Size**: the longest side is reduced to `--max-size` (default 1600).
@@ -266,7 +266,8 @@ appears upside down, pass `--up +y` (or `+z`/`-z`).
 Requirements: CMake 3.28+, Ninja, git, and a C++23 compiler (GCC 14+,
 Clang 18+ or Visual Studio 2022 17.10+). Video input uses the system's FFmpeg
 6.1 or newer, found through pkg-config (Ubuntu: `libavformat-dev libavcodec-dev
-libswscale-dev`); without it, `splat ingest` handles photos only. Everything else, including the
+libswscale-dev`); without it, `splat ingest` runs the `ffmpeg` program from PATH
+(5.1 or newer) for videos, or handles photos only. Everything else, including the
 shader compiler, is fetched and built by vcpkg, which is a git submodule.
 
 ```
