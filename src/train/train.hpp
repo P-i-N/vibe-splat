@@ -17,7 +17,7 @@ struct TrainOptions {
   int shDegree = 3;
   int maxSize = 0;  // Shrink images to this; 0 keeps their size
   int maxViews = 0; // Use only the first n views; 0 uses all
-  int holdout = 0;  // Keep every nth view out of training; 0 trains on all
+  int holdout = 0;  // Keep the first and every nth view out of training, as 3DGS does; 0 trains on all
   std::uint32_t seed = 1;
   int reportEvery = 500;
   int saveEvery = 5000; // 0 only saves at the end

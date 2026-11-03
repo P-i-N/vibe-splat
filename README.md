@@ -183,8 +183,9 @@ Images are undistorted when loaded, since the renderer is a pinhole camera.
 `src/train/reference.cpp` has every kernel again on the CPU: the tests check it
 against finite differences, and the GPU against it.
 
-`--holdout 8` keeps every 8th view out of training and reports PSNR on those,
-which says more about quality than PSNR on images it has seen.
+`--holdout 8` keeps the first and every 8th view out of training, the split 3DGS
+uses, and reports PSNR on those, which says more about quality than PSNR on
+images it has seen.
 
 ## How rendering works
 

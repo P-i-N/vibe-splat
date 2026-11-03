@@ -109,7 +109,8 @@ train options (writes project/splat.ply and project/preview_*.png):
   --sh-degree <0-3>       Default 3
   --max-size <px>         Shrink training images to this (default: keep size)
   --max-views <n>         Use only the first n views
-  --holdout <n>           Keep every nth view out of training, to measure quality
+  --holdout <n>           Keep the first and every nth view out of training, to
+                          measure quality on the same views as 3DGS does
   --seed <n>              Default 1
   --report-every <n>      Default 500
   --save-every <n>        Save the output this often, 0 only at the end (default 5000)

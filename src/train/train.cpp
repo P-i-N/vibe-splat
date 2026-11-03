@@ -325,7 +325,11 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
   for (const auto &[id, image] : model.images) {
     if (options.maxViews > 0 && number >= options.maxViews) break;
     View view = load_view(options.project, image, model.cameras.at(image.cameraId), options.maxSize);
-    if (options.holdout > 0 && number % options.holdout == options.holdout - 1) {
+    // The first view and every nth after it, as 3DGS and gsplat split, so that
+    // held-out PSNRs compare with published ones. On the Mip-NeRF 360 bicycle
+    // scene the photos alternate between tilted down and tilted up, and holding
+    // out the nth instead of the first tested only the upward ones: 4 dB less.
+    if (options.holdout > 0 && number % options.holdout == 0) {
       holdoutViews.push_back(std::move(view));
     } else {
       trainViews.push_back(std::move(view));
