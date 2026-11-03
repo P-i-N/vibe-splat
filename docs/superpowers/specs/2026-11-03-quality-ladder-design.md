@@ -1,7 +1,7 @@
 # Quality ladder for 7000-iteration training
 
 Date: 2026-11-03
-Status: approved 2026-11-03, in progress
+Status: done 2026-11-03; results at the end
 Branch: claude/training-sota
 
 ## Intent
@@ -261,3 +261,36 @@ targets the colour speckle seen on the sky-facing views. Cost: nil.
 - Test design within the existing Catch2 files.
 - The order of the sub-measurements inside a rung, as long as each option is
   measured on its own and the rung ends with the winning combination.
+
+## Results
+
+Bicycle scene, `images_4`, official split, 7000 iterations, held-out PSNR on
+the owner's RTX 4070 Laptop, two runs each unless one is listed. The baseline
+before the ladder was the adaptive schedule with growth 5: 23.42 / 23.44 dB,
+365k Gaussians, about 140 it/s.
+
+| Rung | Configuration | Held-out dB | Gaussians | it/s | Kept |
+|---|---|---|---|---|---|
+| 0 | adaptive, no cap / growth 8 / 12 | 23.59 / 23.49-23.58 | 600k / 400-500k | 88-123 | no |
+| 0 | fixed schedule, no cap | 24.29 / 24.19 | 617-702k | 88-90 | no |
+| 0 | fixed, 400k / 450k / 500k / 600k | 24.08 / 24.14 / 24.19 / 24.23 | | 104 / 102 / 93 / 91 | |
+| 0 | **fixed, growth 4 (new default)** | **24.11, 24.10** | **417k** | **107-117** | **yes** |
+| 1 | `--opacity-reg 0.01 --scale-reg 0.01` | 22.98 / 22.52 | 270k | 104-110 | no |
+| 1 | `--densify mcmc` | 23.19 / 23.18 | 417k | 76-83 | no |
+| 1 | `--densify mcmc --position-noise 5e5` | 23.31 / 23.27 | 417k | 76-90 | no |
+| 1 | all four | 23.72 / 23.70 | 417k | 84-91 | no |
+| 2 | `--mip-filter` | 24.02 / 24.07 | 417k | 95-98 | no |
+| 2 | `--mip-filter-2d` / `--mip-filter-3d` | 24.08 / 24.09 | 417k | 108 / 96 | no |
+| 3 | `--edge-split` | 22.65 / 22.63 | 86k | 168-184 | no |
+| 3 | `--recovery-prune 0.2` | 24.15 / 24.20 | 405k | 104-119 | no |
+| 3 | both | 22.62 / 22.55 | 70k | 177-190 | no |
+| 4 | `--sh-dropout 0.2` | 24.08 / 24.09 | 417k | 116 | no |
+
+The ladder's gain is rung 0's 0.7 dB, from the fixed 15% / 35% coarse-to-fine
+schedule in place of the adaptive one. Every technique from the literature
+is in as an option, off: at 7000 iterations none of them beats the baseline
+by the 0.2 dB this design asked for, and 3DGS-MCMC and the 3D filter also cost
+speed. Two are worth another look under a different rule than this ladder's:
+recovery pruning is as good and a little faster, and edge-aware splitting
+reaches 22.6 dB with a fifth of the Gaussians at 1.7 times the speed, so a
+split probability that starves growth less might do better than either.
