@@ -18,6 +18,10 @@ layout(std430, binding = 6) writeonly buffer Splats { TrainSplat splats[]; };
 layout(std430, binding = 7) writeonly buffer Keys { uint keys[]; };
 layout(std430, binding = 8) writeonly buffer Values { uint values[]; };
 
+layout(push_constant) uniform Push {
+  uint mipFilter; // Mip-Splatting's 2D filter instead of the 0.3 dilation
+} pc;
+
 void main() {
   const uint i = gl_GlobalInvocationID.x;
   if (i >= cam.counts.x) {
@@ -58,12 +62,23 @@ void main() {
   const mat3 T = J * mat3(cam.view);
   const mat3 cov = T * sigma * transpose(T);
 
-  const float a = cov[0][0] + 0.3;
+  // Low-pass: the paper's 0.3 pixel dilation, or Mip-Splatting's 0.1 with the
+  // opacity scaled to keep the integral.
+  const float dilation = pc.mipFilter != 0u ? 0.1 : 0.3;
+  const float a = cov[0][0] + dilation;
   const float b = cov[0][1];
-  const float c = cov[1][1] + 0.3;
+  const float c = cov[1][1] + dilation;
   const float det = a * c - b * b;
   if (!(det > MIN_CONIC_DETERMINANT)) {
     return;
+  }
+  float opacityUsed = opacity;
+  if (pc.mipFilter != 0u) {
+    const float rawDet = cov[0][0] * cov[1][1] - b * b;
+    opacityUsed = rawDet > 0.0 ? opacity * sqrt(rawDet / det) : 0.0;
+    if (!(opacityUsed >= 1.0 / 255.0)) {
+      return;
+    }
   }
   const float mid = 0.5 * (a + c);
   const float lambda = mid + sqrt(max(0.1, mid * mid - det));
@@ -93,13 +108,13 @@ void main() {
   // Its bounding box is often far smaller than the square of radius 3 sigma, above
   // all at low opacity, and how much is computed depends on that area. So this
   // is what makes training fast, and leaves the picture exactly the same.
-  const float reach = 2.0 * log(255.0 * opacity);
+  const float reach = 2.0 * log(255.0 * opacityUsed);
   const vec2 extent = min(vec2(sqrt(reach * a), sqrt(reach * c)), vec2(radius));
 
   const float gridW = ceil(cam.viewport.x / float(TILE_SIZE)), gridH = ceil(cam.viewport.y / float(TILE_SIZE));
   const float size = float(TILE_SIZE);
   splats[i].centerRadius = vec4(center, radius, t.z);
-  splats[i].conicOpacity = vec4(vec3(c, -b, a) / det, opacity);
+  splats[i].conicOpacity = vec4(vec3(c, -b, a) / det, opacityUsed);
   splats[i].color = vec4(max(color, vec3(0.0)), 1.0);
   splats[i].extent = vec4(extent, 0.0, 0.0);
   splats[i].tiles = uvec4(uint(clamp(floor((center.x - extent.x - 1.0) / size), 0.0, gridW - 1.0)),

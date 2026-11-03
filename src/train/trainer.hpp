@@ -35,6 +35,8 @@ struct TrainerOptions {
   // 3DGS-MCMC's exploration: after each step, positions move by this times the
   // position rate, scaled by the covariance and gated to the nearly transparent.
   float positionNoise = 0.f;
+  // Mip-Splatting's 2D filter, see ReferenceOptions::mipFilter2d.
+  bool mipFilter2d = false;
   bool poseGradients = false; // Fill StepStats::poseGradient, for refining cameras
   std::uint64_t memoryBudget = ~std::uint64_t{0}; // Bytes; never allocates beyond this
 };

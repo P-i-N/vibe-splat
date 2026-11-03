@@ -69,6 +69,11 @@ struct ErrorMaskPush {
 };
 struct GradientPush {
   float opacityReg, scaleReg; // Per Gaussian: the option divided by the count
+  std::uint32_t mipFilter;
+};
+
+struct PreprocessPush {
+  std::uint32_t mipFilter;
 };
 
 struct NoisePush {
@@ -154,7 +159,7 @@ struct Trainer::Group {
 };
 
 Trainer::Trainer(vk::Context &ctx, const GaussianCloud &initial, const TrainerOptions &options)
-    : ctx_(ctx), options_(options), preprocess_(ctx, shaders::train_preprocess_comp, 9),
+    : ctx_(ctx), options_(options), preprocess_(ctx, shaders::train_preprocess_comp, 9, sizeof(PreprocessPush)),
       binCount_(ctx, shaders::train_bin_count_comp, 5, sizeof(CountPush)),
       binEmit_(ctx, shaders::train_bin_emit_comp, 6, sizeof(EmitPush)),
       tileRanges_(ctx, shaders::train_tile_ranges_comp, 2, sizeof(CountPush)),
@@ -329,7 +334,7 @@ std::uint32_t Trainer::record_prepare() {
                          {groups_[0]->values.get(), groups_[1]->values.get(), groups_[2]->values.get(),
                           groups_[3]->values.get(), groups_[4]->values.get(), camera_.get(), splats_.get(), keys_.get(),
                           values_.get()},
-                         std::span<const std::byte>{}, vk::div_up(count_, 256));
+                         PreprocessPush{options_.mipFilter2d ? 1u : 0u}, vk::div_up(count_, 256));
     vk::compute_barrier(cmd);
     mark(cmd, "project");
     sorter_.record(cmd, *keys_, *values_, *tmpKeys_, *tmpValues_, count_);
@@ -442,7 +447,7 @@ void Trainer::record_backward_from_adjoint(VkCommandBuffer cmd) {
                       groups_[4]->values.get(), camera_.get(), rawGradients_.get(), groups_[0]->gradients.get(),
                       groups_[1]->gradients.get(), groups_[2]->gradients.get(), groups_[3]->gradients.get(), groups_[4]->gradients.get(),
                       splats_.get(), stats_.get()},
-                     GradientPush{options_.opacityReg / static_cast<float>(count_), options_.scaleReg / static_cast<float>(count_)},
+                     GradientPush{options_.opacityReg / static_cast<float>(count_), options_.scaleReg / static_cast<float>(count_), options_.mipFilter2d ? 1u : 0u},
                      vk::div_up(count_, 256));
   vk::compute_barrier(cmd);
   if (options_.poseGradients) {

@@ -132,9 +132,16 @@ std::vector<Splat> prepare(const GaussianCloud &cloud, const Camera &cam, const 
     const dmat3 J(fx / t.z, 0, 0, 0, fy / t.z, 0, -fx * tx / (t.z * t.z), -fy * ty / (t.z * t.z), 0);
     const dmat3 T = J * Rv;
     const dmat3 cov = T * sigma * glm::transpose(T);
-    const double a = cov[0][0] + 0.3, b = cov[0][1], c = cov[1][1] + 0.3;
+    const double dilation = options.mipFilter2d ? 0.1 : 0.3;
+    const double a = cov[0][0] + dilation, b = cov[0][1], c = cov[1][1] + dilation;
     const double det = a * c - b * b;
     if (!(det > 1e-6)) continue;
+    double opacityUsed = opacity;
+    if (options.mipFilter2d) {
+      const double rawDet = cov[0][0] * cov[1][1] - b * b;
+      opacityUsed = rawDet > 0.0 ? opacity * std::sqrt(rawDet / det) : 0.0;
+      if (!(opacityUsed >= 1.0 / 255.0)) continue;
+    }
     const double mid = 0.5 * (a + c);
     const double lambda = mid + std::sqrt(std::max(0.1, mid * mid - det));
 
@@ -148,7 +155,7 @@ std::vector<Splat> prepare(const GaussianCloud &cloud, const Camera &cam, const 
     }
     out.depth = t.z;
     out.conic = dvec3(c, -b, a) / det;
-    out.opacity = opacity;
+    out.opacity = opacityUsed;
     const auto basis = sh_basis(glm::normalize(p - dvec3(cam.position)), cloud.shDegree);
     const std::size_t coefficients = static_cast<std::size_t>(cloud.shCoeffs());
     dvec3 color(0.5);
@@ -403,7 +410,9 @@ ParameterGradients reference_gradients(const GaussianCloud &cloud, const Camera 
     const dvec3 t = dvec3(view * glm::dvec4(p, 1.0));
     const double z = t.z, iz = 1.0 / z, iz2 = iz * iz;
     const dvec2 gCentre(g[1], g[2]);
-    const dmat2 G(g[3], g[4], g[4], g[5]);
+    dmat2 G(g[3], g[4], g[4], g[5]);
+    const double opacity = 1.0 / (1.0 + std::exp(-static_cast<double>(cloud.opacities[i])));
+    double opacityFactor = 1.0; // d(opacity used) / d(opacity), the 2D Mip filter's
     const dmat3 R = quat_to_mat(quat);
     const dvec3 s2(std::exp(2.0 * static_cast<double>(cloud.scales[i * 3])), std::exp(2.0 * static_cast<double>(cloud.scales[i * 3 + 1])),
                    std::exp(2.0 * static_cast<double>(cloud.scales[i * 3 + 2])));
@@ -414,6 +423,21 @@ ParameterGradients reference_gradients(const GaussianCloud &cloud, const Camera 
     const bool clampedX = std::abs(rx) > limX, clampedY = std::abs(ry) > limY;
     const double tx = std::clamp(rx, -limX, limX) * z, ty = std::clamp(ry, -limY, limY) * z;
     const dmat3x2 J(dvec2(fx * iz, 0.0), dvec2(0.0, fy * iz), dvec2(-fx * tx * iz2, -fy * ty * iz2));
+    if (options.mipFilter2d) {
+      // The filter scales the opacity by k = sqrt(det C / det(C + 0.1 I)) with C
+      // the 2D covariance before dilation: that also moves the covariance gradient.
+      const dmat2 C = J * X * glm::transpose(J);
+      const dmat2 F = C + dmat2(0.1);
+      const double detC = glm::determinant(C), detF = glm::determinant(F);
+      if (detC > 0.0 && detF > 0.0) {
+        const double k = std::sqrt(detC / detF);
+        const dmat2 cofC(C[1][1], -C[0][1], -C[1][0], C[0][0]), cofF(F[1][1], -F[0][1], -F[1][0], F[0][0]);
+        G += g[0] * opacity * 0.5 * k * (cofC / detC - cofF / detF);
+        opacityFactor = k;
+      } else {
+        opacityFactor = 0.0;
+      }
+    }
     const dmat3x2 Jc(dvec2(fx * iz, 0.0), dvec2(0.0, fy * iz), dvec2(-fx * t.x * iz2, -fy * t.y * iz2));
     dvec3 gT = glm::transpose(Jc) * gCentre;
     const dmat3x2 dJx(dvec2(0.0), dvec2(0.0), dvec2(clampedX ? 0.0 : -fx * iz2, 0.0));
@@ -439,8 +463,7 @@ ParameterGradients reference_gradients(const GaussianCloud &cloud, const Camera 
     const dvec4 tangent = (gq - quat * glm::dot(quat, gq)) / std::max(quatLength, 1e-12);
     for (int k = 0; k < 4; ++k) out.rotations[i * 4 + k] = tangent[k];
 
-    const double opacity = 1.0 / (1.0 + std::exp(-static_cast<double>(cloud.opacities[i])));
-    out.opacities[i] = g[0] * opacity * (1.0 - opacity);
+    out.opacities[i] = g[0] * opacityFactor * opacity * (1.0 - opacity);
 
     const dvec3 gColour(g[6], g[7], g[8]);
     const auto basis = sh_basis(glm::normalize(p - dvec3(cam.position)), cloud.shDegree);

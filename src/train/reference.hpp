@@ -24,6 +24,9 @@ struct ReferenceOptions {
   bool noCutoffs = false;
   float opacityReg = 0.f; // The 3DGS-MCMC penalties, as TrainerOptions
   float scaleReg = 0.f;
+  // Mip-Splatting's 2D filter: a 0.1 pixel dilation instead of 0.3, with the
+  // opacity scaled by sqrt(det(cov) / det(cov + 0.1 I)) to keep the integral.
+  bool mipFilter2d = false;
 };
 
 struct ReferenceImage {

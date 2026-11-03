@@ -139,6 +139,8 @@ train options (writes project/splat.ply and project/preview_*.png):
   --scale-reg <x>         Penalise size the same way (3DGS-MCMC uses 0.01; default 0)
   --position-noise <x>    Move nearly transparent Gaussians at random each step, by this
                           times the position rate (3DGS-MCMC uses 5e5; default 0)
+  --mip-filter            Mip-Splatting's filters against aliasing: a 0.1 pixel dilation
+                          with the opacity scaled to match, in place of 0.3
   --densify-interval <n>  Iterations between densification rounds (default 100)
   --score-views <n>       Densify only Gaussians reaching many high-error pixels in
                           this many views per round (default 10; 0: off)
@@ -476,11 +478,11 @@ int cmd_train(const GlobalOptions &opts) {
   for (auto &a : rest) {
     if (a == "-o") a = "--out";
   }
-  const splat::cli::Args args(rest, {"--no-densify", "--full-resolution", "--exposure", "--full-adam", "--significance-prune", "--point-extent", "--adaptive-schedule", "--refine-poses", "--second-order", "--no-align"});
+  const splat::cli::Args args(rest, {"--no-densify", "--full-resolution", "--exposure", "--full-adam", "--significance-prune", "--point-extent", "--adaptive-schedule", "--mip-filter", "--refine-poses", "--second-order", "--no-align"});
   args.allow_only({"out", "iterations", "lambda-ssim", "sh-degree", "max-size", "max-views", "holdout", "seed", "report-every", "save-every",
                    "no-densify", "densify", "gradient-threshold", "vram-budget", "max-gaussians", "prune", "full-resolution", "exposure", "full-adam",
                    "threshold-rise", "split-threshold", "dense-fraction", "densify-interval", "score-views", "score-min-pixels", "explore",
-                   "significance-prune", "point-extent", "adaptive-schedule", "max-growth", "opacity-reg", "scale-reg", "position-noise", "refine-poses", "second-order", "dense-init", "no-align"});
+                   "significance-prune", "point-extent", "adaptive-schedule", "max-growth", "opacity-reg", "scale-reg", "position-noise", "mip-filter", "refine-poses", "second-order", "dense-init", "no-align"});
   if (args.positionals().size() != 1) {
     std::println(stderr, "Usage: splat train <project> [options]  (see splat --help)");
     return 2;
@@ -525,6 +527,7 @@ int cmd_train(const GlobalOptions &opts) {
   options.opacityReg = std::max(args.number("opacity-reg", options.opacityReg), 0.f);
   options.scaleReg = std::max(args.number("scale-reg", options.scaleReg), 0.f);
   options.positionNoise = std::max(args.number("position-noise", options.positionNoise), 0.f);
+  options.mipFilter = args.has("mip-filter");
   options.refinePoses = args.has("refine-poses");
   options.secondOrder = args.has("second-order");
   options.densePoints = args.number<std::size_t>("dense-init", options.densePoints);

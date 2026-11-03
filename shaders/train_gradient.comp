@@ -28,6 +28,7 @@ layout(std430, binding = 13) buffer DensifyStats { DensifyStat densifyStats[]; }
 layout(push_constant) uniform Push {
   float opacityReg;
   float scaleReg;
+  uint mipFilter; // As in train_preprocess.comp
 } pc;
 
 // tr(G A X J^T) for 2x2 symmetric G, with A and J 2x3 and X 3x3.
@@ -80,7 +81,9 @@ void main() {
   densifyStats[i].main.z = max(densifyStats[i].main.z, splats[i].centerRadius.z);
   densifyStats[i].main.w += raw[at + 9u] * 3.0 * cam.viewport.x * cam.viewport.y; // In pixels
   densifyStats[i].more.x += length(vec2(raw[at + 10u], raw[at + 11u]) * 0.5 * cam.viewport.xy);
-  const mat2 G = mat2(raw[at + 3u], raw[at + 4u], raw[at + 4u], raw[at + 5u]);
+  mat2 G = mat2(raw[at + 3u], raw[at + 4u], raw[at + 4u], raw[at + 5u]);
+  const float opacity = 1.0 / (1.0 + exp(-opacities[i]));
+  float opacityFactor = 1.0; // d(opacity used) / d(opacity), the 2D Mip filter's
 
   const mat3 Rv = mat3(cam.view);
   const mat3 R = train_quat_to_mat(quat);
@@ -94,6 +97,22 @@ void main() {
   const bool clampedX = abs(rx) > limX, clampedY = abs(ry) > limY;
   const float tx = clamp(rx, -limX, limX) * z, ty = clamp(ry, -limY, limY) * z;
   const mat3x2 J = mat3x2(vec2(fx * iz, 0.0), vec2(0.0, fy * iz), vec2(-fx * tx * iz2, -fy * ty * iz2));
+
+  if (pc.mipFilter != 0u) {
+    // The filter scales the opacity by k = sqrt(det C / det(C + 0.1 I)) with C
+    // the 2D covariance before dilation: that also moves the covariance gradient.
+    const mat2 C = J * X * transpose(J);
+    const mat2 F = C + mat2(0.1);
+    const float detC = determinant(C), detF = determinant(F);
+    if (detC > 0.0 && detF > 0.0) {
+      const float k = sqrt(detC / detF);
+      const mat2 cofC = mat2(C[1][1], -C[0][1], -C[1][0], C[0][0]), cofF = mat2(F[1][1], -F[0][1], -F[1][0], F[0][0]);
+      G += raw[at] * opacity * 0.5 * k * (cofC / detC - cofF / detF);
+      opacityFactor = k;
+    } else {
+      opacityFactor = 0.0;
+    }
+  }
 
   // Position moves the centre, and also how the covariance projects.
   const mat3x2 Jc = mat3x2(vec2(fx * iz, 0.0), vec2(0.0, fy * iz), vec2(-fx * t.x * iz2, -fy * t.y * iz2));
@@ -133,8 +152,7 @@ void main() {
   gradRotations[i * 4u + 2u] = tangent.z;
   gradRotations[i * 4u + 3u] = tangent.w;
 
-  const float opacity = 1.0 / (1.0 + exp(-opacities[i]));
-  gradOpacities[i] = (raw[at] + pc.opacityReg) * opacity * (1.0 - opacity);
+  gradOpacities[i] = (raw[at] * opacityFactor + pc.opacityReg) * opacity * (1.0 - opacity);
 
   const vec3 gColour = vec3(raw[at + 6u], raw[at + 7u], raw[at + 8u]);
   float basis[16];
