@@ -242,6 +242,36 @@ TEST_CASE("Opacity and scale penalties add their gradient to every Gaussian", "[
   }
 }
 
+TEST_CASE("Position noise moves transparent Gaussians by their covariance and leaves opaque ones", "[train][vulkan]") {
+  vk::Context *ctx = test::context();
+  if (ctx == nullptr) SKIP("No usable Vulkan device");
+  constexpr std::size_t kCount = 4000;
+  GaussianCloud cloud;
+  cloud.resize(kCount, 0);
+  for (std::size_t i = 0; i < kCount; ++i) {
+    cloud.rotations[i * 4] = 1.f;                       // Identity, scales log 0 = 1: the covariance is the identity
+    cloud.opacities[i] = i < kCount / 2 ? -20.f : 20.f; // Transparent first, then opaque
+  }
+  cloud.scales[(kCount - 1) * 3] = -30.f; // A degenerate axis must still give a finite position
+  Trainer trainer(*ctx, cloud);
+  trainer.add_position_noise(0.5f, 7);
+  const GaussianCloud moved = trainer.cloud();
+  double sum = 0.0, sumSquares = 0.0;
+  for (std::size_t i = 0; i < kCount / 2; ++i) {
+    sum += moved.positions[i * 3];
+    sumSquares += static_cast<double>(moved.positions[i * 3]) * moved.positions[i * 3];
+  }
+  const double mean = sum / (kCount / 2), deviation = std::sqrt(sumSquares / (kCount / 2) - mean * mean);
+  std::println("  noise on transparent Gaussians: mean {:.4f}, standard deviation {:.4f}", mean, deviation);
+  CHECK_THAT(mean, WithinAbs(0.0, 0.05));
+  // The gate is a logistic in 1 - opacity, steep at 0.995: fully transparent gives 1 / (1 + e^-0.5).
+  CHECK_THAT(deviation, WithinAbs(0.5 / (1.0 + std::exp(-0.5)), 0.03));
+  for (std::size_t i = kCount / 2; i < kCount; ++i) {
+    for (std::size_t a = 0; a < 3; ++a) CHECK(moved.positions[i * 3 + a] == 0.f);
+  }
+  for (const float p : moved.positions) REQUIRE(std::isfinite(p));
+}
+
 TEST_CASE("GPU forward and gradients match the CPU reference where pixels stop early", "[train][vulkan]") {
   vk::Context *ctx = test::context();
   if (ctx == nullptr) SKIP("No usable Vulkan device");

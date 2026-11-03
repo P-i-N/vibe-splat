@@ -32,6 +32,9 @@ struct TrainerOptions {
   // scaleReg * mean(exp(scale)) over the Gaussians. 0 is off.
   float opacityReg = 0.f;
   float scaleReg = 0.f;
+  // 3DGS-MCMC's exploration: after each step, positions move by this times the
+  // position rate, scaled by the covariance and gated to the nearly transparent.
+  float positionNoise = 0.f;
   bool poseGradients = false; // Fill StepStats::poseGradient, for refining cameras
   std::uint64_t memoryBudget = ~std::uint64_t{0}; // Bytes; never allocates beyond this
 };
@@ -143,6 +146,8 @@ public:
 
   // Caps opacity, so that Gaussians no longer needed fade below the prune limit.
   void reset_opacity(float maximum);
+  // One round of the position noise of TrainerOptions::positionNoise, with the given scaler (noise_lr times the position rate).
+  void add_position_noise(float scaler, std::uint32_t iteration);
 
   // Frees memory when a view does not fit. See remove_largest().
   std::size_t remove_largest_gaussians(double share);
@@ -183,6 +188,7 @@ private:
   void record_backward(VkCommandBuffer cmd);
   void record_backward_from_adjoint(VkCommandBuffer cmd);
   void record_adam(VkCommandBuffer cmd, const LearningRates &rates);
+  void record_noise(VkCommandBuffer cmd, float scaler, std::uint32_t iteration);
   // Forward, loss, backward and, when rates are given, the Adam step, in one submission.
   StepStats run(const Camera &camera, std::span<const std::uint8_t> target, const LearningRates *rates,
                 std::span<const std::uint8_t> nextTarget = {});
@@ -199,7 +205,7 @@ private:
   std::uint32_t gridW_ = 0, tileCount_ = 0;
 
   vk::ComputePipeline preprocess_, binCount_, binEmit_, tileRanges_, forward_, exposure_, ssim_, loss_, exposureBackward_, errorMask_, score_, pose_, hutchinson_, curvature_, secondOrder_, gradient_,
-      adam_, gather_;
+      adam_, noise_, gather_;
   std::uint32_t curvatureUpdates_ = 0;
   Exposure exposureValues_ = kNeutralExposure;
   bool exposing_ = false; // The last iteration ran the exposure passes

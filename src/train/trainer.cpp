@@ -71,6 +71,12 @@ struct GradientPush {
   float opacityReg, scaleReg; // Per Gaussian: the option divided by the count
 };
 
+struct NoisePush {
+  std::uint32_t count;
+  float scaler;
+  std::uint32_t iteration;
+};
+
 struct ScorePush {
   std::uint32_t count;
   float toPixels, loss;
@@ -162,7 +168,7 @@ Trainer::Trainer(vk::Context &ctx, const GaussianCloud &initial, const TrainerOp
       hutchinson_(ctx, shaders::train_hutchinson_comp, 1, sizeof(HutchinsonPush)),
       curvature_(ctx, shaders::train_curvature_comp, 2, sizeof(CurvaturePush)),
       secondOrder_(ctx, shaders::train_second_order_comp, 7, sizeof(SecondOrderPush)), gradient_(ctx, shaders::train_gradient_comp, 14, sizeof(GradientPush)),
-      adam_(ctx, shaders::train_adam_comp, 4, sizeof(AdamPush)), gather_(ctx, shaders::train_gather_comp, 3, sizeof(GatherPush)),
+      adam_(ctx, shaders::train_adam_comp, 4, sizeof(AdamPush)), noise_(ctx, shaders::train_noise_comp, 4, sizeof(NoisePush)), gather_(ctx, shaders::train_gather_comp, 3, sizeof(GatherPush)),
       sorter_(ctx) {
   initial.validate();
   if (initial.empty()) throw std::runtime_error("nothing to train: the cloud is empty");
@@ -541,6 +547,7 @@ StepStats Trainer::run(const Camera &camera, std::span<const std::uint8_t> targe
     record_forward(cmd, entries);
     record_backward(cmd);
     if (rates != nullptr) record_adam(cmd, *rates);
+    if (rates != nullptr && options_.positionNoise > 0.f) record_noise(cmd, options_.positionNoise * rates->position, adamStep_);
   });
   finish_timing();
   ++timedIterations_;
@@ -749,6 +756,16 @@ void Trainer::apply_changes(const DensifyResult &result) {
   }
   count_ = static_cast<std::uint32_t>(newCount);
   allocate_per_gaussian();
+}
+
+void Trainer::record_noise(VkCommandBuffer cmd, float scaler, std::uint32_t iteration) {
+  vk::compute_barrier(cmd); // After Adam's writes to the positions
+  noise_.dispatch(cmd, {groups_[0]->values.get(), groups_[1]->values.get(), groups_[2]->values.get(), groups_[3]->values.get()},
+                  NoisePush{count_, scaler, iteration}, vk::div_up(count_, 256));
+}
+
+void Trainer::add_position_noise(float scaler, std::uint32_t iteration) {
+  ctx_.submit_and_wait([&](VkCommandBuffer cmd) { record_noise(cmd, scaler, iteration); });
 }
 
 void Trainer::reset_opacity(float maximum) {

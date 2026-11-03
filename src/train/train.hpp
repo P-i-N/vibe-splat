@@ -62,6 +62,9 @@ struct TrainOptions {
   // shrink. 0 is off.
   float opacityReg = 0.f;
   float scaleReg = 0.f;
+  // 3DGS-MCMC's exploration noise on positions, as a multiple of the position
+  // rate (its paper and gsplat use 5e5). 0 is off.
+  float positionNoise = 0.f;
   // Refine each training view's camera along with the Gaussians, for poses that are a little off.
   bool refinePoses = false;
   std::size_t densePoints = 50000;  // Start from up to this many more points, by patch matching

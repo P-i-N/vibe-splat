@@ -28,6 +28,7 @@ splat_add_shader_library(splat_shaders
     train_fixed_to_float.comp
     train_gradient.comp
     train_adam.comp
+    train_noise.comp
     train_gather.comp
     match_score.comp
     match_compact.comp
