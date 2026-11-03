@@ -126,7 +126,11 @@ std::vector<Splat> prepare(const GaussianCloud &cloud, const Camera &cam, const 
     const dvec3 s(std::exp(static_cast<double>(cloud.scales[i * 3])), std::exp(static_cast<double>(cloud.scales[i * 3 + 1])),
                   std::exp(static_cast<double>(cloud.scales[i * 3 + 2])));
     const dmat3 M = quat_to_mat(quat) * dmat3(s.x, 0, 0, 0, s.y, 0, 0, 0, s.z);
-    const dmat3 sigma = M * glm::transpose(M);
+    const double filter = i < options.filter3d.size() ? options.filter3d[i] : 0.0;
+    const dmat3 sigma = M * glm::transpose(M) + dmat3(filter);
+    double opacity3 = opacity;
+    for (int a = 0; a < 3; ++a) opacity3 *= std::sqrt(s[a] * s[a] / (s[a] * s[a] + filter));
+    if (!(opacity3 >= 1.0 / 255.0)) continue;
 
     const double tx = std::clamp(t.x / t.z, -limX, limX) * t.z, ty = std::clamp(t.y / t.z, -limY, limY) * t.z;
     const dmat3 J(fx / t.z, 0, 0, 0, fy / t.z, 0, -fx * tx / (t.z * t.z), -fy * ty / (t.z * t.z), 0);
@@ -136,10 +140,10 @@ std::vector<Splat> prepare(const GaussianCloud &cloud, const Camera &cam, const 
     const double a = cov[0][0] + dilation, b = cov[0][1], c = cov[1][1] + dilation;
     const double det = a * c - b * b;
     if (!(det > 1e-6)) continue;
-    double opacityUsed = opacity;
+    double opacityUsed = opacity3;
     if (options.mipFilter2d) {
       const double rawDet = cov[0][0] * cov[1][1] - b * b;
-      opacityUsed = rawDet > 0.0 ? opacity * std::sqrt(rawDet / det) : 0.0;
+      opacityUsed = rawDet > 0.0 ? opacity3 * std::sqrt(rawDet / det) : 0.0;
       if (!(opacityUsed >= 1.0 / 255.0)) continue;
     }
     const double mid = 0.5 * (a + c);
@@ -412,12 +416,17 @@ ParameterGradients reference_gradients(const GaussianCloud &cloud, const Camera 
     const dvec2 gCentre(g[1], g[2]);
     dmat2 G(g[3], g[4], g[4], g[5]);
     const double opacity = 1.0 / (1.0 + std::exp(-static_cast<double>(cloud.opacities[i])));
-    double opacityFactor = 1.0; // d(opacity used) / d(opacity), the 2D Mip filter's
+    double k2 = 1.0; // The 2D Mip filter's factor
     const dmat3 R = quat_to_mat(quat);
     const dvec3 s2(std::exp(2.0 * static_cast<double>(cloud.scales[i * 3])), std::exp(2.0 * static_cast<double>(cloud.scales[i * 3 + 1])),
                    std::exp(2.0 * static_cast<double>(cloud.scales[i * 3 + 2])));
     const dmat3 D(s2.x, 0, 0, 0, s2.y, 0, 0, 0, s2.z);
-    const dmat3 X = Rv * (R * D * glm::transpose(R)) * glm::transpose(Rv);
+    const double filter = i < options.filter3d.size() ? options.filter3d[i] : 0.0;
+    const dmat3 X = Rv * (R * D * glm::transpose(R) + dmat3(filter)) * glm::transpose(Rv);
+    // The 3D filter scales the opacity by k3 = prod sqrt(s2 / (s2 + f)).
+    double k3 = 1.0;
+    for (int a = 0; a < 3; ++a) k3 *= std::sqrt(s2[a] / (s2[a] + filter));
+    const double opacity3 = opacity * k3; // What the 2D stage sees
 
     const double rx = t.x * iz, ry = t.y * iz;
     const bool clampedX = std::abs(rx) > limX, clampedY = std::abs(ry) > limY;
@@ -432,10 +441,10 @@ ParameterGradients reference_gradients(const GaussianCloud &cloud, const Camera 
       if (detC > 0.0 && detF > 0.0) {
         const double k = std::sqrt(detC / detF);
         const dmat2 cofC(C[1][1], -C[0][1], -C[1][0], C[0][0]), cofF(F[1][1], -F[0][1], -F[1][0], F[0][0]);
-        G += g[0] * opacity * 0.5 * k * (cofC / detC - cofF / detF);
-        opacityFactor = k;
+        G += g[0] * opacity3 * 0.5 * k * (cofC / detC - cofF / detF);
+        k2 = k;
       } else {
-        opacityFactor = 0.0;
+        k2 = 0.0;
       }
     }
     const dmat3x2 Jc(dvec2(fx * iz, 0.0), dvec2(0.0, fy * iz), dvec2(-fx * t.x * iz2, -fy * t.y * iz2));
@@ -450,7 +459,10 @@ ParameterGradients reference_gradients(const GaussianCloud &cloud, const Camera 
 
     const dmat3x2 T = J * Rv;
     const dmat3 G3 = glm::transpose(T) * G * T;
-    for (int a = 0; a < 3; ++a) out.scales[i * 3 + a] = 2.0 * s2[a] * glm::dot(R[a], G3 * R[a]);
+    // The filter's opacity factor also moves with the scales: dk3 / dlog s_a = k3 f / (s2_a + f).
+    for (int a = 0; a < 3; ++a) {
+      out.scales[i * 3 + a] = 2.0 * s2[a] * glm::dot(R[a], G3 * R[a]) + g[0] * k2 * opacity * k3 * filter / (s2[a] + filter);
+    }
 
     const dmat3 P = 2.0 * G3 * R * D;
     const double w = quat.x, x = quat.y, y = quat.z, zq = quat.w;
@@ -463,7 +475,7 @@ ParameterGradients reference_gradients(const GaussianCloud &cloud, const Camera 
     const dvec4 tangent = (gq - quat * glm::dot(quat, gq)) / std::max(quatLength, 1e-12);
     for (int k = 0; k < 4; ++k) out.rotations[i * 4 + k] = tangent[k];
 
-    out.opacities[i] = g[0] * opacityFactor * opacity * (1.0 - opacity);
+    out.opacities[i] = g[0] * k2 * k3 * opacity * (1.0 - opacity);
 
     const dvec3 gColour(g[6], g[7], g[8]);
     const auto basis = sh_basis(glm::normalize(p - dvec3(cam.position)), cloud.shDegree);

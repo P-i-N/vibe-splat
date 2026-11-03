@@ -2,6 +2,7 @@
 #include "sfm/test_views.hpp"
 #include "test_support.hpp"
 #include "train/densify.hpp"
+#include "train/mip.hpp"
 #include "train/dense_points.hpp"
 #include "train/reference.hpp"
 #include "train/schedule.hpp"
@@ -411,6 +412,35 @@ TEST_CASE("Relocation with no live Gaussian leaves the cloud alone", "[densify]"
   CHECK(result.cloud.positions == cloud.positions);
   CHECK(result.cloud.opacities == cloud.opacities);
   CHECK(result.cloned == 0);
+}
+
+TEST_CASE("The smoothing filter is the smallest footprint of the cameras that see a Gaussian", "[densify]") {
+  const auto camera_at = [](float z) {
+    Camera camera = Camera::look_at(glm::vec3(0.f, 0.f, z), glm::vec3(0.f), glm::vec3(0.f, -1.f, 0.f), 60.f, 64, 48);
+    camera.fx = camera.fy = 100.f;
+    camera.cx = 32.f;
+    camera.cy = 24.f;
+    return camera;
+  };
+  const std::array<Camera, 2> cameras{camera_at(-2.f), camera_at(-4.f)};
+  GaussianCloud cloud = line_of(2, 0.1f);
+  cloud.positions[0] = 0.f;    // At the origin: depth 2 from the nearer camera
+  cloud.positions[3] = 0.f;    // Behind both cameras
+  cloud.positions[5] = -10.f;
+  const std::vector<float> filter = smoothing_filter(cloud, cameras);
+  REQUIRE(filter.size() == 2);
+  CHECK_THAT(filter[0], WithinAbs(std::pow(0.2 * 2.0 / 100.0, 2.0), 1e-9));
+  CHECK(filter[1] == 0.f);
+}
+
+TEST_CASE("Baking the filter keeps the Gaussian's integral", "[densify]") {
+  GaussianCloud cloud = line_of(2, 0.1f);
+  const GaussianCloud before = cloud;
+  bake_filter(cloud, std::vector<float>{0.03f, 0.f});
+  for (std::size_t a = 0; a < 3; ++a) CHECK_THAT(cloud.scales[a], WithinAbs(0.5 * std::log(0.01 + 0.03), 1e-6));
+  CHECK_THAT(1.0 / (1.0 + std::exp(-cloud.opacities[0])), WithinAbs(0.5 * std::pow(0.01 / 0.04, 1.5), 1e-6));
+  CHECK(cloud.scales[3] == before.scales[3]);
+  CHECK(cloud.opacities[1] == before.opacities[1]);
 }
 
 TEST_CASE("Patch matching finds points on a textured plane", "[densify]") {

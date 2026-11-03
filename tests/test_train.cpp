@@ -49,10 +49,8 @@ void check_close(const std::vector<double> &a, const std::vector<double> &b, con
 
 std::vector<double> to_double(const std::vector<float> &v) { return {v.begin(), v.end()}; }
 
-double functional(const GaussianCloud &cloud, const Camera &camera, const std::vector<glm::dvec3> &adjoint, bool mipFilter2d = false) {
-  ReferenceOptions options;
+double functional(const GaussianCloud &cloud, const Camera &camera, const std::vector<glm::dvec3> &adjoint, ReferenceOptions options = {}) {
   options.noCutoffs = true;
-  options.mipFilter2d = mipFilter2d;
   const ReferenceImage image = reference_render(cloud, camera, options);
   double sum = 0.0;
   for (std::size_t i = 0; i < adjoint.size(); ++i) sum += glm::dot(adjoint[i], image.rgb[i]);
@@ -61,17 +59,17 @@ double functional(const GaussianCloud &cloud, const Camera &camera, const std::v
 
 // Central differences of the functional over one parameter array.
 std::vector<double> finite_differences(GaussianCloud cloud, std::vector<float> GaussianCloud::*member, const Camera &camera,
-                                       const std::vector<glm::dvec3> &adjoint, float step, bool mipFilter2d = false) {
+                                       const std::vector<glm::dvec3> &adjoint, float step, const ReferenceOptions &options = {}) {
   std::vector<float> &values = cloud.*member;
   std::vector<double> out(values.size());
   for (std::size_t i = 0; i < values.size(); ++i) {
     const float original = values[i];
     values[i] = original + step;
     const float up = values[i];
-    const double high = functional(cloud, camera, adjoint, mipFilter2d);
+    const double high = functional(cloud, camera, adjoint, options);
     values[i] = original - step;
     const float down = values[i];
-    const double low = functional(cloud, camera, adjoint, mipFilter2d);
+    const double low = functional(cloud, camera, adjoint, options);
     values[i] = original;
     out[i] = (high - low) / static_cast<double>(up - down);
   }
@@ -149,17 +147,36 @@ TEST_CASE("The 2D Mip filter's gradients match finite differences on the CPU", "
   smooth.noCutoffs = true;
   smooth.mipFilter2d = true;
   const ParameterGradients g = reference_gradients(cloud, camera, adjoint, smooth);
-  check_close(g.positions, finite_differences(cloud, &GaussianCloud::positions, camera, adjoint, 2e-3f, true), "positions", 0.999, 0.01);
-  check_close(g.scales, finite_differences(cloud, &GaussianCloud::scales, camera, adjoint, 2e-3f, true), "scales", 0.999, 0.01);
-  check_close(g.rotations, finite_differences(cloud, &GaussianCloud::rotations, camera, adjoint, 2e-3f, true), "rotations", 0.999, 0.01);
-  check_close(g.opacities, finite_differences(cloud, &GaussianCloud::opacities, camera, adjoint, 2e-3f, true), "opacities", 0.999, 0.01);
+  check_close(g.positions, finite_differences(cloud, &GaussianCloud::positions, camera, adjoint, 2e-3f, smooth), "positions", 0.999, 0.01);
+  check_close(g.scales, finite_differences(cloud, &GaussianCloud::scales, camera, adjoint, 2e-3f, smooth), "scales", 0.999, 0.01);
+  check_close(g.rotations, finite_differences(cloud, &GaussianCloud::rotations, camera, adjoint, 2e-3f, smooth), "rotations", 0.999, 0.01);
+  check_close(g.opacities, finite_differences(cloud, &GaussianCloud::opacities, camera, adjoint, 2e-3f, smooth), "opacities", 0.999, 0.01);
   // The filter changes the picture: an opaque, sub-pixel Gaussian renders fainter.
-  ReferenceOptions plain;
-  plain.noCutoffs = true;
-  CHECK(functional(cloud, camera, adjoint, true) != functional(cloud, camera, adjoint, false));
+  CHECK(functional(cloud, camera, adjoint, smooth) != functional(cloud, camera, adjoint));
 }
 
-TEST_CASE("GPU forward and gradients match the CPU reference with the 2D Mip filter", "[train][vulkan]") {
+TEST_CASE("The 3D smoothing filter's gradients match finite differences on the CPU", "[train][reference]") {
+  const Camera camera = test_camera(40, 32);
+  std::mt19937 rng(23);
+  std::normal_distribution<double> n(0.0, 1.0);
+  std::vector<glm::dvec3> adjoint(static_cast<std::size_t>(camera.width) * camera.height);
+  for (auto &a : adjoint) a = glm::dvec3(n(rng), n(rng), n(rng));
+  const GaussianCloud cloud = random_cloud(12, 0, 3);
+  ReferenceOptions smooth;
+  smooth.noCutoffs = true;
+  smooth.mipFilter2d = true;
+  for (std::size_t i = 0; i < cloud.size(); ++i) smooth.filter3d.push_back(0.002f * static_cast<float>(i + 1));
+  const ParameterGradients g = reference_gradients(cloud, camera, adjoint, smooth);
+  check_close(g.positions, finite_differences(cloud, &GaussianCloud::positions, camera, adjoint, 2e-3f, smooth), "positions", 0.999, 0.01);
+  check_close(g.scales, finite_differences(cloud, &GaussianCloud::scales, camera, adjoint, 2e-3f, smooth), "scales", 0.999, 0.01);
+  check_close(g.rotations, finite_differences(cloud, &GaussianCloud::rotations, camera, adjoint, 2e-3f, smooth), "rotations", 0.999, 0.01);
+  check_close(g.opacities, finite_differences(cloud, &GaussianCloud::opacities, camera, adjoint, 2e-3f, smooth), "opacities", 0.999, 0.01);
+  ReferenceOptions unfiltered = smooth;
+  unfiltered.filter3d.clear();
+  CHECK(functional(cloud, camera, adjoint, smooth) != functional(cloud, camera, adjoint, unfiltered));
+}
+
+TEST_CASE("GPU forward and gradients match the CPU reference with the Mip filters", "[train][vulkan]") {
   vk::Context *ctx = test::context();
   if (ctx == nullptr) SKIP("No usable Vulkan device");
   const Camera camera = test_camera(72, 56);
@@ -167,6 +184,7 @@ TEST_CASE("GPU forward and gradients match the CPU reference with the 2D Mip fil
   const GaussianCloud cloud = random_cloud(60, 1, 13);
   ReferenceOptions referenceOptions;
   referenceOptions.mipFilter2d = true;
+  for (std::size_t i = 0; i < cloud.size(); ++i) referenceOptions.filter3d.push_back(0.001f * static_cast<float>(i % 7));
   const ReferenceImage image = reference_render(cloud, camera, referenceOptions);
   const ReferenceLoss cpuLoss = reference_loss(image, target, 0.2);
   const ParameterGradients cpu = reference_gradients(cloud, camera, cpuLoss.adjoint, referenceOptions);
@@ -174,6 +192,7 @@ TEST_CASE("GPU forward and gradients match the CPU reference with the 2D Mip fil
   TrainerOptions options;
   options.mipFilter2d = true;
   Trainer trainer(*ctx, cloud, options);
+  trainer.set_filter3d(referenceOptions.filter3d);
   const std::vector<float> gpu = trainer.render(camera);
   double worst = 0.0;
   for (std::size_t i = 0; i < image.rgb.size(); ++i) {

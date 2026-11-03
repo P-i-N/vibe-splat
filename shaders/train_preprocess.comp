@@ -17,6 +17,7 @@ layout(std430, binding = 5) readonly buffer Camera { CameraParams cam; };
 layout(std430, binding = 6) writeonly buffer Splats { TrainSplat splats[]; };
 layout(std430, binding = 7) writeonly buffer Keys { uint keys[]; };
 layout(std430, binding = 8) writeonly buffer Values { uint values[]; };
+layout(std430, binding = 9) readonly buffer Filter3d { float filter3d[]; }; // Mip-Splatting's 3D smoothing filter, 0 for none
 
 layout(push_constant) uniform Push {
   uint mipFilter; // Mip-Splatting's 2D filter instead of the 0.3 dilation
@@ -50,7 +51,14 @@ void main() {
   q /= len;
   const vec3 s = exp(vec3(scales[i * 3u], scales[i * 3u + 1u], scales[i * 3u + 2u]));
   const mat3 M = train_quat_to_mat(q) * mat3(s.x, 0.0, 0.0, 0.0, s.y, 0.0, 0.0, 0.0, s.z);
-  const mat3 sigma = M * transpose(M);
+  const float smooth3d = filter3d[i];
+  const mat3 sigma = M * transpose(M) + mat3(smooth3d);
+  // The filter widens the Gaussian; its opacity shrinks to keep the integral.
+  const vec3 s2 = s * s;
+  const float opacity3 = opacity * sqrt(s2.x / (s2.x + smooth3d) * s2.y / (s2.y + smooth3d) * s2.z / (s2.z + smooth3d));
+  if (!(opacity3 >= 1.0 / 255.0)) {
+    return;
+  }
 
   const float fx = cam.intrinsics.x, fy = cam.intrinsics.y;
   const float limX = 1.3 * cam.viewport.z, limY = 1.3 * cam.viewport.w;
@@ -72,10 +80,10 @@ void main() {
   if (!(det > MIN_CONIC_DETERMINANT)) {
     return;
   }
-  float opacityUsed = opacity;
+  float opacityUsed = opacity3;
   if (pc.mipFilter != 0u) {
     const float rawDet = cov[0][0] * cov[1][1] - b * b;
-    opacityUsed = rawDet > 0.0 ? opacity * sqrt(rawDet / det) : 0.0;
+    opacityUsed = rawDet > 0.0 ? opacity3 * sqrt(rawDet / det) : 0.0;
     if (!(opacityUsed >= 1.0 / 255.0)) {
       return;
     }

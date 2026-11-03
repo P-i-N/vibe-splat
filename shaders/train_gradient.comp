@@ -22,6 +22,7 @@ layout(std430, binding = 10) writeonly buffer GradOpacities { float gradOpacitie
 layout(std430, binding = 11) writeonly buffer GradSH { float gradSh[]; };
 layout(std430, binding = 12) readonly buffer Splats { TrainSplat splats[]; };
 layout(std430, binding = 13) buffer DensifyStats { DensifyStat densifyStats[]; };
+layout(std430, binding = 14) readonly buffer Filter3d { float filter3d[]; }; // As in train_preprocess.comp
 
 // 3DGS-MCMC's penalties, reg * mean(sigmoid(opacity)) and reg * mean(exp(scale))
 // over the Gaussians, already divided by their count.
@@ -83,14 +84,18 @@ void main() {
   densifyStats[i].more.x += length(vec2(raw[at + 10u], raw[at + 11u]) * 0.5 * cam.viewport.xy);
   mat2 G = mat2(raw[at + 3u], raw[at + 4u], raw[at + 4u], raw[at + 5u]);
   const float opacity = 1.0 / (1.0 + exp(-opacities[i]));
-  float opacityFactor = 1.0; // d(opacity used) / d(opacity), the 2D Mip filter's
+  float k2 = 1.0; // The 2D Mip filter's opacity factor
 
   const mat3 Rv = mat3(cam.view);
   const mat3 R = train_quat_to_mat(quat);
   const vec3 s2 = exp(2.0 * logScale);
   const mat3 D = mat3(s2.x, 0.0, 0.0, 0.0, s2.y, 0.0, 0.0, 0.0, s2.z);
-  const mat3 sigma = R * D * transpose(R);
+  const float smooth3d = filter3d[i];
+  const mat3 sigma = R * D * transpose(R) + mat3(smooth3d);
   const mat3 X = Rv * sigma * transpose(Rv);
+  // The 3D filter's opacity factor, k3 = prod sqrt(s2 / (s2 + f)), and what the 2D stage saw.
+  const float k3 = sqrt(s2.x / (s2.x + smooth3d) * s2.y / (s2.y + smooth3d) * s2.z / (s2.z + smooth3d));
+  const float opacity3 = opacity * k3;
 
   const float limX = 1.3 * cam.viewport.z, limY = 1.3 * cam.viewport.w;
   const float rx = t.x * iz, ry = t.y * iz;
@@ -107,10 +112,10 @@ void main() {
     if (detC > 0.0 && detF > 0.0) {
       const float k = sqrt(detC / detF);
       const mat2 cofC = mat2(C[1][1], -C[0][1], -C[1][0], C[0][0]), cofF = mat2(F[1][1], -F[0][1], -F[1][0], F[0][0]);
-      G += raw[at] * opacity * 0.5 * k * (cofC / detC - cofF / detF);
-      opacityFactor = k;
+      G += raw[at] * opacity3 * 0.5 * k * (cofC / detC - cofF / detF);
+      k2 = k;
     } else {
-      opacityFactor = 0.0;
+      k2 = 0.0;
     }
   }
 
@@ -130,7 +135,8 @@ void main() {
   const mat3 G3 = transpose(T) * G * T;
   for (int a = 0; a < 3; ++a) {
     const vec3 axis = R[a];
-    gradScales[i * 3u + uint(a)] = 2.0 * s2[a] * dot(axis, G3 * axis) + pc.scaleReg * exp(logScale[a]); // Plus the penalty
+    // Plus the filter's opacity factor moving with the scale, and the penalty.
+    gradScales[i * 3u + uint(a)] = 2.0 * s2[a] * dot(axis, G3 * axis) + raw[at] * k2 * opacity * k3 * smooth3d / (s2[a] + smooth3d) + pc.scaleReg * exp(logScale[a]);
   }
 
   // Rotation: dL = tr(P^T dR). The matrices are dR/dw, dR/dx, dR/dy, dR/dz of
@@ -152,7 +158,7 @@ void main() {
   gradRotations[i * 4u + 2u] = tangent.z;
   gradRotations[i * 4u + 3u] = tangent.w;
 
-  gradOpacities[i] = (raw[at] * opacityFactor + pc.opacityReg) * opacity * (1.0 - opacity);
+  gradOpacities[i] = (raw[at] * k2 * k3 + pc.opacityReg) * opacity * (1.0 - opacity);
 
   const vec3 gColour = vec3(raw[at + 6u], raw[at + 7u], raw[at + 8u]);
   float basis[16];

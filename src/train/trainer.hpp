@@ -150,6 +150,9 @@ public:
   void reset_opacity(float maximum);
   // One round of the position noise of TrainerOptions::positionNoise, with the given scaler (noise_lr times the position rate).
   void add_position_noise(float scaler, std::uint32_t iteration);
+  // Mip-Splatting's 3D smoothing filter per Gaussian (see smoothing_filter()); zero until set, and
+  // zero again after any change of the count.
+  void set_filter3d(std::span<const float> filter);
 
   // Frees memory when a view does not fit. See remove_largest().
   std::size_t remove_largest_gaussians(double share);
@@ -218,7 +221,7 @@ private:
   std::vector<std::unique_ptr<Group>> groups_; // positions, scales, rotations, opacities, sh
 
   std::unique_ptr<vk::Buffer> camera_, counters_, fixedScale_;
-  std::unique_ptr<vk::Buffer> splats_, keys_, values_, tmpKeys_, tmpValues_, coverage_, rawGradients_, stats_;
+  std::unique_ptr<vk::Buffer> splats_, keys_, values_, tmpKeys_, tmpValues_, coverage_, rawGradients_, stats_, filter3d_;
   std::unique_ptr<vk::Buffer> entryKeys_, entryValues_, tmpEntryKeys_, tmpEntryValues_;
   std::unique_ptr<vk::Buffer> ranges_, image_, stops_, exposed_, exposureTotals_, adjoint_, fields_, targetStaging_, target_, groupTotals_, errorMax_, poseTotals_;
   // prefetch_target() hands one copy at a time to a worker thread that lives

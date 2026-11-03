@@ -29,6 +29,7 @@ add_library(splat_core STATIC
   sfm/test_views.cpp
   train/reference.cpp
   train/densify.cpp
+  train/mip.cpp
   train/dense_points.cpp
   train/evaluate.cpp
   train/schedule.cpp

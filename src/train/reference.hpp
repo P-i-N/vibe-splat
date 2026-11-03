@@ -27,6 +27,9 @@ struct ReferenceOptions {
   // Mip-Splatting's 2D filter: a 0.1 pixel dilation instead of 0.3, with the
   // opacity scaled by sqrt(det(cov) / det(cov + 0.1 I)) to keep the integral.
   bool mipFilter2d = false;
+  // Mip-Splatting's 3D smoothing filter per Gaussian (see smoothing_filter()),
+  // or empty for none: added to the covariance, with the opacity scaled to match.
+  std::vector<float> filter3d;
 };
 
 struct ReferenceImage {

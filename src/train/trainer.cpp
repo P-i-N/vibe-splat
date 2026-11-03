@@ -159,7 +159,7 @@ struct Trainer::Group {
 };
 
 Trainer::Trainer(vk::Context &ctx, const GaussianCloud &initial, const TrainerOptions &options)
-    : ctx_(ctx), options_(options), preprocess_(ctx, shaders::train_preprocess_comp, 9, sizeof(PreprocessPush)),
+    : ctx_(ctx), options_(options), preprocess_(ctx, shaders::train_preprocess_comp, 10, sizeof(PreprocessPush)),
       binCount_(ctx, shaders::train_bin_count_comp, 5, sizeof(CountPush)),
       binEmit_(ctx, shaders::train_bin_emit_comp, 6, sizeof(EmitPush)),
       tileRanges_(ctx, shaders::train_tile_ranges_comp, 2, sizeof(CountPush)),
@@ -172,7 +172,7 @@ Trainer::Trainer(vk::Context &ctx, const GaussianCloud &initial, const TrainerOp
       score_(ctx, shaders::train_score_comp, 2, sizeof(ScorePush)), pose_(ctx, shaders::train_pose_comp, 4),
       hutchinson_(ctx, shaders::train_hutchinson_comp, 1, sizeof(HutchinsonPush)),
       curvature_(ctx, shaders::train_curvature_comp, 2, sizeof(CurvaturePush)),
-      secondOrder_(ctx, shaders::train_second_order_comp, 7, sizeof(SecondOrderPush)), gradient_(ctx, shaders::train_gradient_comp, 14, sizeof(GradientPush)),
+      secondOrder_(ctx, shaders::train_second_order_comp, 7, sizeof(SecondOrderPush)), gradient_(ctx, shaders::train_gradient_comp, 15, sizeof(GradientPush)),
       adam_(ctx, shaders::train_adam_comp, 4, sizeof(AdamPush)), noise_(ctx, shaders::train_noise_comp, 4, sizeof(NoisePush)), gather_(ctx, shaders::train_gather_comp, 3, sizeof(GatherPush)),
       sorter_(ctx) {
   initial.validate();
@@ -253,11 +253,13 @@ void Trainer::allocate_per_gaussian() {
   coverage_ = gpu_buffer(ctx_, n * 4);
   rawGradients_ = gpu_buffer(ctx_, n * kRawGradientsPerSplat * sizeof(float));
   stats_ = gpu_buffer(ctx_, n * 32);
+  filter3d_ = gpu_buffer(ctx_, n * sizeof(float));
   if (options_.poseGradients) {
     poseTotals_ = std::make_unique<Buffer>(ctx_, VkDeviceSize{vk::div_up(count_, 256u)} * 6 * sizeof(float), kStorage, MemoryUsage::Readback);
   }
   ctx_.submit_and_wait([&](VkCommandBuffer cmd) {
     clear(cmd, *stats_);
+    clear(cmd, *filter3d_);
     vk::compute_barrier(cmd);
   });
 }
@@ -333,7 +335,7 @@ std::uint32_t Trainer::record_prepare() {
     preprocess_.dispatch(cmd,
                          {groups_[0]->values.get(), groups_[1]->values.get(), groups_[2]->values.get(),
                           groups_[3]->values.get(), groups_[4]->values.get(), camera_.get(), splats_.get(), keys_.get(),
-                          values_.get()},
+                          values_.get(), filter3d_.get()},
                          PreprocessPush{options_.mipFilter2d ? 1u : 0u}, vk::div_up(count_, 256));
     vk::compute_barrier(cmd);
     mark(cmd, "project");
@@ -446,7 +448,7 @@ void Trainer::record_backward_from_adjoint(VkCommandBuffer cmd) {
                      {groups_[0]->values.get(), groups_[1]->values.get(), groups_[2]->values.get(), groups_[3]->values.get(),
                       groups_[4]->values.get(), camera_.get(), rawGradients_.get(), groups_[0]->gradients.get(),
                       groups_[1]->gradients.get(), groups_[2]->gradients.get(), groups_[3]->gradients.get(), groups_[4]->gradients.get(),
-                      splats_.get(), stats_.get()},
+                      splats_.get(), stats_.get(), filter3d_.get()},
                      GradientPush{options_.opacityReg / static_cast<float>(count_), options_.scaleReg / static_cast<float>(count_), options_.mipFilter2d ? 1u : 0u},
                      vk::div_up(count_, 256));
   vk::compute_barrier(cmd);
@@ -767,6 +769,11 @@ void Trainer::record_noise(VkCommandBuffer cmd, float scaler, std::uint32_t iter
   vk::compute_barrier(cmd); // After Adam's writes to the positions
   noise_.dispatch(cmd, {groups_[0]->values.get(), groups_[1]->values.get(), groups_[2]->values.get(), groups_[3]->values.get()},
                   NoisePush{count_, scaler, iteration}, vk::div_up(count_, 256));
+}
+
+void Trainer::set_filter3d(std::span<const float> filter) {
+  if (filter.size() != count_) throw std::invalid_argument("the filter must have one value per Gaussian");
+  filter3d_->upload(ctx_, filter);
 }
 
 void Trainer::add_position_noise(float scaler, std::uint32_t iteration) {

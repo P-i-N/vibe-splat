@@ -8,6 +8,7 @@
 #include "splat/cgc.hpp"
 #include "splat/gaussian_cloud.hpp"
 #include "train/dense_points.hpp"
+#include "train/mip.hpp"
 #include "train/densify.hpp"
 #include "train/evaluate.hpp"
 #include "train/schedule.hpp"
@@ -472,8 +473,22 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
   // CGC refuses NaN and infinity, which a few Gaussians can pick up after
   // densification has stopped pruning them, so those are left out of CGC files.
   // Returns how the floor was found, or nothing if it was not looked for.
+  // Mip-Splatting's 3D smoothing filter, from the training cameras of the
+  // current image size; recomputed after every change of the cloud or the size.
+  std::vector<float> filter3d;
+  std::size_t filterLevel = ~std::size_t{0};
+  const auto refresh_filter = [&](int iteration) {
+    if (!options.mipFilter) return;
+    std::vector<Camera> cameras;
+    cameras.reserve(trainViews.size());
+    for (std::size_t i = 0; i < trainViews.size(); ++i) cameras.push_back(view_at(i, iteration).camera);
+    filter3d = smoothing_filter(trainer.cloud(), cameras);
+    trainer.set_filter3d(filter3d);
+    filterLevel = coarse_level(iteration);
+  };
   const auto save_output = [&](const fs::path &path, const CgcOptions &cgcOptions) {
     GaussianCloud cloud = trainer.cloud();
+    if (options.mipFilter && filter3d.size() == cloud.size()) bake_filter(cloud, filter3d);
     const CloudFormat format = cloud_format(options.out);
     if (format == CloudFormat::Cgc) {
       if (const std::size_t removed = remove_non_finite(cloud); removed > 0) {
@@ -493,6 +508,7 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
     return floorNote;
   };
   const auto start = std::chrono::steady_clock::now();
+  refresh_filter(1);
   bar.start();
   for (int iteration = 1; iteration <= options.iterations; ++iteration) {
     if (order.empty()) {
@@ -509,6 +525,7 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
       std::shuffle(order.begin(), order.end(), rng);
     }
     const View &nextView = view_at(order.back(), iteration + 1);
+    if (options.mipFilter && coarse_level(iteration) != filterLevel) refresh_filter(iteration);
 
     const double progress = static_cast<double>(iteration - 1) / std::max(options.iterations - 1, 1);
     // With the adaptive schedule, held while the image is still growing.
@@ -636,6 +653,7 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
           lastOpacityReset = iteration;
         }
       }
+      refresh_filter(iteration);
       densifySeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - densifyStart).count();
       ++densifyRounds;
     }
