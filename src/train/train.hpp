@@ -49,7 +49,7 @@ struct TrainOptions {
   bool adaptiveSchedule = true;
   // Refine each training view's camera along with the Gaussians, for poses that are a little off.
   bool refinePoses = false;
-  std::size_t densePoints = 200000; // Start from up to this many more points, by patch matching
+  std::size_t densePoints = 50000;  // Start from up to this many more points, by patch matching
   // After densification, steps from the curvature instead of Adam's second moment (3DGS^2-TR).
   bool secondOrder = false;
   bool pointExtent = false;       // The scene's extent from the sparse points, not the cameras

@@ -144,7 +144,7 @@ train options (writes project/splat.ply and project/preview_*.png):
   --refine-poses          Refine the training cameras along with the Gaussians
   --second-order          After densification, step by estimated curvature, not Adam
   --dense-init <n>        Start from up to n more points than the sparse model has,
-                          found by matching patches between the photos (default 200000)
+                          found by matching patches between the photos (default 50000)
   --point-extent          Take the scene's extent from the sparse points, not the cameras
 
 make-test-views options:

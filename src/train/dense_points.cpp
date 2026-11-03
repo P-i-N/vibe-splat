@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <mutex>
 #include <optional>
 #include <random>
 
@@ -122,17 +121,26 @@ glm::vec2 project(const Camera &camera, const glm::vec3 &world, float &depth) {
 
 std::vector<ColmapPoint> dense_points(std::span<const DensePointsView> views, std::span<const ColmapPoint> sparse, std::size_t maxPoints) {
   if (views.size() < 3 || maxPoints == 0) return {};
-  std::vector<Prepared> prepared;
-  prepared.reserve(views.size());
-  for (const DensePointsView &view : views) prepared.push_back(prepare_view(view));
+  std::vector<Prepared> prepared(views.size());
+  parallel_for(views.size(), 0, [&](std::size_t i) { prepared[i] = prepare_view(views[i]); });
 
   const std::size_t step = std::max<std::size_t>(views.size() / kMaxReferences, 1);
+  std::vector<std::size_t> evenly;
+  for (std::size_t i = 0; i < views.size(); i += step) evenly.push_back(i);
+  // Spread out from the start, so that stopping early still covers the scene:
+  // the order of the bit-reversed positions.
+  std::size_t bits = 0;
+  while ((std::size_t{1} << bits) < evenly.size()) ++bits;
   std::vector<std::size_t> references;
-  for (std::size_t i = 0; i < views.size(); i += step) references.push_back(i);
+  for (std::size_t k = 0; k < (std::size_t{1} << bits); ++k) {
+    std::size_t reversed = 0;
+    for (std::size_t b = 0; b < bits; ++b) reversed |= ((k >> b) & 1) << (bits - 1 - b);
+    if (reversed < evenly.size()) references.push_back(evenly[reversed]);
+  }
 
-  std::mutex found;
-  std::vector<ColmapPoint> points;
-  parallel_for(references.size(), 0, [&](std::size_t r) {
+  std::vector<std::vector<ColmapPoint>> perReference(references.size());
+  const auto match = [&](std::size_t r) {
+    std::vector<ColmapPoint> &local = perReference[r];
     const std::size_t index = references[r];
     const Prepared &reference = prepared[index];
     // The depths worth searching: where the sparse points lie from here.
@@ -160,7 +168,6 @@ std::vector<ColmapPoint> dense_points(std::span<const DensePointsView> views, st
     const Gray &first = prepared[nearby[0].second].gray, &second = prepared[nearby[1].second].gray;
     const Camera &firstCamera = prepared[nearby[0].second].camera, &secondCamera = prepared[nearby[1].second].camera;
     const glm::mat3 toWorld = glm::transpose(glm::mat3(reference.camera.view));
-    std::vector<ColmapPoint> local;
     for (int y = kPatch; y < reference.gray.height - kPatch - 1; y += kGrid) {
       for (int x = kPatch; x < reference.gray.width - kPatch - 1; x += kGrid) {
         const auto wanted = normalised(patch_at(reference.gray, static_cast<float>(x), static_cast<float>(y)));
@@ -177,17 +184,24 @@ std::vector<ColmapPoint> dense_points(std::span<const DensePointsView> views, st
         std::array<float, kMaxSteps + 1> scores;
         scores.fill(-1.f);
         int best = -1;
-        for (int s = 0; s <= steps; ++s) {
+        const auto score = [&](int s) {
           const float inverseDepth = inverseFar + (inverseNear - inverseFar) * static_cast<float>(s) / static_cast<float>(steps);
           float depth = 0.f;
           const glm::vec2 at = project(firstCamera, world_at(inverseDepth), depth);
-          if (depth <= 0.f || !first.holds(at.x - 0.5f, at.y - 0.5f)) continue;
+          if (depth <= 0.f || !first.holds(at.x - 0.5f, at.y - 0.5f)) return;
           const auto found_patch = normalised(patch_at(first, at.x - 0.5f, at.y - 0.5f));
-          if (!found_patch) continue;
+          if (!found_patch) return;
           scores[static_cast<std::size_t>(s)] = correlation(*wanted, *found_patch);
           if (best < 0 || scores[static_cast<std::size_t>(s)] > scores[static_cast<std::size_t>(best)]) best = s;
-        }
-        if (best < 0 || scores[static_cast<std::size_t>(best)] < kMinCorrelation) continue;
+        };
+        // A whole pixel at a time, then the half pixels either side of the
+        // best: half the patches, and the best's neighbours are always known.
+        for (int s = 0; s <= steps; s += 2) score(s);
+        if (best < 0) continue;
+        const int coarse = best;
+        if (coarse > 0) score(coarse - 1);
+        if (coarse < steps) score(coarse + 1);
+        if (scores[static_cast<std::size_t>(best)] < kMinCorrelation) continue;
         bool unique = true;
         for (int s = 0; s <= steps && unique; ++s) {
           if (std::abs(s - best) > 4 && scores[static_cast<std::size_t>(s)] > scores[static_cast<std::size_t>(best)] - kMinLead) unique = false;
@@ -218,9 +232,18 @@ std::vector<ColmapPoint> dense_points(std::span<const DensePointsView> views, st
         local.push_back(point);
       }
     }
-    const std::lock_guard lock(found);
-    points.insert(points.end(), local.begin(), local.end());
-  });
+  };
+
+  // A round of references at a time, until there are twice the points wanted
+  // to choose from: matching every reference costs seconds that a small
+  // starting set doesn't need.
+  const std::size_t round = thread_count(0);
+  std::vector<ColmapPoint> points;
+  for (std::size_t first = 0; first < references.size() && points.size() < 2 * maxPoints; first += round) {
+    const std::size_t count = std::min(round, references.size() - first);
+    parallel_for(count, 0, [&](std::size_t r) { match(first + r); });
+    for (std::size_t r = first; r < first + count; ++r) points.insert(points.end(), perReference[r].begin(), perReference[r].end());
+  }
 
   if (points.size() > maxPoints) {
     std::mt19937 rng(1);

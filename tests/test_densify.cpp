@@ -376,8 +376,10 @@ TEST_CASE("Patch matching finds points on a textured plane", "[densify]") {
   }
   CHECK(static_cast<double>(onPlane) > 0.95 * static_cast<double>(found.size()));
 
-  // The limit holds.
-  CHECK(dense_points(views, sparse, 100).size() == 100);
+  // The limit holds, and the same points come back each time.
+  const std::vector<ColmapPoint> few = dense_points(views, sparse, 100), again = dense_points(views, sparse, 100);
+  CHECK(few.size() == 100);
+  CHECK(std::ranges::equal(few, again, [](const ColmapPoint &a, const ColmapPoint &b) { return a.position == b.position; }));
   // Too few views to check anything.
   CHECK(dense_points(std::span(views).first(2), sparse, 100).empty());
 }

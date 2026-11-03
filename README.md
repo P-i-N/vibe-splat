@@ -130,7 +130,7 @@ does automatic differentiation: each pass has a hand-derived counterpart.
 - **Overlap.** One submission per iteration (forward, loss, backward, Adam),
   and the next view's image is copied to staging memory on a worker thread
   while the GPU works on the current one.
-- **Starting points.** Besides the sparse model, up to 200000 more points come
+- **Starting points.** Besides the sparse model, up to 50000 more points come
   from matching patches along epipolar lines between the photos, checked in a
   third one (`--dense-init` sets how many, 0 turns it off). The idea is from
   EDGS, without its neural matcher.
