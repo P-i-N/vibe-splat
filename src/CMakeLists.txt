@@ -11,6 +11,7 @@ add_library(splat_core STATIC
   splat/gaussian_cloud.cpp
   splat/lzma.cpp
   splat/cgc.cpp
+  splat/align.cpp
   render/camera.cpp
   render/splat_renderer.cpp
   render/offscreen.cpp

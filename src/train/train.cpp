@@ -4,6 +4,7 @@
 #include "ingest/image.hpp"
 #include "render/camera.hpp"
 #include "sfm/colmap_model.hpp"
+#include "splat/align.hpp"
 #include "splat/cgc.hpp"
 #include "splat/gaussian_cloud.hpp"
 #include "train/dense_points.hpp"
@@ -456,8 +457,13 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
   double densifySeconds = 0.0;
   int densifyRounds = 0;
   double pruneSeconds = 0.0;
+  std::vector<Camera> allCameras;
+  for (const auto *views : {&trainViews, &holdoutViews}) {
+    for (const View &view : *views) allCameras.push_back(view.camera);
+  }
   // CGC refuses NaN and infinity, which a few Gaussians can pick up after
   // densification has stopped pruning them, so those are left out of CGC files.
+  // Returns how the floor was found, or nothing if it was not looked for.
   const auto save_output = [&](const fs::path &path, const CgcOptions &cgcOptions) {
     GaussianCloud cloud = trainer.cloud();
     const CloudFormat format = cloud_format(options.out);
@@ -466,7 +472,17 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
         bar.message(std::format("  left out {} Gaussians with NaN or infinite values", removed));
       }
     }
+    std::string floorNote;
+    if (options.alignFloor) {
+      const FloorEstimate floor = estimate_floor(cloud, allCameras);
+      transform_cloud(cloud, floor_alignment(floor, cloud));
+      const double tilt = glm::degrees(std::acos(std::clamp(glm::dot(floor.normal, estimate_up(allCameras)), -1.0, 1.0)));
+      floorNote = floor.fitted ? std::format("floor plane through {} of {} opaque Gaussians, {:.1f} deg off the cameras' up", floor.inliers,
+                                             floor.candidates, tilt)
+                               : "no floor plane found, levelled by the cameras' up";
+    }
     save_cloud(cloud, path, format, cgcOptions);
+    return floorNote;
   };
   const auto start = std::chrono::steady_clock::now();
   bar.start();
@@ -621,9 +637,9 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
       // Through a temporary file, so that a crash never leaves half a checkpoint.
       const fs::path temporary = fs::path(options.out).concat(".tmp");
       // Quick settings, so that CGC checkpoints don't hold up training.
-      save_output(temporary, CgcOptions{.fast = true});
+      const std::string floorNote = save_output(temporary, CgcOptions{.fast = true});
       fs::rename(temporary, options.out);
-      bar.message(std::format("  iteration {:6}: checkpoint saved to {}", iteration, options.out.string()));
+      bar.message(std::format("  iteration {:6}: checkpoint saved to {}{}", iteration, options.out.string(), floorNote.empty() ? "" : " (" + floorNote + ")"));
     }
     if (iteration % 10 == 0 || iteration == options.iterations) {
       const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -653,7 +669,9 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
 
   trainer.set_active_sh_degree(options.shDegree);
   report.gaussians = trainer.gaussian_count();
-  save_output(options.out, CgcOptions{});
+  if (const std::string floorNote = save_output(options.out, CgcOptions{}); !floorNote.empty()) {
+    std::println("Aligned to the floor: {}", floorNote);
+  }
   write_preview(trainer.render(trainViews[0].camera), trainViews[0], options.project / "preview_train.png");
   if (!holdoutViews.empty()) {
     write_preview(trainer.render(holdoutViews[0].camera), holdoutViews[0], options.project / "preview_holdout.png");

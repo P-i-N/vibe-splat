@@ -261,6 +261,15 @@ splat info
 3DGS data normally uses the COLMAP convention, where "up" is -y. If a scene
 appears upside down, pass `--up +y` (or `+z`/`-z`).
 
+`splat train` saves its output, checkpoints included, with the floor level at
+y = 0 under the scene's centre, -y up. Training itself stays in the cameras'
+frame; only the saved copy is turned (positions, orientations and the
+view-dependent colour). Up comes from the cameras, whose x axes lie level when
+held by people, and the floor is the plane holding the most opaque Gaussians,
+by RANSAC, within 20 degrees of that, favouring level ones and with the
+cameras above it. If no such plane stands out, the scene is only levelled by
+the cameras' up. Pass `--no-align` to save in the cameras' frame.
+
 ## Building
 
 Requirements: CMake 3.28+, Ninja, git, and a C++23 compiler (GCC 14+,

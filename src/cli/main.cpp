@@ -146,6 +146,8 @@ train options (writes project/splat.ply and project/preview_*.png):
   --dense-init <n>        Start from up to n more points than the sparse model has,
                           found by matching patches between the photos (default 50000)
   --point-extent          Take the scene's extent from the sparse points, not the cameras
+  --no-align              Save in the cameras' frame, rather than with the floor
+                          level at y = 0 (-y up) under the scene's centre
 
 make-test-views options:
   --count <n>             Number of images (default 12)
@@ -463,11 +465,11 @@ int cmd_train(const GlobalOptions &opts) {
   for (auto &a : rest) {
     if (a == "-o") a = "--out";
   }
-  const splat::cli::Args args(rest, {"--no-densify", "--full-resolution", "--exposure", "--full-adam", "--significance-prune", "--point-extent", "--fixed-schedule", "--refine-poses", "--second-order"});
+  const splat::cli::Args args(rest, {"--no-densify", "--full-resolution", "--exposure", "--full-adam", "--significance-prune", "--point-extent", "--fixed-schedule", "--refine-poses", "--second-order", "--no-align"});
   args.allow_only({"out", "iterations", "lambda-ssim", "sh-degree", "max-size", "max-views", "holdout", "seed", "report-every", "save-every",
                    "no-densify", "gradient-threshold", "vram-budget", "max-gaussians", "prune", "full-resolution", "exposure", "full-adam",
                    "threshold-rise", "split-threshold", "dense-fraction", "densify-interval", "score-views", "score-min-pixels", "explore",
-                   "significance-prune", "point-extent", "fixed-schedule", "refine-poses", "second-order", "dense-init"});
+                   "significance-prune", "point-extent", "fixed-schedule", "refine-poses", "second-order", "dense-init", "no-align"});
   if (args.positionals().size() != 1) {
     std::println(stderr, "Usage: splat train <project> [options]  (see splat --help)");
     return 2;
@@ -505,6 +507,7 @@ int cmd_train(const GlobalOptions &opts) {
   options.refinePoses = args.has("refine-poses");
   options.secondOrder = args.has("second-order");
   options.densePoints = args.number<std::size_t>("dense-init", options.densePoints);
+  options.alignFloor = !args.has("no-align");
   splat::vk::Context ctx(opts.context);
   std::println("Device: {}", ctx.info().name);
   splat::run_train(ctx, options);

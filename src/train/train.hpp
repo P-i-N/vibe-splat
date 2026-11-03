@@ -55,6 +55,9 @@ struct TrainOptions {
   // After densification, steps from the curvature instead of Adam's second moment (3DGS^2-TR).
   bool secondOrder = false;
   bool pointExtent = false;       // The scene's extent from the sparse points, not the cameras
+  // Turn and move the saved Gaussians so the floor is level at y = 0, -y up.
+  // Training itself stays in the cameras' frame.
+  bool alignFloor = true;
 };
 
 struct TrainReport {
