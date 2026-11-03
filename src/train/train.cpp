@@ -525,6 +525,16 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
     }
     report.peakGpuBytes = std::max(report.peakGpuBytes, trainer.gpu_bytes());
 
+    // Measured now, before this iteration's pruning and opacity reset: a cloud
+    // just after a reset is nearly transparent and its PSNR says nothing about
+    // what training reached. Reported below, once the Gaussian count is final.
+    const bool reportDue = iteration % options.reportEvery == 0 || iteration == options.iterations;
+    double probePsnr = 0.0;
+    if (reportDue) {
+      const View &probe = holdoutViews.empty() ? trainViews[0] : holdoutViews[0];
+      probePsnr = psnr_of(fitting([&] { return trainer.render(probe.camera); }), probe.rgba);
+    }
+
     // Before densification, which may cap the opacities the ranking depends on.
     if (options.pruneShare > 0.0 && (iteration == densifyUntil || iteration == pruneAgainAt)) {
       const auto pruneStart = std::chrono::steady_clock::now();
@@ -596,10 +606,9 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
       ++densifyRounds;
     }
 
-    if (iteration % options.reportEvery == 0 || iteration == options.iterations) {
+    if (reportDue) {
       const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-      const View &probe = holdoutViews.empty() ? trainViews[0] : holdoutViews[0];
-      const double probePsnr = psnr_of(fitting([&] { return trainer.render(probe.camera); }), probe.rgba);
+      report.progressPsnr.emplace_back(iteration, probePsnr);
       bar.message(std::format("  iteration {:6}: loss {:.4f}, {} PSNR {:.2f} dB, {} Gaussians, {} visible, {} tile entries, {:.2f} GiB, {:.1f} it/s", iteration,
                    lossSum / lossCount, holdoutViews.empty() ? "training view" : "held-out view", probePsnr, trainer.gaussian_count(), stats.visibleSplats, stats.tileEntries,
                    static_cast<double>(trainer.gpu_bytes()) / (1024.0 * 1024.0 * 1024.0), iteration / seconds));

@@ -626,5 +626,15 @@ TEST_CASE("A full schedule keeps the quality it reached", "[.long][vulkan]") {
   const TrainReport report = run_train(*ctx, train);
   CHECK(report.holdoutPsnr > 28.0);
   CHECK(report.lastLoss < report.firstLoss * 0.3f);
+  // The progress reports measure the cloud before an opacity reset, never
+  // the nearly transparent one just after it. The reset at iteration 3000
+  // once took 6 dB off that report.
+  REQUIRE(report.progressPsnr.size() == 8);
+  for (std::size_t i = 1; i < report.progressPsnr.size(); ++i) {
+    const auto [iteration, psnr] = report.progressPsnr[i];
+    const double previous = report.progressPsnr[i - 1].second;
+    INFO("iteration " << iteration << ": " << psnr << " dB after " << previous << " dB");
+    CHECK(psnr > previous - 1.0);
+  }
   fs::remove_all(dir);
 }

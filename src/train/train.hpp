@@ -4,6 +4,8 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <utility>
+#include <vector>
 
 namespace splat {
 
@@ -65,6 +67,10 @@ struct TrainReport {
   std::size_t gaussians = 0;
   std::uint64_t peakGpuBytes = 0;
   std::size_t heldBack = 0;
+  // The progress reports' PSNR on the probe view (the first held-out view, or
+  // the first training view), by iteration, as measured before that
+  // iteration's pruning and opacity reset.
+  std::vector<std::pair<int, double>> progressPsnr;
 };
 
 // Trains Gaussians on a project with images and camera poses in sparse/0, and
