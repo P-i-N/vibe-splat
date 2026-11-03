@@ -611,6 +611,42 @@ TEST_CASE("Scoring a view counts the high-error pixels each Gaussian reaches", "
   }
 }
 
+TEST_CASE("Scoring a view accumulates the edge score", "[train][vulkan]") {
+  vk::Context *ctx = test::context();
+  if (ctx == nullptr) SKIP("No usable Vulkan device");
+  const Camera camera = test_camera(96, 64); // Identity pose, focal 60: pixel x = 30 x + 48 at depth 2
+  // One vertical edge down the middle: dark left, bright right.
+  std::vector<std::uint8_t> target(static_cast<std::size_t>(camera.width) * camera.height * 4, 255);
+  for (int y = 0; y < camera.height; ++y) {
+    for (int x = 0; x < camera.width; ++x) {
+      const std::size_t at = (static_cast<std::size_t>(y) * camera.width + x) * 4;
+      target[at] = target[at + 1] = target[at + 2] = x < camera.width / 2 ? 40 : 220;
+    }
+  }
+  // Eight small Gaussians on the edge, eight 24 pixels to its right.
+  GaussianCloud cloud;
+  cloud.resize(16, 0);
+  for (std::size_t i = 0; i < 16; ++i) {
+    cloud.positions[i * 3] = i < 8 ? 0.f : 0.8f;
+    cloud.positions[i * 3 + 1] = (static_cast<float>(i % 8) - 3.5f) * 0.1f;
+    cloud.positions[i * 3 + 2] = 2.f;
+    for (std::size_t a = 0; a < 3; ++a) cloud.scales[i * 3 + a] = std::log(0.02f);
+    cloud.rotations[i * 4] = 1.f;
+  }
+  Trainer trainer(*ctx, cloud);
+  trainer.score_view(camera, target, 0.5f, 1.f);
+  const DensifyStats scored = trainer.densify_stats();
+  REQUIRE(scored.edgeScore.size() == cloud.size());
+  double nearSum = 0.0, farSum = 0.0;
+  for (std::size_t i = 0; i < 8; ++i) nearSum += scored.edgeScore[i];
+  for (std::size_t i = 8; i < 16; ++i) farSum += scored.edgeScore[i];
+  std::println("  edge score on the edge {:.3f} per Gaussian, 24 pixels away {:.3f}", nearSum / 8, farSum / 8);
+  CHECK(nearSum > 0.0);
+  CHECK(farSum == 0.0);
+  // The high-error count is untouched by the edge weight: the whole image is wrong.
+  for (std::size_t i = 0; i < 16; ++i) CHECK(scored.markedPixels[i] > 0.f);
+}
+
 TEST_CASE("Pose gradients match finite differences of the loss", "[train][vulkan]") {
   vk::Context *ctx = test::context();
   if (ctx == nullptr) SKIP("No usable Vulkan device");

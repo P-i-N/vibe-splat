@@ -393,7 +393,7 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
   trainerOptions.opacityReg = options.opacityReg;
   trainerOptions.scaleReg = options.scaleReg;
   trainerOptions.positionNoise = options.positionNoise;
-  trainerOptions.mipFilter2d = options.mipFilter;
+  trainerOptions.mipFilter2d = options.mipFilter2d;
   trainerOptions.nearPlane = static_cast<float>(typicalDepth * 0.01);
   // Asked for before anything is allocated, so that it is all ours to spend.
   double budgetGiB = options.vramBudgetGiB;
@@ -478,7 +478,7 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
   std::vector<float> filter3d;
   std::size_t filterLevel = ~std::size_t{0};
   const auto refresh_filter = [&](int iteration) {
-    if (!options.mipFilter) return;
+    if (!options.mipFilter3d) return;
     std::vector<Camera> cameras;
     cameras.reserve(trainViews.size());
     for (std::size_t i = 0; i < trainViews.size(); ++i) cameras.push_back(view_at(i, iteration).camera);
@@ -488,7 +488,7 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
   };
   const auto save_output = [&](const fs::path &path, const CgcOptions &cgcOptions) {
     GaussianCloud cloud = trainer.cloud();
-    if (options.mipFilter && filter3d.size() == cloud.size()) bake_filter(cloud, filter3d);
+    if (options.mipFilter3d && filter3d.size() == cloud.size()) bake_filter(cloud, filter3d);
     const CloudFormat format = cloud_format(options.out);
     if (format == CloudFormat::Cgc) {
       if (const std::size_t removed = remove_non_finite(cloud); removed > 0) {
@@ -525,7 +525,7 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
       std::shuffle(order.begin(), order.end(), rng);
     }
     const View &nextView = view_at(order.back(), iteration + 1);
-    if (options.mipFilter && coarse_level(iteration) != filterLevel) refresh_filter(iteration);
+    if (options.mipFilter3d && coarse_level(iteration) != filterLevel) refresh_filter(iteration);
 
     const double progress = static_cast<double>(iteration - 1) / std::max(options.iterations - 1, 1);
     // With the adaptive schedule, held while the image is still growing.
@@ -613,6 +613,7 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
       densifyOptions.pruneLarge = iteration > kOpacityResetInterval && !options.significancePrune;
       if (options.significancePrune) densifyOptions.transparentShare = 0.5;
       densifyOptions.exploreSplits = densifyOptions.exploreSeeds = static_cast<std::size_t>(options.explore);
+      densifyOptions.edgeSplit = options.edgeSplit;
       densifyOptions.maxGaussians = available > pixelBytes ? static_cast<std::size_t>(static_cast<double>(available - pixelBytes) / perGaussian) : 0;
       if (options.maxGaussians > 0) densifyOptions.maxGaussians = std::min(densifyOptions.maxGaussians, options.maxGaussians);
       const auto densifyStart = std::chrono::steady_clock::now();

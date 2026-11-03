@@ -140,7 +140,11 @@ train options (writes project/splat.ply and project/preview_*.png):
   --position-noise <x>    Move nearly transparent Gaussians at random each step, by this
                           times the position rate (3DGS-MCMC uses 5e5; default 0)
   --mip-filter            Mip-Splatting's filters against aliasing: a 0.1 pixel dilation
-                          with the opacity scaled to match, in place of 0.3
+                          with the opacity scaled to match, in place of 0.3, and a 3D
+                          filter at each Gaussian's smallest footprint in the photos
+                          (--mip-filter-2d and --mip-filter-3d: one of the two)
+  --edge-split            Split in proportion to the edges a Gaussian covers, into two
+                          children along its longest axis (Improving Densification)
   --densify-interval <n>  Iterations between densification rounds (default 100)
   --score-views <n>       Densify only Gaussians reaching many high-error pixels in
                           this many views per round (default 10; 0: off)
@@ -478,11 +482,11 @@ int cmd_train(const GlobalOptions &opts) {
   for (auto &a : rest) {
     if (a == "-o") a = "--out";
   }
-  const splat::cli::Args args(rest, {"--no-densify", "--full-resolution", "--exposure", "--full-adam", "--significance-prune", "--point-extent", "--adaptive-schedule", "--mip-filter", "--refine-poses", "--second-order", "--no-align"});
+  const splat::cli::Args args(rest, {"--no-densify", "--full-resolution", "--exposure", "--full-adam", "--significance-prune", "--point-extent", "--adaptive-schedule", "--mip-filter", "--mip-filter-2d", "--mip-filter-3d", "--edge-split", "--refine-poses", "--second-order", "--no-align"});
   args.allow_only({"out", "iterations", "lambda-ssim", "sh-degree", "max-size", "max-views", "holdout", "seed", "report-every", "save-every",
                    "no-densify", "densify", "gradient-threshold", "vram-budget", "max-gaussians", "prune", "full-resolution", "exposure", "full-adam",
                    "threshold-rise", "split-threshold", "dense-fraction", "densify-interval", "score-views", "score-min-pixels", "explore",
-                   "significance-prune", "point-extent", "adaptive-schedule", "max-growth", "opacity-reg", "scale-reg", "position-noise", "mip-filter", "refine-poses", "second-order", "dense-init", "no-align"});
+                   "significance-prune", "point-extent", "adaptive-schedule", "max-growth", "opacity-reg", "scale-reg", "position-noise", "mip-filter", "mip-filter-2d", "mip-filter-3d", "edge-split", "refine-poses", "second-order", "dense-init", "no-align"});
   if (args.positionals().size() != 1) {
     std::println(stderr, "Usage: splat train <project> [options]  (see splat --help)");
     return 2;
@@ -527,7 +531,9 @@ int cmd_train(const GlobalOptions &opts) {
   options.opacityReg = std::max(args.number("opacity-reg", options.opacityReg), 0.f);
   options.scaleReg = std::max(args.number("scale-reg", options.scaleReg), 0.f);
   options.positionNoise = std::max(args.number("position-noise", options.positionNoise), 0.f);
-  options.mipFilter = args.has("mip-filter");
+  options.mipFilter2d = args.has("mip-filter") || args.has("mip-filter-2d");
+  options.mipFilter3d = args.has("mip-filter") || args.has("mip-filter-3d");
+  options.edgeSplit = args.has("edge-split");
   options.refinePoses = args.has("refine-poses");
   options.secondOrder = args.has("second-order");
   options.densePoints = args.number<std::size_t>("dense-init", options.densePoints);

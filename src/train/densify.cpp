@@ -37,11 +37,8 @@ bool all_finite(const GaussianCloud &cloud, std::size_t i) {
          finite(std::span(cloud.rotations).subspan(i * 4, 4)) && std::isfinite(cloud.opacities[i]) && finite(std::span(cloud.sh).subspan(i * floats, floats));
 }
 
-// A sample from the Gaussian itself: rotated standard normal, scaled.
-void sample_position(const GaussianCloud &cloud, std::size_t i, std::mt19937 &rng, float out[3]) {
-  std::normal_distribution<float> normal(0.f, 1.f);
-  const float local[3] = {normal(rng) * std::exp(cloud.scales[i * 3]), normal(rng) * std::exp(cloud.scales[i * 3 + 1]),
-                          normal(rng) * std::exp(cloud.scales[i * 3 + 2])};
+// The Gaussian's rotation as a matrix, identity for a degenerate quaternion.
+void rotation_of(const GaussianCloud &cloud, std::size_t i, float R[3][3]) {
   float w = cloud.rotations[i * 4], x = cloud.rotations[i * 4 + 1], y = cloud.rotations[i * 4 + 2], z = cloud.rotations[i * 4 + 3];
   const float length = std::sqrt(w * w + x * x + y * y + z * z);
   if (length > 0.f) {
@@ -53,9 +50,19 @@ void sample_position(const GaussianCloud &cloud, std::size_t i, std::mt19937 &rn
     w = 1.f;
     x = y = z = 0.f;
   }
-  const float R[3][3] = {{1.f - 2.f * (y * y + z * z), 2.f * (x * y - w * z), 2.f * (x * z + w * y)},
+  const float M[3][3] = {{1.f - 2.f * (y * y + z * z), 2.f * (x * y - w * z), 2.f * (x * z + w * y)},
                          {2.f * (x * y + w * z), 1.f - 2.f * (x * x + z * z), 2.f * (y * z - w * x)},
                          {2.f * (x * z - w * y), 2.f * (y * z + w * x), 1.f - 2.f * (x * x + y * y)}};
+  std::copy(&M[0][0], &M[0][0] + 9, &R[0][0]);
+}
+
+// A sample from the Gaussian itself: rotated standard normal, scaled.
+void sample_position(const GaussianCloud &cloud, std::size_t i, std::mt19937 &rng, float out[3]) {
+  std::normal_distribution<float> normal(0.f, 1.f);
+  const float local[3] = {normal(rng) * std::exp(cloud.scales[i * 3]), normal(rng) * std::exp(cloud.scales[i * 3 + 1]),
+                          normal(rng) * std::exp(cloud.scales[i * 3 + 2])};
+  float R[3][3];
+  rotation_of(cloud, i, R);
   for (std::size_t r = 0; r < 3; ++r) {
     out[r] = cloud.positions[i * 3 + r] + R[r][0] * local[0] + R[r][1] * local[1] + R[r][2] * local[2];
   }
@@ -112,7 +119,7 @@ DensifyResult densify_cloud(const GaussianCloud &cloud, const DensifyStats &stat
   }
 
   DensifyResult result;
-  enum class Action : std::uint8_t { Keep, Prune, Clone, Split };
+  enum class Action : std::uint8_t { Keep, Prune, Clone, Split, LongAxis };
   std::vector<Action> actions(n, Action::Keep);
   const auto largest_of = [&](std::size_t i) { return std::exp(std::max({cloud.scales[i * 3], cloud.scales[i * 3 + 1], cloud.scales[i * 3 + 2]})); };
 
@@ -165,8 +172,22 @@ DensifyResult densify_cloud(const GaussianCloud &cloud, const DensifyStats &stat
     candidates.resize(room);
     std::sort(candidates.begin(), candidates.end());
   }
+  // With the edge-aware score, a candidate splits with probability
+  // score / best, unless no candidate touched an edge at all.
+  if (options.edgeSplit) {
+    const auto score = [&](std::size_t i) { return i < stats.edgeScore.size() ? stats.edgeScore[i] : 0.f; };
+    float best = 0.f;
+    for (const std::size_t i : candidates) best = std::max(best, score(i));
+    if (best > 0.f) {
+      std::uniform_real_distribution<float> draw(0.f, 1.f);
+      std::erase_if(candidates, [&](std::size_t i) { return draw(rng) > score(i) / best; });
+    }
+  }
   for (const std::size_t i : candidates) {
-    if (largest_of(i) > options.denseScale) {
+    if (options.edgeSplit) {
+      actions[i] = Action::LongAxis;
+      ++result.split;
+    } else if (largest_of(i) > options.denseScale) {
       actions[i] = Action::Split;
       ++result.split;
     } else {
@@ -255,6 +276,28 @@ DensifyResult densify_cloud(const GaussianCloud &cloud, const DensifyStats &stat
           out.positions[at * 3 + a] = position[a];
           out.scales[at * 3 + a] -= std::log(kSplitShrink);
         }
+        result.source.push_back(-1);
+      }
+    } else if (actions[i] == Action::LongAxis) {
+      // Two children on the longest axis, tangent to the parent at its ends:
+      // at 0.45 of its semi-axis from the centre, 0.55 of it long, the other
+      // axes shrunk to keep inside, and 0.6 of its opacity each.
+      constexpr float kOffset = 0.45f;
+      const std::size_t axis = static_cast<std::size_t>(std::max_element(cloud.scales.begin() + static_cast<std::ptrdiff_t>(i * 3),
+                                                                         cloud.scales.begin() + static_cast<std::ptrdiff_t>(i * 3 + 3)) -
+                                                        (cloud.scales.begin() + static_cast<std::ptrdiff_t>(i * 3)));
+      float R[3][3];
+      rotation_of(cloud, i, R);
+      const float length = std::exp(cloud.scales[i * 3 + axis]);
+      const double opacity = 0.6 * sigmoid(cloud.opacities[i]);
+      for (const float side : {-1.f, 1.f}) {
+        const std::size_t at = out.size();
+        append_copy(out, cloud, i);
+        for (std::size_t a = 0; a < 3; ++a) {
+          out.positions[at * 3 + a] += side * kOffset * length * R[a][axis];
+          out.scales[at * 3 + a] += a == axis ? std::log(1.f - kOffset) : 0.5f * std::log(1.f - kOffset * kOffset);
+        }
+        out.opacities[at] = static_cast<float>(std::log(opacity / (1.0 - opacity)));
         result.source.push_back(-1);
       }
     }

@@ -12,12 +12,12 @@ const float LOG_MIN_TRANSMITTANCE = -9.210340372;
 // Below these a Gaussian is degenerate and is not drawn, as in Faster-GS.
 const float MIN_QUATERNION_LENGTH = 1e-4;
 const float MIN_CONIC_DETERMINANT = 1e-6;
-const uint RAW_PER_SPLAT = 13u; // Sums per splat from the backward pass, listed in train_backward.glsl
+const uint RAW_PER_SPLAT = 14u; // Sums per splat from the backward pass, listed in train_backward.glsl
 
 // What densification decides on, per Gaussian.
 struct DensifyStat {
   vec4 main; // x: gradient sum, y: visits, z: largest radius, w: contribution
-  vec4 more; // x: sum of the gradient without cancelling, y: marked pixels, z: those by loss
+  vec4 more; // x: sum of the gradient without cancelling, y: marked pixels, z: those by loss, w: edge score
 };
 
 struct TrainSplat {

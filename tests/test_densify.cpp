@@ -414,6 +414,62 @@ TEST_CASE("Relocation with no live Gaussian leaves the cloud alone", "[densify]"
   CHECK(result.cloned == 0);
 }
 
+TEST_CASE("Long-axis split places two children along the longest axis", "[densify]") {
+  GaussianCloud cloud = line_of(1, 1.f);
+  cloud.scales[1] = cloud.scales[2] = std::log(0.2f);
+  DensifyStats stats = stats_of(1, 2.f);
+  stats.edgeScore.assign(1, 1.f);
+  DensifyOptions options = default_options();
+  options.edgeSplit = true;
+  std::mt19937 rng(1);
+  const DensifyResult result = densify_cloud(cloud, stats, options, rng);
+  REQUIRE(result.cloud.size() == 2);
+  CHECK(result.split == 1);
+  std::array<float, 2> xs{result.cloud.positions[0], result.cloud.positions[3]};
+  std::ranges::sort(xs);
+  CHECK_THAT(xs[0], WithinAbs(-0.45, 1e-6));
+  CHECK_THAT(xs[1], WithinAbs(0.45, 1e-6));
+  for (std::size_t i = 0; i < 2; ++i) {
+    INFO("child " << i);
+    CHECK_THAT(result.cloud.scales[i * 3], WithinAbs(std::log(0.55), 1e-6));
+    CHECK_THAT(result.cloud.scales[i * 3 + 1], WithinAbs(std::log(0.2 * std::sqrt(1.0 - 0.45 * 0.45)), 1e-6));
+    CHECK_THAT(result.cloud.scales[i * 3 + 2], WithinAbs(std::log(0.2 * std::sqrt(1.0 - 0.45 * 0.45)), 1e-6));
+    CHECK_THAT(1.0 / (1.0 + std::exp(-result.cloud.opacities[i])), WithinAbs(0.3, 1e-6));
+    CHECK(result.source[i] == -1);
+  }
+}
+
+TEST_CASE("Edge scores set the split probability", "[densify]") {
+  const GaussianCloud cloud = line_of(1000, 1.f);
+  DensifyStats stats = stats_of(1000, 2.f);
+  stats.edgeScore.assign(1000, 0.1f);
+  for (std::size_t i = 0; i < 500; ++i) stats.edgeScore[i] = 1.f;
+  DensifyOptions options = default_options();
+  options.edgeSplit = true;
+  std::mt19937 rng(1);
+  const DensifyResult result = densify_cloud(cloud, stats, options, rng);
+  CHECK(result.split >= 530);
+  CHECK(result.split <= 570);
+  // Every Gaussian with the top score split: none of them survives unchanged.
+  std::size_t keptOfTop = 0;
+  for (std::size_t i = 0; i < result.cloud.size(); ++i) {
+    if (result.source[i] >= 0 && result.source[i] < 500) ++keptOfTop;
+  }
+  CHECK(keptOfTop == 0);
+}
+
+TEST_CASE("All edge scores zero splits every candidate", "[densify]") {
+  const GaussianCloud cloud = line_of(100, 1.f);
+  DensifyStats stats = stats_of(100, 2.f);
+  stats.edgeScore.assign(100, 0.f);
+  DensifyOptions options = default_options();
+  options.edgeSplit = true;
+  std::mt19937 rng(1);
+  const DensifyResult result = densify_cloud(cloud, stats, options, rng);
+  CHECK(result.split == 100);
+  CHECK(result.cloud.size() == 200);
+}
+
 TEST_CASE("The smoothing filter is the smallest footprint of the cameras that see a Gaussian", "[densify]") {
   const auto camera_at = [](float z) {
     Camera camera = Camera::look_at(glm::vec3(0.f, 0.f, z), glm::vec3(0.f), glm::vec3(0.f, -1.f, 0.f), 60.f, 64, 48);

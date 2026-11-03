@@ -21,5 +21,6 @@ void main() {
     const float pixels = raw[i * RAW_PER_SPLAT + 12u] * pc.toPixels;
     densifyStats[i].more.y += pixels;
     densifyStats[i].more.z += pixels * pc.loss;
+    densifyStats[i].more.w += raw[i * RAW_PER_SPLAT + 13u] * pc.toPixels;
   }
 }

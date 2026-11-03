@@ -21,7 +21,7 @@ using vk::MemoryUsage;
 constexpr VkBufferUsageFlags kStorage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
 constexpr std::uint32_t kTileSize = 16;
 constexpr float kBeta1 = 0.9f, kBeta2 = 0.999f, kEpsilon = 1e-15f;
-constexpr std::size_t kRawGradientsPerSplat = 13; // RAW_PER_SPLAT in train_types.glsl
+constexpr std::size_t kRawGradientsPerSplat = 14; // RAW_PER_SPLAT in train_types.glsl
 constexpr float kCurvatureBeta = 0.999f;
 constexpr std::uint32_t kMaxMarks = 16;
 
@@ -166,7 +166,7 @@ Trainer::Trainer(vk::Context &ctx, const GaussianCloud &initial, const TrainerOp
       forward_(ctx, shaders::train_forward_comp, 5, sizeof(TilePush)),
       exposure_(ctx, shaders::train_exposure_comp, 2, sizeof(ExposurePush)),
       ssim_(ctx, shaders::train_ssim_comp, 4, sizeof(SsimPush)),
-      loss_(ctx, shaders::train_loss_comp, 6, sizeof(LossPush)),
+      loss_(ctx, shaders::train_loss_comp, 7, sizeof(LossPush)),
       exposureBackward_(ctx, shaders::train_exposure_backward_comp, 3, sizeof(ExposurePush)),
       errorMask_(ctx, shaders::train_error_mask_comp, 2, sizeof(ErrorMaskPush)),
       score_(ctx, shaders::train_score_comp, 2, sizeof(ScorePush)), pose_(ctx, shaders::train_pose_comp, 4),
@@ -184,11 +184,11 @@ Trainer::Trainer(vk::Context &ctx, const GaussianCloud &initial, const TrainerOp
 
   fixedPoint_ = options.forceFixedPoint || !ctx.info().floatAtomicAdd;
   if (fixedPoint_) {
-    backward_.emplace(ctx, shaders::train_backward_fixed_comp, 8, sizeof(TilePush));
+    backward_.emplace(ctx, shaders::train_backward_fixed_comp, 9, sizeof(TilePush));
     fixedToFloat_.emplace(ctx, shaders::train_fixed_to_float_comp, 1, sizeof(FixedPush));
     fixedScale_ = std::make_unique<Buffer>(ctx, sizeof(float), kStorage, MemoryUsage::Upload);
   } else {
-    backward_.emplace(ctx, shaders::train_backward_float_comp, 7, sizeof(TilePush));
+    backward_.emplace(ctx, shaders::train_backward_float_comp, 8, sizeof(TilePush));
   }
 
   groups_.push_back(std::make_unique<Group>(ctx, initial.positions));
@@ -289,6 +289,7 @@ void Trainer::ensure_size(int width, int height) {
     exposed_ = gpu_buffer(ctx_, pixels * 16);
     exposureTotals_ = std::make_unique<Buffer>(ctx_, (pixels + 255) / 256 * 12 * sizeof(float), kStorage, MemoryUsage::Readback);
     adjoint_ = gpu_buffer(ctx_, pixels * 16);
+    edge_ = gpu_buffer(ctx_, pixels * 4);
     fields_ = gpu_buffer(ctx_, pixels * 48);
     // The target is written by the CPU into staging memory and copied to the
     // device once per iteration, as the loss passes read it several times.
@@ -411,7 +412,7 @@ void Trainer::record_backward(VkCommandBuffer cmd) {
   if (scoreErrorShare_ > 0.f) clear(cmd, *errorMax_);
   ssim_.dispatch(cmd, {seen, target_.get(), fields_.get(), groupTotals_.get()}, SsimPush{w, h, gridW_}, tileCount_);
   vk::compute_barrier(cmd);
-  loss_.dispatch(cmd, {seen, target_.get(), fields_.get(), adjoint_.get(), groupTotals_.get(), errorMax_.get()},
+  loss_.dispatch(cmd, {seen, target_.get(), fields_.get(), adjoint_.get(), groupTotals_.get(), errorMax_.get(), edge_.get()},
                  LossPush{w, h, gridW_, options_.lambdaSsim, scoreErrorShare_ > 0.f ? 1u : 0u}, tileCount_);
   vk::compute_barrier(cmd);
   if (exposing_) {
@@ -433,13 +434,13 @@ void Trainer::record_backward_from_adjoint(VkCommandBuffer cmd) {
   vk::compute_barrier(cmd);
   const TilePush push{w, h, gridW_, tileCount_, {options_.background[0], options_.background[1], options_.background[2], 0.f}};
   if (fixedPoint_) {
-    backward_->dispatch(cmd, {splats_.get(), entryValues_.get(), ranges_.get(), image_.get(), adjoint_.get(), stops_.get(), rawGradients_.get(), fixedScale_.get()},
+    backward_->dispatch(cmd, {splats_.get(), entryValues_.get(), ranges_.get(), image_.get(), adjoint_.get(), stops_.get(), rawGradients_.get(), fixedScale_.get(), edge_.get()},
                         push, tileCount_);
     vk::compute_barrier(cmd);
     const auto rawCount = static_cast<std::uint32_t>(count_ * kRawGradientsPerSplat);
     fixedToFloat_->dispatch(cmd, {rawGradients_.get()}, FixedPush{rawCount, fixedScale_->as<float>()[0]}, vk::div_up(rawCount, 256));
   } else {
-    backward_->dispatch(cmd, {splats_.get(), entryValues_.get(), ranges_.get(), image_.get(), adjoint_.get(), stops_.get(), rawGradients_.get()},
+    backward_->dispatch(cmd, {splats_.get(), entryValues_.get(), ranges_.get(), image_.get(), adjoint_.get(), stops_.get(), rawGradients_.get(), edge_.get()},
                         push, tileCount_);
   }
   vk::compute_barrier(cmd);
@@ -678,6 +679,7 @@ DensifyStats Trainer::densify_stats() const {
   stats.absoluteGradientSum.resize(count_);
   stats.markedPixels.resize(count_);
   stats.markedLoss.resize(count_);
+  stats.edgeScore.resize(count_);
   for (std::size_t i = 0; i < count_; ++i) {
     stats.gradientSum[i] = raw[i * 8];
     stats.visits[i] = raw[i * 8 + 1];
@@ -686,6 +688,7 @@ DensifyStats Trainer::densify_stats() const {
     stats.absoluteGradientSum[i] = raw[i * 8 + 4];
     stats.markedPixels[i] = raw[i * 8 + 5];
     stats.markedLoss[i] = raw[i * 8 + 6];
+    stats.edgeScore[i] = raw[i * 8 + 7];
   }
   return stats;
 }

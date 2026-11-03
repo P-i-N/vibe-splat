@@ -17,6 +17,7 @@ struct DensifyStats {
   std::vector<float> absoluteGradientSum; // As gradientSum, but pixels pulling opposite ways do not cancel
   std::vector<float> markedPixels; // Over the views scored, the high-error pixels it reached
   std::vector<float> markedLoss;   // The same, each view's count weighted by its loss
+  std::vector<float> edgeScore;    // Over the views scored, the target's edge weight times its blending weight, summed over pixels
 };
 
 struct DensifyOptions {
@@ -42,6 +43,10 @@ struct DensifyOptions {
   // in the cloud's bounding box. Places gradients never point to get a chance.
   std::size_t exploreSplits = 0;
   std::size_t exploreSeeds = 0;
+  // Improving Densification in 3DGS (CVPR 2026): each candidate splits with
+  // probability edgeScore / the round's best, into two children along its
+  // longest axis, in place of cloning and splitting.
+  bool edgeSplit = false;
 };
 
 struct DensifyResult {

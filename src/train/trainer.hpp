@@ -221,7 +221,7 @@ private:
   std::vector<std::unique_ptr<Group>> groups_; // positions, scales, rotations, opacities, sh
 
   std::unique_ptr<vk::Buffer> camera_, counters_, fixedScale_;
-  std::unique_ptr<vk::Buffer> splats_, keys_, values_, tmpKeys_, tmpValues_, coverage_, rawGradients_, stats_, filter3d_;
+  std::unique_ptr<vk::Buffer> splats_, keys_, values_, tmpKeys_, tmpValues_, coverage_, rawGradients_, stats_, filter3d_, edge_;
   std::unique_ptr<vk::Buffer> entryKeys_, entryValues_, tmpEntryKeys_, tmpEntryValues_;
   std::unique_ptr<vk::Buffer> ranges_, image_, stops_, exposed_, exposureTotals_, adjoint_, fields_, targetStaging_, target_, groupTotals_, errorMax_, poseTotals_;
   // prefetch_target() hands one copy at a time to a worker thread that lives

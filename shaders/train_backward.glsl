@@ -18,6 +18,7 @@
 //   10-11: |dL/dcentre| per pixel. Pixels pulling a splat opposite ways cancel
 //      in 1-2 and not here, which is what AbsGS splits on
 //   12: pixels marked as high error in the adjoint's alpha, over 3 pixels of the image
+//   13: the edge-aware score: the target's edge weight times the blending weight, likewise
 #include "train_types.glsl"
 
 layout(local_size_x = 16, local_size_y = 16) in; // TILE_SIZE
@@ -48,7 +49,7 @@ shared uint tileStop; // The lowest stop of the tile's pixels
 // value bitreverse(l), and one lane adds each total that is not zero. Every
 // lane of the subgroup must take part.
 void reduce_and_add(uint base, float g[RAW_PER_SPLAT]) {
-  float v[16] = float[16](g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7], g[8], g[9], g[10], g[11], g[12], 0.0, 0.0, 0.0);
+  float v[16] = float[16](g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7], g[8], g[9], g[10], g[11], g[12], g[13], 0.0, 0.0);
   const uint lane = gl_SubgroupInvocationID;
   // Lanes with the bit clear keep the lower half of the list and receive the
   // partner's lower half; the others keep and receive the upper half.
@@ -85,6 +86,7 @@ void main() {
   const float logTotal = inside ? image[at].a : 0.0;
   const vec3 A = inside ? adjoint[at].rgb : vec3(0.0);
   const float marked = inside ? adjoint[at].a : 0.0;
+  const float edgeWeight = marked != 0.0 || inside ? (inside ? edge[at] : 0.0) : 0.0;
   const float perPixel = 1.0 / (3.0 * float(pc.width) * float(pc.height));
   const uvec2 range = ranges[tile];
   const uint stop = inside ? stops[at] : range.y;
@@ -110,7 +112,7 @@ void main() {
     barrier();
     for (uint k = 0u; k < count; ++k) {
       const TrainSplat s = batch[k];
-      float g[RAW_PER_SPLAT] = float[RAW_PER_SPLAT](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+      float g[RAW_PER_SPLAT] = float[RAW_PER_SPLAT](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
       bool any = false;
       vec2 d;
       float power, alpha;
@@ -126,6 +128,7 @@ void main() {
         g[8] = dColour.b;
         g[9] = T * alpha * perPixel;
         g[12] = marked * perPixel;
+        g[13] = edgeWeight * T * alpha * perPixel;
 
         // At the 0.99 clamp, alpha no longer depends on the parameters.
         if (s.conicOpacity.w * exp(power) < 0.99) {
