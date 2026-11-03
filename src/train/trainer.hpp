@@ -80,6 +80,13 @@ public:
 
   [[nodiscard]] GaussianCloud cloud() const;
 
+  // The raw parameters on the GPU, laid out as in GaussianCloud: 0 positions,
+  // 1 scales, 2 rotations, 3 opacities, 4 SH. Valid until the Gaussians change
+  // in number (densify, remove_largest_gaussians).
+  [[nodiscard]] const vk::Buffer &parameters(std::size_t group) const;
+  [[nodiscard]] int sh_degree() const noexcept { return shDegree_; }
+  [[nodiscard]] int active_sh_degree() const noexcept { return activeShDegree_; }
+
   struct Gradients {
     std::vector<float> positions, scales, rotations, opacities, sh;
   };

@@ -24,20 +24,38 @@
 #include <charconv>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
 #include <optional>
 #include <print>
 #include <span>
 #include <string_view>
 #include <vector>
 
+#ifdef _WIN32
+// From kernel32, declared here rather than pulling in <windows.h>.
+extern "C" __declspec(dllimport) unsigned long __stdcall GetConsoleProcessList(unsigned long *list, unsigned long count);
+#endif
+
 namespace {
+
+// True when started by double-clicking (or dropping a file on) the program,
+// rather than from a terminal: then the console exists only for us.
+bool started_from_desktop() {
+#ifdef _WIN32
+  unsigned long processes[2];
+  return GetConsoleProcessList(processes, 2) == 1;
+#else
+  return false;
+#endif
+}
 
 constexpr std::string_view kUsage = R"(splat {} - Gaussian splat generator and viewer (Vulkan)
 
 Usage: splat <command> [options]
+       splat <scene.ply | project>   Same as 'splat view'
 
 Commands:
-  view <scene.ply>              Open the real-time viewer
+  view [scene.ply | project]    Open the real-time viewer
   render <scene.ply> -o <png>   Render one image without a window
   make-test-scene <out.ply>     Write a synthetic scene for trying things out
   info                          List Vulkan devices and whether splat can use them
@@ -98,20 +116,28 @@ train options (writes project/splat.ply and project/preview_*.png):
   --save-every <n>        Save the output this often, 0 only at the end (default 5000)
   --no-densify            Keep the initial Gaussians, without adding or removing any
   --gradient-threshold <x>  Lower adds more Gaussians (default 0.0002)
-  --vram-budget <GiB>     Default: 90% of the GPU's free memory
+  --vram-budget <GiB>     Default: 90% of the GPU's free memory (75% with --view)
   --max-gaussians <n>     Default: what the budget allows
+  --view                  Train in the viewer window, watching it as it goes
 
 make-test-views options:
   --count <n>             Number of images (default 12)
   --width <px>, --height <px>, --focal <px>   Default 640, 480, 500
 
-view options:
+view options (a project folder shows its splat.ply, camera poses and sparse
+points, and can be trained from the window; drop files or folders on it too):
   --up <axis>             As for render
+  --no-vsync              Draw as fast as possible
 
-Viewer controls:
+Viewer controls (H shows them in the window):
   left mouse drag  orbit        right/middle drag  pan       wheel  zoom
-  W A S D / Q E    move         R  reset view                Esc    quit
-  gamepad: left stick move, right stick orbit, triggers zoom, A reset
+  W A S D / Q E    move         F  frame scene  R  reset     T      turntable
+  1 / 2            splats / Gaussian centres                 Tab    hide UI
+  C / P / G        cameras / sparse points / grid            F12    screenshot
+  [ ]              look through the previous / next photo, X (hold) shows it
+  Space            pause training   Ctrl+S  save             Esc    quit
+  gamepad: left stick move, right stick orbit, triggers zoom, A reset,
+           LB/RB photos, Y hide UI
 
 Global options:
   --device <n>   Use Vulkan device n (see 'splat info')
@@ -228,18 +254,30 @@ int cmd_make_test_scene(const GlobalOptions &opts) {
 
 int cmd_view([[maybe_unused]] const GlobalOptions &opts) {
 #ifdef SPLAT_WITH_VIEWER
-  const splat::cli::Args args(opts.rest, {});
-  args.allow_only({"up"});
-  if (args.positionals().size() != 1) {
-    std::println(stderr, "Usage: splat view <scene.ply> [--up -y|+y|+z|-z]");
+  const splat::cli::Args args(opts.rest, {"--no-vsync"});
+  args.allow_only({"up", "no-vsync"});
+  if (args.positionals().size() > 1) {
+    std::println(stderr, "Usage: splat view [scene.ply | project folder] [--up -y|+y|+z|-z] [--no-vsync]");
     return 2;
   }
-  const auto cloud = load_scene(args.positionals()[0]);
   splat::ViewerOptions vo;
   vo.context = opts.context;
   vo.up = parse_up(args.get("up", "-y"));
-  vo.title = args.positionals()[0];
-  return splat::run_viewer(cloud, vo);
+  vo.vsync = !args.has("no-vsync");
+  // Without a path the window opens empty, for files dropped on it.
+  const std::filesystem::path path = args.positionals().empty() ? std::filesystem::path() : std::filesystem::path(args.positionals()[0]);
+  if (!path.empty() && std::filesystem::is_directory(path)) {
+    vo.project = path;
+    if (std::filesystem::exists(path / "splat.ply")) vo.scene = path / "splat.ply";
+  } else if (!path.empty() && std::filesystem::exists(path)) {
+    vo.scene = path;
+    // A .ply inside a project brings its camera poses along.
+    if (std::filesystem::exists(path.parent_path() / "sparse" / "0" / "images.bin")) vo.project = path.parent_path();
+  } else if (!path.empty()) {
+    std::println(stderr, "{} does not exist", path.string());
+    return 2;
+  }
+  return splat::run_viewer(vo);
 #else
   std::println(stderr, "This build of splat has no window viewer (built without SDL3). Use 'splat render'.");
   return 2;
@@ -344,9 +382,9 @@ int cmd_train(const GlobalOptions &opts) {
   for (auto &a : rest) {
     if (a == "-o") a = "--out";
   }
-  const splat::cli::Args args(rest, {"--no-densify"});
+  const splat::cli::Args args(rest, {"--no-densify", "--view"});
   args.allow_only({"out", "iterations", "lambda-ssim", "sh-degree", "max-size", "max-views", "holdout", "seed", "report-every", "save-every",
-                   "no-densify", "gradient-threshold", "vram-budget", "max-gaussians"});
+                   "no-densify", "gradient-threshold", "vram-budget", "max-gaussians", "view"});
   if (args.positionals().size() != 1) {
     std::println(stderr, "Usage: splat train <project> [options]  (see splat --help)");
     return 2;
@@ -367,6 +405,18 @@ int cmd_train(const GlobalOptions &opts) {
   options.gradientThreshold = args.number("gradient-threshold", options.gradientThreshold);
   options.vramBudgetGiB = args.number("vram-budget", 0.0);
   options.maxGaussians = args.number<std::size_t>("max-gaussians", 0);
+  if (args.has("view")) {
+#ifdef SPLAT_WITH_VIEWER
+    splat::ViewerOptions vo;
+    vo.context = opts.context;
+    vo.project = options.project;
+    vo.train = options;
+    return splat::run_viewer(vo);
+#else
+    std::println(stderr, "This build of splat has no window viewer (built without SDL3), so --view is not available.");
+    return 2;
+#endif
+  }
   splat::vk::Context ctx(opts.context);
   std::println("Device: {}", ctx.info().name);
   splat::run_train(ctx, options);
@@ -425,8 +475,12 @@ int main(int argc, char **argv) {
   }
 
   if (opts.command.empty()) {
-    std::print(kUsage, SPLAT_VERSION);
-    return 2;
+    if (started_from_desktop()) {
+      opts.command = "view";
+    } else {
+      std::print(kUsage, SPLAT_VERSION);
+      return 2;
+    }
   }
 
   try {
@@ -439,6 +493,11 @@ int main(int argc, char **argv) {
     if (opts.command == "view") return cmd_view(opts);
     if (opts.command == "render") return cmd_render(opts);
     if (opts.command == "make-test-scene") return cmd_make_test_scene(opts);
+    // A file or folder instead of a command: show it.
+    if (std::filesystem::exists(opts.command)) {
+      opts.rest.insert(opts.rest.begin(), opts.command);
+      return cmd_view(opts);
+    }
     std::println(stderr, "Unknown command '{}'. Run 'splat --help'.", opts.command);
     return 2;
   } catch (const splat::vk::Error &e) {

@@ -522,6 +522,8 @@ GaussianCloud Trainer::cloud() const {
   return out;
 }
 
+const vk::Buffer &Trainer::parameters(std::size_t group) const { return *groups_.at(group)->values; }
+
 Trainer::Gradients Trainer::gradients() const {
   Gradients out;
   out.positions = groups_[0]->gradients->download_as<float>(ctx_);

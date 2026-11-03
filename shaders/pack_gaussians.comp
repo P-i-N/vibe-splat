@@ -1,0 +1,32 @@
+#version 460
+// Turns raw parameters, laid out as in GaussianCloud (and the trainer's
+// buffers), into the activated Gaussians the renderer reads. Lets the viewer
+// show training as it happens without a trip through the CPU.
+#extension GL_GOOGLE_include_directive : require
+#include "splat_types.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Positions { float positions[]; };
+layout(std430, binding = 1) readonly buffer Scales { float scales[]; };
+layout(std430, binding = 2) readonly buffer Rotations { vec4 rotations[]; };
+layout(std430, binding = 3) readonly buffer Opacities { float opacities[]; };
+layout(std430, binding = 4) writeonly buffer Gaussians { Gaussian gaussians[]; };
+
+layout(push_constant) uniform Push { uint count; } pc;
+
+void main() {
+  const uint i = gl_GlobalInvocationID.x;
+  if (i >= pc.count) {
+    return;
+  }
+  const vec3 position = vec3(positions[i * 3u], positions[i * 3u + 1u], positions[i * 3u + 2u]);
+  const vec3 scale = exp(vec3(scales[i * 3u], scales[i * 3u + 1u], scales[i * 3u + 2u]));
+  const vec4 q = rotations[i];
+  const float len = length(q);
+  Gaussian g;
+  g.posOpacity = vec4(position, 1.0 / (1.0 + exp(-opacities[i])));
+  g.rotation = len > 0.0 ? q / len : vec4(1.0, 0.0, 0.0, 0.0);
+  g.scale = vec4(scale, 0.0);
+  gaussians[i] = g;
+}

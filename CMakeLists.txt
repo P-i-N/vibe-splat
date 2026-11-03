@@ -28,9 +28,11 @@ find_package(nlohmann_json CONFIG REQUIRED)
 find_package(Eigen3 CONFIG REQUIRED)
 # stb is header-only; vcpkg installs it to include/, Debian/Ubuntu to include/stb/.
 find_path(STB_INCLUDE_DIR stb_image_write.h PATH_SUFFIXES stb REQUIRED)
-# The window viewer needs SDL3. Without it, `splat view` is not available but
-# everything else (including headless `splat render`) still builds.
+# The window viewer needs SDL3 and Dear ImGui. Without them, `splat view` is
+# not available but everything else (including headless `splat render`) still
+# builds.
 find_package(SDL3 CONFIG QUIET)
+find_package(imgui CONFIG QUIET)
 # Video input needs FFmpeg's libraries. Without them, `splat ingest` handles
 # photos only.
 find_package(PkgConfig QUIET)

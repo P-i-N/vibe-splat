@@ -10,13 +10,12 @@ from EXIF or given by hand. Output is a standard 3D Gaussian splatting `.ply`.
 
 ## Status
 
-Milestones M1 (viewer), M2 (ingest), M3 (camera poses), M4 (trainer core) and M5 (full training) are done:
+All milestones, M1 (viewer) to M6 (polish), are done:
 
 - `splat view scene.ply` opens a window and renders a 3DGS `.ply` in real time.
-  Controls: left-drag orbits, right- or middle-drag pans, the wheel zooms,
-  W/A/S/D/Q/E move, R resets the view and Esc quits. On a gamepad (Steam
-  Machine controller, Xbox or PlayStation pads), the left stick moves, the
-  right stick orbits, the triggers zoom and A resets the view.
+  `splat view project/` also shows the camera poses and sparse points, and can
+  train the project while you watch (see below).
+- `splat train project/ --view` trains in that window from the start.
 - `splat render scene.ply -o out.png` renders one image without a window.
 - `splat make-test-scene out.ply` writes a synthetic scene, so you can try
   everything without a trained splat.
@@ -41,6 +40,41 @@ That is the layout written by the original implementation and most trainers.
 | M4 Trainer core | Vulkan forward, loss, backward, Adam |
 | M5 Full training | Densification, SH degree 3, 8 GB VRAM budget |
 | M6 Polish | GUI, live preview, gamepad, AppImage and Windows zip |
+
+## The viewer
+
+`splat view` takes a `.ply`, a project folder, or nothing (then drop files or
+folders on the window). With a project it draws each posed photo as a camera
+frustum (blue for training, orange for held out, green for the one just trained
+on) and can overlay the sparse points. Everything else sits in the corners:
+
+- **Top left**: the scene, splat counts, frame rate and GPU. When looking
+  through a photo, its name and a thumbnail.
+- **Top right**: keys and mouse (H hides them).
+- **Bottom left**: training. Set the iterations, image size, holdout and SH
+  degree, then watch progress, loss, PSNR, Gaussians and VRAM, with pause,
+  save and finish buttons. The Gaussians are drawn straight from the trainer's
+  GPU buffers, so live preview costs no copies; a slider sets how much of each
+  frame goes to training.
+- **Bottom right**: view settings: splats or their centres, splat scale, SH
+  degree, field of view, background, grid, axes, cameras and points.
+
+| Input | Does |
+| --- | --- |
+| left drag / right or middle drag / wheel | orbit / pan / zoom (Ctrl+wheel: field of view) |
+| W A S D, Q E | move (Shift: faster) |
+| F, R, T | frame the scene, reset the view, turntable |
+| 1, 2 | splats, Gaussian centres as dots |
+| C, P, G | cameras, sparse points, grid |
+| [ ], double-click a camera | look through a photo; X (held) shows the photo itself |
+| Space, Ctrl+S | pause training, save what it has so far |
+| F12, Tab, H | screenshot (into the project or current folder), hide UI, help |
+| Esc | leave the photo, or quit |
+
+On a gamepad (Steam Machine controller, Xbox or PlayStation pads), the left
+stick moves, the right stick orbits, the triggers zoom, A resets the view, B
+leaves a photo, LB/RB step through photos, X switches to centres, Y hides the UI
+and Start pauses training. Closing the window while training saves what it has.
 
 ## How ingest works
 
@@ -158,6 +192,13 @@ supports all of these, and so does Mesa (RADV, ANV, lavapipe).
 Users need nothing but a GPU driver with Vulkan 1.3. The program loads the
 Vulkan loader at runtime and links everything else statically.
 
+CI builds the release packages: `splat-x86_64.AppImage` for Linux and SteamOS
+(`packaging/make-appimage.sh`) and `splat-windows-x64.zip`. Both include the
+licences of the libraries inside. Started without arguments from a desktop
+(double-clicking `splat.exe`, or the AppImage), splat opens an empty viewer;
+dropping a file or folder on `splat.exe` opens it, and `splat <path>` is short
+for `splat view <path>`.
+
 ```
 splat make-test-scene scene.ply
 splat view scene.ply
@@ -190,7 +231,7 @@ builds reuse vcpkg's binary cache.
 On Linux you can skip vcpkg for a quick local build if your distribution has
 the packages (Ubuntu 24.04: `libvulkan-dev libvulkan-volk-dev
 libvulkan-memory-allocator-dev glslang-tools catch2 libglm-dev libstb-dev
-nlohmann-json3-dev libeigen3-dev`). Without SDL3 the window viewer is left out, and without
+nlohmann-json3-dev libeigen3-dev`). Without SDL3 and Dear ImGui the window viewer is left out, and without
 FFmpeg's development packages video input is, but everything else still builds:
 
 ```
@@ -208,8 +249,9 @@ shaders/        GLSL shaders, compiled to SPIR-V and embedded at build time
 src/core/       Vulkan context, buffers, images, compute pipelines, radix sort
 src/splat/      Gaussian cloud data, .ply reading and writing, test scene
 src/render/     Camera, splat renderer, offscreen rendering and PNG output
-src/viewer/     SDL3 window, swapchain and input (built when SDL3 is found)
+src/viewer/     SDL3 window, Dear ImGui interface, debug lines (built when SDL3 and ImGui are found)
 src/cli/        The `splat` command-line program
+packaging/      AppImage script, desktop entry, licence collection
 tests/          Catch2 unit tests
 cmake/          Shader compilation and compiler settings
 external/vcpkg  Package manager (submodule)

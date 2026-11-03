@@ -22,7 +22,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build g++-14 mesa-vulkan-drivers vulkan-validationlayers \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libxfixes-dev \
-            libxtst-dev libwayland-dev libxkbcommon-dev libegl1-mesa-dev wayland-protocols
+            libxtst-dev libwayland-dev libxkbcommon-dev libegl1-mesa-dev wayland-protocols \
+            libibus-1.0-dev libdbus-1-dev
 
       - name: Restore vcpkg binary cache
         uses: actions/cache@v4
@@ -37,13 +38,20 @@ jobs:
       - run: ctest --preset linux-release
       - name: Check the window viewer was built
         run: |
-          ./build/linux-release/src/splat view 2>&1 | grep -q "Usage: splat view"
+          ./build/linux-release/src/splat view --bogus 1 2>&1 | grep -q "Unknown option --bogus"
+
+      - name: Package the AppImage
+        run: |
+          cmake -DINSTALLED=build/linux-release/vcpkg_installed/x64-linux -DOUT=build/linux-release/THIRD_PARTY_NOTICES.txt \
+            -P packaging/collect-notices.cmake
+          bash packaging/make-appimage.sh build/linux-release splat-x86_64.AppImage
+          ./splat-x86_64.AppImage --appimage-extract-and-run --version
 
       - uses: actions/upload-artifact@v4
         with:
           name: splat-linux-x64
           path: |
-            build/linux-release/src/splat
+            splat-x86_64.AppImage
             build/linux-release/tests/cli_render.png
 
   windows:
@@ -71,7 +79,15 @@ jobs:
       # and the CLI selftest is excluded.
       - run: ctest --preset windows-release -E cli_selftest
 
+      - name: Package the zip
+        run: |
+          cmake -DINSTALLED=build/windows-release/vcpkg_installed/x64-windows-static -DOUT=build/windows-release/THIRD_PARTY_NOTICES.txt `
+            -P packaging/collect-notices.cmake
+          New-Item -ItemType Directory -Force package/splat | Out-Null
+          Copy-Item build/windows-release/src/splat.exe, README.md, LICENSE, build/windows-release/THIRD_PARTY_NOTICES.txt package/splat/
+          Compress-Archive -Path package/splat -DestinationPath splat-windows-x64.zip -Force
+
       - uses: actions/upload-artifact@v4
         with:
           name: splat-windows-x64
-          path: build/windows-release/src/splat.exe
+          path: splat-windows-x64.zip

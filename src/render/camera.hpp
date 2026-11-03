@@ -35,6 +35,9 @@ struct OrbitCamera {
   // scaled by distance.
   void pan(float dxScreen, float dyScreen);
   void move(float forward, float right, float upward);
+  // Places the eye at `eye` looking along `forward`, orbiting a target that far
+  // ahead. Any roll is lost: the orbit camera always keeps `up` up.
+  void look_along(glm::vec3 eye, glm::vec3 forward, float targetDistance);
 
 private:
   void basis(glm::vec3 &forward, glm::vec3 &right, glm::vec3 &down) const;

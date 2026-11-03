@@ -13,6 +13,12 @@
     "nlohmann-json",
     "eigen3",
     {
+      "name": "imgui",
+      "features": [
+        "sdl3-binding"
+      ]
+    },
+    {
       "name": "sdl3",
       "default-features": false,
       "features": [

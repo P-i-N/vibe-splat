@@ -1,10 +1,13 @@
+#include "core/vk_buffer.hpp"
 #include "render/offscreen.hpp"
 #include "render/splat_renderer.hpp"
 #include "test_support.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 using namespace splat;
 
@@ -118,4 +121,69 @@ TEST_CASE("Test scene renders without errors", "[vulkan][render]") {
     lit += (img.rgba[i] + img.rgba[i + 1] + img.rgba[i + 2]) > 30 ? 1 : 0;
   }
   CHECK(lit > 160 * 90 / 5); // the scene fills a good part of the frame
+}
+
+TEST_CASE("Gaussians packed on the GPU render like those uploaded from the CPU", "[vulkan][render]") {
+  vk::Context *ctx = test::context();
+  if (ctx == nullptr) {
+    SKIP("No usable Vulkan device");
+  }
+  GaussianCloud cloud = make_test_scene(20'000);
+  // Unnormalised rotations: the shader must normalise them as set_scene() does.
+  for (float &q : cloud.rotations) q *= 1.7f;
+  const Camera cam = default_orbit(cloud).camera(160, 90);
+
+  SplatRenderer fromCpu(*ctx, VK_FORMAT_R8G8B8A8_UNORM);
+  fromCpu.set_scene(cloud);
+  const RenderedImage expected = render_offscreen(*ctx, fromCpu, cam);
+
+  const auto buffer = [&](const std::vector<float> &values) {
+    vk::Buffer b(*ctx, values.size() * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, vk::MemoryUsage::GpuOnly);
+    b.upload(*ctx, std::span<const float>(values));
+    return b;
+  };
+  const vk::Buffer positions = buffer(cloud.positions), scales = buffer(cloud.scales), rotations = buffer(cloud.rotations),
+                   opacities = buffer(cloud.opacities), sh = buffer(cloud.sh);
+  SplatRenderer fromGpu(*ctx, VK_FORMAT_R8G8B8A8_UNORM);
+  ctx->submit_and_wait([&](VkCommandBuffer cmd) {
+    fromGpu.set_scene(cmd, {&positions, &scales, &rotations, &opacities, &sh, cloud.size(), cloud.shDegree, cloud.shDegree});
+  });
+  const RenderedImage actual = render_offscreen(*ctx, fromGpu, cam);
+
+  CHECK(actual.visibleSplats == expected.visibleSplats);
+  REQUIRE(actual.rgba.size() == expected.rgba.size());
+  int worst = 0;
+  for (std::size_t i = 0; i < actual.rgba.size(); ++i) worst = std::max(worst, std::abs(actual.rgba[i] - expected.rgba[i]));
+  CHECK(worst <= 2); // exp() and sigmoid on the GPU differ in the last bits
+}
+
+TEST_CASE("Point mode draws every Gaussian as an opaque dot", "[vulkan][render]") {
+  vk::Context *ctx = test::context();
+  if (ctx == nullptr) {
+    SKIP("No usable Vulkan device");
+  }
+  GaussianCloud cloud;
+  // Faint and wide: as a splat it barely shows, as a point it is solid.
+  add(cloud, 0.f, 0.f, 4.f, 1.f, 0.f, 1.f, 0.f, 0.1f);
+  SplatRenderer renderer(*ctx, VK_FORMAT_R8G8B8A8_UNORM);
+  renderer.set_scene(cloud);
+  const RenderedImage splat = render_offscreen(*ctx, renderer, front_camera());
+  renderer.settings.points = true;
+  renderer.settings.pointRadius = 3.f;
+  const RenderedImage point = render_offscreen(*ctx, renderer, front_camera());
+
+  CHECK(at(splat, 32, 32).g < 40);
+  CHECK(at(point, 32, 32).g > 200);
+  CHECK(at(point, 32 + 8, 32).g < 10); // Beyond the radius
+}
+
+TEST_CASE("An orbit camera placed along a direction looks that way from there", "[render]") {
+  OrbitCamera orbit;
+  orbit.up = {0.f, -1.f, 0.f};
+  const glm::vec3 eye(1.f, -2.f, 3.f);
+  const glm::vec3 forward = glm::normalize(glm::vec3(-0.3f, 0.4f, -1.f));
+  orbit.look_along(eye, forward, 5.f);
+  CHECK(glm::length(orbit.eye() - eye) < 1e-4f);
+  CHECK(glm::dot(glm::normalize(orbit.target - orbit.eye()), forward) > 0.99999f);
+  CHECK(std::abs(orbit.distance - 5.f) < 1e-5f);
 }
