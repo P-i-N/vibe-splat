@@ -61,8 +61,8 @@ iteration replaced it before reading it. Both are fixed.
 
 ## Where the implementation differs from the papers
 
-- FastGS: only the pruning before the end of densification was considered, and
-  the rule it uses after that is left out. Pixels are counted where the backward
+- FastGS: its pruning before the end of densification only applies with
+  `--significance-prune`, and the rule it uses after that is left out. Pixels are counted where the backward
   pass visits them, so not behind a pixel's early stop. The minimum of its
   error range is taken as 0.
 - DashGaussian: the image sizes stay at 1/4, 1/2 and full, as switch points only.
