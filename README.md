@@ -171,7 +171,14 @@ does automatic differentiation: each pass has a hand-derived counterpart.
 - **Options that did not help on the test scenes, and are off.** `--second-order`
   (3DGS^2-TR, after densification), `--explore` (random splits and new
   Gaussians, from the blur trap paper), `--threshold-rise` (Improving ADC),
-  `--significance-prune` and `--point-extent`.
+  `--significance-prune` and `--point-extent`. From 3DGS-MCMC, measured on the
+  bicycle scene at 7000 iterations against 24.1 dB held out at 107 it/s:
+  `--opacity-reg 0.01 --scale-reg 0.01` (22.5-23.0 dB: with the opacity reset
+  the penalties thin the cloud to 270k), `--densify mcmc` (relocation in place
+  of clone, split and prune: 23.2 dB, 76-83 it/s as the relocated Gaussians are
+  opaque and large), `--position-noise 5e5` on top (23.3 dB), and all of them
+  together (23.7 dB, 84-91 it/s). Its gains are reported at 30000 iterations;
+  at 7000 the relocation has not converged.
 - **Poses.** `--refine-poses` refines the training cameras along with the
   Gaussians. It helps when poses are a little off and costs a little when they
   are good, so it is off by default.
