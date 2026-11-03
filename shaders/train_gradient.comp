@@ -30,6 +30,9 @@ layout(push_constant) uniform Push {
   float opacityReg;
   float scaleReg;
   uint mipFilter; // As in train_preprocess.comp
+  float shDropout;
+  uint shRetained;
+  uint shSeed;
 } pc;
 
 // tr(G A X J^T) for 2x2 symmetric G, with A and J 2x3 and X 3x3.
@@ -163,7 +166,7 @@ void main() {
   const vec3 gColour = vec3(raw[at + 6u], raw[at + 7u], raw[at + 8u]);
   float basis[16];
   sh_basis(normalize(p - cam.position.xyz), cam.counts.y, basis);
-  const uint coefficients = cam.counts.w;
+  const uint coefficients = train_sh_coefficients(i, cam.counts.w, pc.shDropout, pc.shRetained, pc.shSeed);
   const uint base = i * cam.counts.z;
   vec3 colour = vec3(0.5);
   for (uint k = 0u; k < coefficients; ++k) {

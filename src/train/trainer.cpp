@@ -70,10 +70,14 @@ struct ErrorMaskPush {
 struct GradientPush {
   float opacityReg, scaleReg; // Per Gaussian: the option divided by the count
   std::uint32_t mipFilter;
+  float shDropout;
+  std::uint32_t shRetained, shSeed;
 };
 
 struct PreprocessPush {
   std::uint32_t mipFilter;
+  float shDropout;
+  std::uint32_t shRetained, shSeed;
 };
 
 struct NoisePush {
@@ -337,7 +341,7 @@ std::uint32_t Trainer::record_prepare() {
                          {groups_[0]->values.get(), groups_[1]->values.get(), groups_[2]->values.get(),
                           groups_[3]->values.get(), groups_[4]->values.get(), camera_.get(), splats_.get(), keys_.get(),
                           values_.get(), filter3d_.get()},
-                         PreprocessPush{options_.mipFilter2d ? 1u : 0u}, vk::div_up(count_, 256));
+                         PreprocessPush{options_.mipFilter2d ? 1u : 0u, shDropout_, shRetained_, shSeed_}, vk::div_up(count_, 256));
     vk::compute_barrier(cmd);
     mark(cmd, "project");
     sorter_.record(cmd, *keys_, *values_, *tmpKeys_, *tmpValues_, count_);
@@ -450,7 +454,7 @@ void Trainer::record_backward_from_adjoint(VkCommandBuffer cmd) {
                       groups_[4]->values.get(), camera_.get(), rawGradients_.get(), groups_[0]->gradients.get(),
                       groups_[1]->gradients.get(), groups_[2]->gradients.get(), groups_[3]->gradients.get(), groups_[4]->gradients.get(),
                       splats_.get(), stats_.get(), filter3d_.get()},
-                     GradientPush{options_.opacityReg / static_cast<float>(count_), options_.scaleReg / static_cast<float>(count_), options_.mipFilter2d ? 1u : 0u},
+                     GradientPush{options_.opacityReg / static_cast<float>(count_), options_.scaleReg / static_cast<float>(count_), options_.mipFilter2d ? 1u : 0u, shDropout_, shRetained_, shSeed_},
                      vk::div_up(count_, 256));
   vk::compute_barrier(cmd);
   if (options_.poseGradients) {
@@ -778,6 +782,12 @@ void Trainer::record_noise(VkCommandBuffer cmd, float scaler, std::uint32_t iter
   vk::compute_barrier(cmd); // After Adam's writes to the positions
   noise_.dispatch(cmd, {groups_[0]->values.get(), groups_[1]->values.get(), groups_[2]->values.get(), groups_[3]->values.get()},
                   NoisePush{count_, scaler, iteration}, vk::div_up(count_, 256));
+}
+
+void Trainer::set_sh_dropout(float probability, int retainedDegree, std::uint32_t seed) {
+  shDropout_ = std::clamp(probability, 0.f, 1.f);
+  shRetained_ = static_cast<std::uint32_t>(std::clamp(retainedDegree, 0, 3));
+  shSeed_ = seed;
 }
 
 void Trainer::set_filter3d(std::span<const float> filter) {

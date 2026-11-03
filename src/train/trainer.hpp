@@ -153,6 +153,9 @@ public:
   // Mip-Splatting's 3D smoothing filter per Gaussian (see smoothing_filter()); zero until set, and
   // zero again after any change of the count.
   void set_filter3d(std::span<const float> filter);
+  // SH dropout for the coming iterations: with `probability`, a Gaussian uses and
+  // trains only the coefficients up to `retainedDegree`; drawn afresh per `seed`.
+  void set_sh_dropout(float probability, int retainedDegree, std::uint32_t seed);
 
   // Frees memory when a view does not fit. See remove_largest().
   std::size_t remove_largest_gaussians(double share);
@@ -207,6 +210,8 @@ private:
   std::uint32_t shFloats_ = 3;
   int activeShDegree_ = 0;
   std::uint32_t adamStep_ = 0;
+  float shDropout_ = 0.f;
+  std::uint32_t shRetained_ = 0, shSeed_ = 0;
   bool fixedPoint_ = false;
   int width_ = 0, height_ = 0;
   std::uint32_t gridW_ = 0, tileCount_ = 0;

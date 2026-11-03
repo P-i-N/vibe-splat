@@ -21,6 +21,9 @@ layout(std430, binding = 9) readonly buffer Filter3d { float filter3d[]; }; // M
 
 layout(push_constant) uniform Push {
   uint mipFilter; // Mip-Splatting's 2D filter instead of the 0.3 dilation
+  float shDropout; // SH dropout: probability, retained degree and this iteration's seed
+  uint shRetained;
+  uint shSeed;
 } pc;
 
 void main() {
@@ -101,7 +104,7 @@ void main() {
   const uint degree = cam.counts.y;
   float basis[16];
   sh_basis(normalize(p - cam.position.xyz), degree, basis);
-  const uint coefficients = cam.counts.w;
+  const uint coefficients = train_sh_coefficients(i, cam.counts.w, pc.shDropout, pc.shRetained, pc.shSeed);
   const uint base = i * cam.counts.z;
   vec3 color = vec3(0.5);
   for (uint k = 0u; k < coefficients; ++k) {

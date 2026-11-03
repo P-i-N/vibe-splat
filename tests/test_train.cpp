@@ -647,6 +647,51 @@ TEST_CASE("Scoring a view accumulates the edge score", "[train][vulkan]") {
   for (std::size_t i = 0; i < 16; ++i) CHECK(scored.markedPixels[i] > 0.f);
 }
 
+TEST_CASE("SH dropout renders with the retained degrees only", "[train][vulkan]") {
+  vk::Context *ctx = test::context();
+  if (ctx == nullptr) SKIP("No usable Vulkan device");
+  const Camera camera = test_camera(72, 56);
+  const auto target = noise_target(camera.width, camera.height, 17);
+  const GaussianCloud cloud = random_cloud(300, 3, 7);
+  GaussianCloud truncated = cloud; // The same with every coefficient above degree 0 zeroed
+  const auto coefficients = static_cast<std::size_t>(cloud.shCoeffs());
+  for (std::size_t i = 0; i < cloud.size(); ++i) {
+    std::fill_n(truncated.sh.begin() + static_cast<std::ptrdiff_t>((i * coefficients + 1) * 3), (coefficients - 1) * 3, 0.f);
+  }
+  const ReferenceImage full = reference_render(cloud, camera, {});
+  const ReferenceImage degree0 = reference_render(truncated, camera, {});
+  const auto worst_against = [&](const std::vector<float> &gpu, const ReferenceImage &cpu) {
+    double worst = 0.0;
+    for (std::size_t i = 0; i < cpu.rgb.size(); ++i) {
+      for (int c = 0; c < 3; ++c) worst = std::max(worst, std::abs(gpu[i * 4 + static_cast<std::size_t>(c)] - cpu.rgb[i][c]));
+    }
+    return worst;
+  };
+
+  Trainer trainer(*ctx, cloud);
+  trainer.set_active_sh_degree(3);
+  trainer.set_sh_dropout(1.f, 0, 1); // Every Gaussian keeps degree 0 only
+  CHECK(worst_against(trainer.render(camera), degree0) < 1e-3);
+  trainer.set_sh_dropout(0.f, 0, 1); // Off again
+  CHECK(worst_against(trainer.render(camera), full) < 1e-3);
+
+  // With half the Gaussians dropped, their higher coefficients get no gradient and the others do.
+  trainer.set_sh_dropout(0.5f, 0, 9);
+  trainer.compute_gradients(camera, target);
+  const auto g = trainer.gradients();
+  std::size_t dropped = 0, kept = 0;
+  for (std::size_t i = 0; i < cloud.size(); ++i) {
+    bool anyHigher = false;
+    for (std::size_t k = 1; k < coefficients; ++k) {
+      for (int c = 0; c < 3; ++c) anyHigher = anyHigher || g.sh[(i * coefficients + k) * 3 + static_cast<std::size_t>(c)] != 0.f;
+    }
+    (anyHigher ? kept : dropped) += 1;
+  }
+  std::println("  SH dropout at 0.5: {} Gaussians kept their higher degrees, {} dropped them", kept, dropped);
+  CHECK(dropped > 100);
+  CHECK(kept > 100);
+}
+
 TEST_CASE("Pose gradients match finite differences of the loss", "[train][vulkan]") {
   vk::Context *ctx = test::context();
   if (ctx == nullptr) SKIP("No usable Vulkan device");

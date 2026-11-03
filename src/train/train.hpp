@@ -74,6 +74,9 @@ struct TrainOptions {
   // This share of Gaussians, the least opaque, is removed 300 iterations after
   // each opacity reset (recovery-aware pruning, Improving Densification in 3DGS). 0: none.
   double recoveryPrune = 0.0;
+  // SH dropout: with this probability per iteration, a Gaussian keeps only the
+  // degrees up to 0, 1 and 2 before 20%, 40% and the rest of training. 0: off.
+  float shDropout = 0.f;
   // Refine each training view's camera along with the Gaussians, for poses that are a little off.
   bool refinePoses = false;
   std::size_t densePoints = 50000;  // Start from up to this many more points, by patch matching

@@ -142,6 +142,23 @@ void sh_basis_gradient(vec3 dir, uint degree, out vec3 g[16]) {
   }
 }
 
+// PCG's output permutation over a 32-bit state, as a hash to a uniform in [0, 1).
+float train_uniform(uint index, uint seed) {
+  const uint state = (index ^ (seed * 0x9E3779B9u)) * 747796405u + 2891336453u;
+  const uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+  return float((word >> 22u) ^ word) / 4294967296.0;
+}
+
+// SH dropout (Dropping Anchor and Spherical Harmonics, CVPR 2026): with the
+// given probability a Gaussian keeps only the coefficients up to `retained`
+// this iteration, so that its colour settles in the low degrees.
+uint train_sh_coefficients(uint index, uint coefficients, float dropout, uint retained, uint seed) {
+  if (dropout > 0.0 && train_uniform(index, seed) < dropout) {
+    return min(coefficients, (retained + 1u) * (retained + 1u));
+  }
+  return coefficients;
+}
+
 mat3 train_quat_to_mat(vec4 q) {
   const float w = q.x, x = q.y, y = q.z, z = q.w;
   return mat3(1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y + w * z), 2.0 * (x * z - w * y),

@@ -539,6 +539,9 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
       const double rest = static_cast<double>(iteration - densifyUntil) / std::max(options.iterations - densifyUntil, 1);
       rates.trustRegion = static_cast<float>(kTrustStart * std::pow(kTrustEnd / kTrustStart, rest));
     }
+    if (options.shDropout > 0.f) {
+      trainer.set_sh_dropout(options.shDropout, progress < 0.2 ? 0 : progress < 0.4 ? 1 : 2, static_cast<std::uint32_t>(iteration));
+    }
     const StepStats stats = fitting([&] { return trainer.step(view.camera, view.rgba, rates, nextView.rgba); });
     if (rates.trustRegion > 0.f && (iteration - densifyUntil) % kCurvatureInterval == 1) trainer.update_curvature();
     if (options.exposure) exposures[viewIndex].step(stats.exposureGradient);
@@ -713,6 +716,7 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
   }
 
   trainer.set_active_sh_degree(options.shDegree);
+  trainer.set_sh_dropout(0.f, 0, 0);
   report.gaussians = trainer.gaussian_count();
   if (const std::string floorNote = save_output(options.out, CgcOptions{}); !floorNote.empty()) {
     std::println("Aligned to the floor: {}", floorNote);
