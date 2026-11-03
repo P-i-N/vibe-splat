@@ -178,7 +178,11 @@ does automatic differentiation: each pass has a hand-derived counterpart.
   of clone, split and prune: 23.2 dB, 76-83 it/s as the relocated Gaussians are
   opaque and large), `--position-noise 5e5` on top (23.3 dB), and all of them
   together (23.7 dB, 84-91 it/s). Its gains are reported at 30000 iterations;
-  at 7000 the relocation has not converged.
+  at 7000 the relocation has not converged. Mip-Splatting's filters,
+  `--mip-filter` (both), `--mip-filter-2d` (a 0.1 pixel dilation with the
+  opacity scaled to match) and `--mip-filter-3d` (each Gaussian widened to its
+  smallest footprint in the photos, baked into saved scenes): 24.0-24.1 dB, the
+  same as without, and the 3D filter costs a tenth of the speed (96 it/s).
 - **Poses.** `--refine-poses` refines the training cameras along with the
   Gaussians. It helps when poses are a little off and costs a little when they
   are good, so it is off by default.
