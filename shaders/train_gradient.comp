@@ -21,7 +21,7 @@ layout(std430, binding = 9) writeonly buffer GradRotations { float gradRotations
 layout(std430, binding = 10) writeonly buffer GradOpacities { float gradOpacities[]; };
 layout(std430, binding = 11) writeonly buffer GradSH { float gradSh[]; };
 layout(std430, binding = 12) readonly buffer Splats { TrainSplat splats[]; };
-layout(std430, binding = 13) buffer DensifyStats { vec4 densifyStats[]; }; // x: gradient sum, y: visits, z: largest radius
+layout(std430, binding = 13) buffer DensifyStats { vec4 densifyStats[]; }; // x: gradient sum, y: visits, z: largest radius, w: contribution
 
 // tr(G A X J^T) for 2x2 symmetric G, with A and J 2x3 and X 3x3.
 float trace_term(mat2 G, mat3x2 A, mat3 X, mat3x2 J) {
@@ -37,8 +37,8 @@ void main() {
   // Nothing reached this splat. The buffers were cleared, so skip the maths,
   // which would not even be defined for a splat behind the camera.
   bool touched = false;
-  for (uint k = 0u; k < 9u; ++k) {
-    touched = touched || raw[i * 9u + k] != 0.0;
+  for (uint k = 0u; k < RAW_PER_SPLAT; ++k) {
+    touched = touched || raw[i * RAW_PER_SPLAT + k] != 0.0;
   }
   if (!touched) {
     return;
@@ -50,7 +50,7 @@ void main() {
   const float quatLength = length(quat);
   quat = quatLength > 0.0 ? quat / quatLength : vec4(1.0, 0.0, 0.0, 0.0);
 
-  const uint at = i * 9u;
+  const uint at = i * RAW_PER_SPLAT;
   const vec3 t = (cam.view * vec4(p, 1.0)).xyz;
   const float fx = cam.intrinsics.x, fy = cam.intrinsics.y;
   const float z = t.z, iz = 1.0 / z, iz2 = iz * iz;
@@ -63,6 +63,7 @@ void main() {
   densifyStats[i].x += length(gCentre * 0.5 * cam.viewport.xy);
   densifyStats[i].y += 1.0;
   densifyStats[i].z = max(densifyStats[i].z, splats[i].centerRadius.z);
+  densifyStats[i].w += raw[at + 9u] * 3.0 * cam.viewport.x * cam.viewport.y; // In pixels
   const mat2 G = mat2(raw[at + 3u], raw[at + 4u], raw[at + 4u], raw[at + 5u]);
 
   const mat3 Rv = mat3(cam.view);

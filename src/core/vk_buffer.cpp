@@ -90,19 +90,29 @@ void Buffer::upload(Context &ctx, std::span<const std::byte> data, VkDeviceSize 
 
 std::vector<std::byte> Buffer::download(Context &ctx) const {
   std::vector<std::byte> out(static_cast<std::size_t>(size_));
+  download_into(ctx, out);
+  return out;
+}
+
+void Buffer::download_into(Context &ctx, std::span<std::byte> out) const {
+  if (out.size() > size_) {
+    throw Error("Buffer::download_into: more asked for than the buffer holds");
+  }
+  if (out.empty()) {
+    return;
+  }
   if (mapped_ != nullptr) {
     invalidate();
     std::memcpy(out.data(), mapped_, out.size());
-    return out;
+    return;
   }
-  Buffer staging(ctx, size_, 0, MemoryUsage::Readback);
+  Buffer staging(ctx, out.size(), 0, MemoryUsage::Readback);
   ctx.submit_and_wait([&](VkCommandBuffer cmd) {
-    const VkBufferCopy region{0, 0, size_};
+    const VkBufferCopy region{0, 0, out.size()};
     vkCmdCopyBuffer(cmd, buffer_, staging.handle(), 1, &region);
   });
   staging.invalidate();
   std::memcpy(out.data(), staging.mapped().data(), out.size());
-  return out;
 }
 
 void Buffer::reset() noexcept {

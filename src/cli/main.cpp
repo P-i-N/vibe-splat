@@ -4,6 +4,7 @@
 // a project folder, so any stage can be rerun on its own.
 
 #include "cli/args.hpp"
+#include "core/progress.hpp"
 #include "core/selftest.hpp"
 #include "core/vk_check.hpp"
 #include "core/vk_context.hpp"
@@ -12,6 +13,7 @@
 #include "render/splat_renderer.hpp"
 #include "sfm/sfm.hpp"
 #include "sfm/test_views.hpp"
+#include "splat/cgc.hpp"
 #include "splat/gaussian_cloud.hpp"
 #include "train/train.hpp"
 #ifdef SPLAT_WITH_VIEWER
@@ -20,14 +22,20 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 
 #include <charconv>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
+#include <format>
+#include <numbers>
 #include <optional>
 #include <print>
 #include <span>
+#include <stdexcept>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -37,9 +45,10 @@ constexpr std::string_view kUsage = R"(splat {} - Gaussian splat generator and v
 Usage: splat <command> [options]
 
 Commands:
-  view <scene.ply>              Open the real-time viewer
-  render <scene.ply> -o <png>   Render one image without a window
-  make-test-scene <out.ply>     Write a synthetic scene for trying things out
+  view <scene.ply|cgc>          Open the real-time viewer
+  render <scene.ply|cgc> -o <png>  Render one image without a window
+  make-test-scene <out.ply|cgc> Write a synthetic scene for trying things out
+  convert <in> <out>            Convert between .ply and compressed .cgc
   info                          List Vulkan devices and whether splat can use them
   selftest                      Run a compute kernel on the GPU and check the result
   ingest <inputs...> -o <dir>   Import photos and videos into a project folder
@@ -59,6 +68,13 @@ render options:
 
 make-test-scene options:
   --count <n>             Number of Gaussians (default 200000)
+
+convert options (both pruning tests are off unless given; either enables it):
+  --small                 CGC only: a smaller file, with weaker close-ups
+  --prune-sigma <units>   Drop floaters: Gaussians whose largest axis (one standard
+                          deviation) is longer than this many world units
+  --prune-radius <factor> Drop Gaussians farther from the scene centre than this times
+                          the radius that holds 90% of them
 
 ingest options (inputs are image files, video files or folders of them):
   -o, --out <dir>         Project folder (required); gets images/ and ingest.json
@@ -83,10 +99,11 @@ sfm options (writes project/sparse/0 in COLMAP's format, plus preview.ply):
   --window <n>            Neighbours per image when sequential (default 8)
   --max-features <n>      Per image (default 4000)
   --threads <n>           0 uses all cores (default 0)
+  --cpu                   Match features on the CPU even when a GPU is available
   --import <dir>          Instead of estimating, import a COLMAP sparse model
 
 train options (writes project/splat.ply and project/preview_*.png):
-  -o, --out <file.ply>    Output file
+  -o, --out <file>        Output file, .ply or compressed .cgc
   --iterations <n>        Default 30000
   --lambda-ssim <x>       Weight of D-SSIM against L1 (default 0.2)
   --sh-degree <0-3>       Default 3
@@ -97,9 +114,17 @@ train options (writes project/splat.ply and project/preview_*.png):
   --report-every <n>      Default 500
   --save-every <n>        Save the output this often, 0 only at the end (default 5000)
   --no-densify            Keep the initial Gaussians, without adding or removing any
+  --full-resolution       Train at full size from the start, rather than coarse to fine
+  --full-adam             Update every Gaussian each step, not only those in view:
+                          about 0.5 dB better on held-out views, a fifth slower
+  --exposure              Learn each photo's exposure and white balance, for
+                          photos or video whose exposure varies
   --gradient-threshold <x>  Lower adds more Gaussians (default 0.0002)
   --vram-budget <GiB>     Default: 90% of the GPU's free memory
   --max-gaussians <n>     Default: what the budget allows
+  --prune <share>         Remove this share of Gaussians, those adding least, at the
+                          end of densification and again halfway to the end
+                          (default 0.7, which leaves a tenth; 0 keeps all)
 
 make-test-views options:
   --count <n>             Number of images (default 12)
@@ -109,7 +134,7 @@ view options:
   --up <axis>             As for render
 
 Viewer controls:
-  left mouse drag  orbit        right/middle drag  pan       wheel  zoom
+  left mouse drag  look         right/middle drag  pan       wheel  zoom
   W A S D / Q E    move         R  reset view                Esc    quit
   gamepad: left stick move, right stick orbit, triggers zoom, A reset
 
@@ -175,7 +200,7 @@ glm::vec3 parse_up(const std::string &axis) {
 
 splat::GaussianCloud load_scene(const std::string &path) {
   const auto start = std::chrono::steady_clock::now();
-  auto cloud = splat::load_ply(path);
+  auto cloud = splat::load_cloud(path);
   const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
   std::println("Loaded {} Gaussians (SH degree {}) from {} in {:.0f} ms", cloud.size(), cloud.shDegree, path, ms);
   return cloud;
@@ -221,8 +246,54 @@ int cmd_make_test_scene(const GlobalOptions &opts) {
   }
   const auto count = args.number<std::size_t>("count", 200'000);
   const auto cloud = splat::make_test_scene(std::max<std::size_t>(count, 16));
-  splat::save_ply(cloud, args.positionals()[0]);
+  splat::save_cloud(cloud, args.positionals()[0]);
   std::println("Wrote {} Gaussians to {}", cloud.size(), args.positionals()[0]);
+  return 0;
+}
+
+int cmd_convert(const GlobalOptions &opts) {
+  const splat::cli::Args args(opts.rest, {"--small"});
+  args.allow_only({"prune-sigma", "prune-radius", "small"});
+  if (args.positionals().size() != 2) {
+    std::println(stderr, "Usage: splat convert <in.ply|cgc> <out.ply|cgc> [--small] [--prune-sigma <units>] [--prune-radius <factor>]");
+    return 2;
+  }
+  const std::filesystem::path in(args.positionals()[0]);
+  const std::filesystem::path out(args.positionals()[1]);
+  splat::PruneOptions prune;
+  prune.maxSigma = args.number("prune-sigma", 0.f);
+  prune.maxRadiusFactor = args.number("prune-radius", 0.f);
+  for (const auto [name, value] : {std::pair{"prune-sigma", prune.maxSigma}, std::pair{"prune-radius", prune.maxRadiusFactor}}) {
+    if (args.has(name) && !(value > 0.f)) {
+      throw std::runtime_error(std::format("--{} must be greater than 0", name));
+    }
+  }
+  const bool pruning = prune.maxSigma > 0.f || prune.maxRadiusFactor > 0.f;
+  const bool toCgc = splat::cloud_format(out) == splat::CloudFormat::Cgc;
+
+  auto cloud = load_scene(in.string());
+  const auto start = std::chrono::steady_clock::now();
+  // CGC cannot store NaNs, and the floater tests need finite values to compare.
+  if (toCgc || pruning) {
+    if (const std::size_t removed = splat::remove_non_finite(cloud); removed > 0) {
+      std::println("Left out {} Gaussians with NaN or infinite values", removed);
+    }
+  }
+  if (pruning) {
+    const std::size_t removed = splat::prune_floaters(cloud, prune);
+    std::println("Pruned {} floaters, {} Gaussians left", removed, cloud.size());
+  }
+  if (toCgc) {
+    const auto stats = splat::save_cgc(cloud, out, {.preset = args.has("small") ? splat::CgcPreset::Small : splat::CgcPreset::Balanced});
+    std::println("Gaussians per layer, most important first: {}, {}, {}", stats.layerCounts[0], stats.layerCounts[1], stats.layerCounts[2]);
+  } else {
+    splat::save_ply(cloud, out);
+  }
+  const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  const auto inBytes = std::filesystem::file_size(in);
+  const auto outBytes = std::filesystem::file_size(out);
+  std::println("Wrote {} in {:.1f} s: {:.2f} MB -> {:.2f} MB ({:.1f}x smaller)", out.string(), seconds, inBytes / 1e6,
+               outBytes / 1e6, static_cast<double>(inBytes) / static_cast<double>(std::max<std::uintmax_t>(outBytes, 1)));
   return 0;
 }
 
@@ -292,17 +363,23 @@ int cmd_ingest(const GlobalOptions &opts) {
                report.videoFrames, report.cameras, report.failed, seconds, options.project.string());
 
   const auto manifest = splat::load_manifest(options.project / "ingest.json");
+  bool guessed = false;
   for (const auto &camera : manifest.cameras) {
     std::println("  camera {}: {}x{}, focal {:.1f} px ({}){}{}", camera.id, camera.width, camera.height, camera.fx,
                  splat::to_string(camera.focalSource), camera.make.empty() ? "" : ", ",
                  camera.make.empty() ? "" : camera.make + " " + camera.model);
+    guessed = guessed || camera.focalSource == splat::FocalSource::Default;
+  }
+  if (guessed) {
+    std::println("  default: no EXIF focal length in the files, so the focal is guessed as 1.2 x the longest side.");
+    std::println("  splat sfm refines it; pass --focal-35mm, --focal-px or --fov to start from the real value.");
   }
   return 0;
 }
 
 int cmd_sfm(const GlobalOptions &opts) {
-  const splat::cli::Args args(opts.rest, {});
-  args.allow_only({"import", "matcher", "window", "max-features", "threads"});
+  const splat::cli::Args args(opts.rest, {"--cpu"});
+  args.allow_only({"import", "matcher", "window", "max-features", "threads", "cpu"});
   if (args.positionals().size() != 1) {
     std::println(stderr, "Usage: splat sfm <project> [options]  (see splat --help)");
     return 2;
@@ -331,11 +408,32 @@ int cmd_sfm(const GlobalOptions &opts) {
   else if (matcher == "sequential") options.matcher = splat::Matcher::Sequential;
   else if (matcher != "auto") throw std::runtime_error(std::format("--matcher must be auto, exhaustive or sequential (got '{}')", matcher));
 
+  // Matching runs on the GPU when there is one; the rest is CPU work.
+  std::optional<splat::vk::Context> gpu;
+  if (!args.has("cpu")) {
+    try {
+      gpu.emplace(opts.context);
+      options.gpu = &*gpu;
+    } catch (const std::exception &e) {
+      std::println("No usable GPU, matching on the CPU: {}", e.what());
+    }
+  }
+
   const auto start = std::chrono::steady_clock::now();
   const auto report = splat::run_sfm(options);
   const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
   print_stats(report.stats, report.ingested, report.unregistered);
   std::println("  {} of {} image pairs matched, {:.1f} s in total", report.pairsVerified, report.pairsTried, seconds);
+  for (const auto &camera : report.cameras) {
+    constexpr double kRadToDeg = 180.0 / std::numbers::pi;
+    const double fovDeg = 2.0 * std::atan(0.5 * camera.width / camera.focal) * kRadToDeg;
+    if (camera.focalSource == splat::FocalSource::Manual) {
+      std::println("  camera {}: focal {:.1f} px kept as given, {:.1f} degree horizontal field of view", camera.id, camera.focal, fovDeg);
+    } else {
+      std::println("  camera {}: focal refined {:.1f} -> {:.1f} px ({} start), {:.1f} degree horizontal field of view", camera.id,
+                   camera.initialFocal, camera.focal, splat::to_string(camera.focalSource), fovDeg);
+    }
+  }
   return 0;
 }
 
@@ -344,9 +442,9 @@ int cmd_train(const GlobalOptions &opts) {
   for (auto &a : rest) {
     if (a == "-o") a = "--out";
   }
-  const splat::cli::Args args(rest, {"--no-densify"});
+  const splat::cli::Args args(rest, {"--no-densify", "--full-resolution", "--exposure", "--full-adam"});
   args.allow_only({"out", "iterations", "lambda-ssim", "sh-degree", "max-size", "max-views", "holdout", "seed", "report-every", "save-every",
-                   "no-densify", "gradient-threshold", "vram-budget", "max-gaussians"});
+                   "no-densify", "gradient-threshold", "vram-budget", "max-gaussians", "prune", "full-resolution", "exposure", "full-adam"});
   if (args.positionals().size() != 1) {
     std::println(stderr, "Usage: splat train <project> [options]  (see splat --help)");
     return 2;
@@ -364,9 +462,13 @@ int cmd_train(const GlobalOptions &opts) {
   options.reportEvery = std::max(args.number("report-every", options.reportEvery), 1);
   options.saveEvery = std::max(args.number("save-every", options.saveEvery), 0);
   options.densify = !args.has("no-densify");
+  options.fullResolution = args.has("full-resolution");
+  options.exposure = args.has("exposure");
+  options.fullAdam = args.has("full-adam");
   options.gradientThreshold = args.number("gradient-threshold", options.gradientThreshold);
   options.vramBudgetGiB = args.number("vram-budget", 0.0);
   options.maxGaussians = args.number<std::size_t>("max-gaussians", 0);
+  options.pruneShare = std::clamp(args.number("prune", options.pruneShare), 0.0, 0.95);
   splat::vk::Context ctx(opts.context);
   std::println("Device: {}", ctx.info().name);
   splat::run_train(ctx, options);
@@ -439,12 +541,13 @@ int main(int argc, char **argv) {
     if (opts.command == "view") return cmd_view(opts);
     if (opts.command == "render") return cmd_render(opts);
     if (opts.command == "make-test-scene") return cmd_make_test_scene(opts);
+    if (opts.command == "convert") return cmd_convert(opts);
     std::println(stderr, "Unknown command '{}'. Run 'splat --help'.", opts.command);
     return 2;
   } catch (const splat::vk::Error &e) {
-    std::println(stderr, "Vulkan error: {}", e.what());
+    std::println(stderr, "{} {}", splat::console::paint(splat::console::Color::Red, "Vulkan error:", stderr), e.what());
   } catch (const std::exception &e) {
-    std::println(stderr, "Error: {}", e.what());
+    std::println(stderr, "{} {}", splat::console::paint(splat::console::Color::Red, "Error:", stderr), e.what());
   }
   return 1;
 }

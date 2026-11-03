@@ -13,7 +13,7 @@ from EXIF or given by hand. Output is a standard 3D Gaussian splatting `.ply`.
 Milestones M1 (viewer), M2 (ingest), M3 (camera poses), M4 (trainer core) and M5 (full training) are done:
 
 - `splat view scene.ply` opens a window and renders a 3DGS `.ply` in real time.
-  Controls: left-drag orbits, right- or middle-drag pans, the wheel zooms,
+  Controls: left-drag looks around, right- or middle-drag pans, the wheel zooms,
   W/A/S/D/Q/E move, R resets the view and Esc quits. On a gamepad (Steam
   Machine controller, Xbox or PlayStation pads), the left stick moves, the
   right stick orbits, the triggers zoom and A resets the view.
@@ -37,7 +37,7 @@ That is the layout written by the original implementation and most trainers.
 | M0 Foundation | CMake + vcpkg, Vulkan core, CI on Linux and Windows |
 | M1 Viewer | Load `.ply` splats, GPU sort, render, window and controls |
 | M2 Ingest | Photos, video frames, EXIF and manual intrinsics |
-| M3 Camera poses | Our own structure from motion (CPU), COLMAP model import |
+| M3 Camera poses | Our own structure from motion (GPU matching, CPU otherwise), COLMAP model import |
 | M4 Trainer core | Vulkan forward, loss, backward, Adam |
 | M5 Full training | Densification, SH degree 3, 8 GB VRAM budget |
 | M6 Polish | GUI, live preview, gamepad, AppImage and Windows zip |
@@ -66,13 +66,16 @@ the later stages to read. Rerun it with `--force` to replace them.
 ## How pose estimation works
 
 `splat sfm` is a small incremental structure-from-motion pipeline written from
-scratch, needing only Eigen. It runs on the CPU:
+scratch, needing only Eigen and, for matching, Vulkan:
 
 1. **Features.** SIFT: extrema of a difference-of-Gaussians pyramid, described
    by gradient histograms (RootSIFT).
 2. **Matching.** Brute-force mutual nearest neighbours with Lowe's ratio test.
-   Every pair for up to 150 photos; for videos and larger sets, neighbours in
-   input order plus a few at growing distances (`--matcher` overrides this).
+   On the GPU, descriptors are quantised to 8 bits and compared with packed
+   integer dot products in a compute shader (`--cpu` keeps it on the CPU,
+   where Eigen matrix products do the same job more slowly). Every pair for up
+   to 150 photos; for videos and larger sets, neighbours in input order plus a
+   few at growing distances (`--matcher` overrides this).
 3. **Verification.** RANSAC around the five-point essential matrix solver,
    using ingest's intrinsics. Pairs that do not fit a rigid camera motion go.
 4. **Tracks.** Matches are chained into tracks that follow one 3D point.
@@ -105,21 +108,52 @@ splat view project/sparse/0/preview.ply
 does automatic differentiation: each pass has a hand-derived counterpart.
 
 - **Forward.** Parameters become screen-space splats, which are sorted by depth.
-  Each splat then adds one entry per 16x16 pixel tile it covers, and a stable
-  sort by tile leaves every tile with its own depth-sorted list. Tiles do not
-  share pixels, so they composite in parallel with no blending hardware.
-- **Loss.** 0.8 L1 + 0.2 D-SSIM, and its derivative at every pixel.
+  Each splat then adds one entry per 16x16 pixel tile its ellipse reaches (not
+  just every tile of its bounding box), and a stable
+  sort by tile leaves every tile with its own depth-sorted list. One workgroup
+  per tile, one thread per pixel: the tile's splats are staged through shared
+  memory and every thread blends its own pixel in registers, front to back.
+  A pixel stops once its transmittance falls below 1e-4, and a tile once all
+  its pixels have, so splats hidden behind opaque surfaces cost nothing. Tiles
+  do not share pixels, so they composite in parallel with no blending hardware.
+- **Loss.** 0.8 L1 + 0.2 D-SSIM, and its derivative at every pixel. The 11x11
+  SSIM window is separable: a horizontal pass into shared memory and a
+  vertical pass out of it, per tile.
 - **Backward.** At a pixel `C = F + T (alpha c + (1 - alpha) B)`, with `B` what
   lies behind a splat and `T` the transmittance in front of it. So
-  `dC/dalpha = T (c - B)` and `dC/dc = T alpha`. These add up per splat in
-  screen space, using float atomics, or fixed-point integer atomics on GPUs
-  without them. A last pass applies the chain rule down to position, scale,
-  rotation, opacity and SH.
-- **Optimiser.** Adam, with the learning rates of the 3DGS paper.
+  `dC/dalpha = T (c - B)` and `dC/dc = T alpha`, worked out back to front
+  from where the forward pass stopped. Each pixel's share is reduced
+  over its subgroup with one butterfly for all nine values, then added per
+  splat with float atomics, or fixed-point integer atomics on GPUs without
+  them. A last pass applies the chain rule down to position, scale, rotation,
+  opacity and SH.
+- **Overlap.** One submission per iteration (forward, loss, backward, Adam),
+  and the next view's image is copied to staging memory on a worker thread
+  while the GPU works on the current one.
+- **Coarse to fine.** The first 15% of iterations train on images at a
+  quarter of their size and the next 20% at half, made by averaging 2x2
+  pixels, as the early iterations only need the broad shapes
+  (`--full-resolution` turns this off).
+- **Exposure.** With `--exposure`, each training view also learns a 3x4
+  colour transform that the loss compares its photo through, so that
+  changes in exposure and white balance between photos, as auto exposure
+  makes in video, do not end up in the Gaussians. The output stays neutral.
+- **Optimiser.** Adam, with the learning rates of the 3DGS paper. It only
+  updates Gaussians the current view sees: the rest keep their values and
+  moments, which also spares most of its memory traffic. `--full-adam`
+  updates them all, which on the test set is a fifth slower and 0.5 dB
+  better on held-out views.
 - **Density.** Every 100 iterations in the first half of training, a Gaussian
   whose screen position keeps wanting to move is cloned if small and split in
   two if large, and nearly transparent ones are removed. Opacity is capped every
   3000 iterations, so that those no longer needed fade away.
+- **Pruning.** At the end of densification and again halfway through the
+  rest, every training view is rendered once without a
+  step, adding up each Gaussian's blending weight over all their pixels. The
+  70% adding least are removed (`--prune` sets the share, 0 turns it off),
+  and the rest keep training to fill in. On the 194-photo test set at 10000
+  iterations this ends with 193k Gaussians instead of 2.2M, for 0.1 dB less
+  PSNR on held-out views, and the run takes 36% less time.
 - **View dependence.** SH starts at degree 0 and gains a degree every 1000
   iterations, up to `--sh-degree`.
 - **Memory.** A hard budget, by default 90% of the GPU's free memory
@@ -152,6 +186,48 @@ Each frame runs three GPU stages:
 The device needs Vulkan 1.3, one graphics+compute queue, subgroup arithmetic
 and `VK_KHR_push_descriptor`. Every current AMD, NVIDIA and Intel driver
 supports all of these, and so does Mesa (RADV, ANV, lavapipe).
+
+## Compressed output (.cgc)
+
+Wherever `splat` writes or reads a scene, a `.cgc` extension selects CGC
+(Compressed Gaussian Cloud) instead of `.ply`. It is meant for sending scenes
+over the network, for example to a browser viewer. `splat train -o scene.cgc`
+and `splat make-test-scene scene.cgc` write it directly, and `splat convert
+scene.ply scene.cgc` converts an existing file. `view` and `render` open it
+like a `.ply`.
+
+CGC is lossy. Gaussians are split into three layers by importance, and fainter,
+smaller ones are stored more coarsely. Within a layer they are sorted along a
+Morton curve on one grid, axes are sorted so rotations and scales cost less, higher
+SH bands share one codebook, and each byte column is its own LZMA stream. Training
+itself always works at full precision. On public 3DGS scenes this is about 28x
+smaller than the PLY, at 40 to 43 dB against it; `splat convert --small` gives about
+31x at 39 to 41 dB, with weaker close-ups. Scenes with very few Gaussians and strongly
+view-dependent colour lose more. Older `.cgc` files still load.
+
+[web/cgc.js](web/cgc.js) is a dependency-free decoder for browsers, LZMA included.
+The byte layout and the measurements behind it are in
+`docs/superpowers/specs/2026-11-02-cgc-v2-format.md`.
+
+### Pruning floaters
+
+Trained scenes often contain a few "floaters": huge, nearly transparent
+Gaussians far outside the scene that render as long streaks from any viewpoint
+the training cameras did not cover. `splat convert` can drop them on the way
+to either format, with both tests off unless asked for:
+
+```
+splat convert scene.ply scene.cgc --prune-sigma 1 --prune-radius 4
+```
+
+`--prune-sigma <units>` removes every Gaussian whose largest axis (one standard
+deviation) is longer than that many world units. `--prune-radius <factor>`
+removes every Gaussian farther from the scene centre than that many times the
+radius holding 90% of all Gaussians; the centre is the per-axis median, so the
+floaters themselves do not move it. Either option alone enables its test, and
+`convert` prints how many Gaussians were removed. Start around `--prune-sigma
+1` for a room-sized scene in metres and look at a render; opaque, well-placed
+Gaussians are rarely that large.
 
 ## Running
 
@@ -206,7 +282,7 @@ Tests need a Vulkan device. Without a GPU, Mesa's lavapipe
 ```
 shaders/        GLSL shaders, compiled to SPIR-V and embedded at build time
 src/core/       Vulkan context, buffers, images, compute pipelines, radix sort
-src/splat/      Gaussian cloud data, .ply reading and writing, test scene
+src/splat/      Gaussian cloud data, .ply and .cgc reading and writing, test scene
 src/render/     Camera, splat renderer, offscreen rendering and PNG output
 src/viewer/     SDL3 window, swapchain and input (built when SDL3 is found)
 src/cli/        The `splat` command-line program

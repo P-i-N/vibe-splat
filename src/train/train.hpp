@@ -21,9 +21,19 @@ struct TrainOptions {
   int saveEvery = 5000; // 0 only saves at the end
 
   bool densify = true;
+  // Learn each view's exposure, so that the Gaussians need not take it up.
+  // For photos whose exposure varies, as auto exposure in video does; on
+  // evenly exposed photos it costs about 0.5 dB on held-out views.
+  bool exposure = false;
+  bool fullAdam = false;       // Update every Gaussian each step, not only those in view: slower, sharper
+  bool fullResolution = false; // Train at full size throughout, without the coarse start
   float gradientThreshold = 2e-4f;
   double vramBudgetGiB = 0.0; // 0: 90% of the GPU's free memory
   std::size_t maxGaussians = 0; // 0: as many as the budget allows
+  // Share of the Gaussians removed, those adding least to the training views,
+  // at the end of densification and again halfway through the rest. 0: none.
+  // 70% each time leaves a tenth, for about 0.1 dB of PSNR on held-out views.
+  double pruneShare = 0.7;
 };
 
 struct TrainReport {
