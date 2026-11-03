@@ -26,8 +26,7 @@ struct TrainerOptions {
   std::array<float, 3> background{0.f, 0.f, 0.f};
   float nearPlane = 0.01f;
   bool forceFixedPoint = false; // Use the path for GPUs without float atomics
-  // Adam leaves Gaussians out of view alone: a fifth faster on the test set,
-  // but about 0.5 dB lower on held-out views than updating them all.
+  // Adam leaves Gaussians out of view alone, which is about a tenth faster.
   bool selectiveAdam = true;
   bool poseGradients = false; // Fill StepStats::poseGradient, for refining cameras
   std::uint64_t memoryBudget = ~std::uint64_t{0}; // Bytes; never allocates beyond this

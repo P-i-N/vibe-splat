@@ -130,30 +130,47 @@ does automatic differentiation: each pass has a hand-derived counterpart.
 - **Overlap.** One submission per iteration (forward, loss, backward, Adam),
   and the next view's image is copied to staging memory on a worker thread
   while the GPU works on the current one.
-- **Coarse to fine.** The first 15% of iterations train on images at a
-  quarter of their size and the next 20% at half, made by averaging 2x2
-  pixels, as the early iterations only need the broad shapes
-  (`--full-resolution` turns this off).
+- **Starting points.** Besides the sparse model, up to 200000 more points come
+  from matching patches along epipolar lines between the photos, checked in a
+  third one (`--dense-init` sets how many, 0 turns it off). The idea is from
+  EDGS, without its neural matcher.
+- **Coarse to fine.** Training starts on images at a quarter of their size,
+  then half, made by averaging 2x2 pixels, as the early iterations only need
+  the broad shapes. When to switch comes from how the photos' spectra fall off,
+  as in DashGaussian, and how many Gaussians are allowed grows with the size
+  (`--fixed-schedule` uses 15% and 35% with no such limit, `--full-resolution`
+  stays at full size).
 - **Exposure.** With `--exposure`, each training view also learns a 3x4
   colour transform that the loss compares its photo through, so that
   changes in exposure and white balance between photos, as auto exposure
   makes in video, do not end up in the Gaussians. The output stays neutral.
+  Held-out views are also scored with an exposure fitted on one half of each
+  image and scored on the other, the only fair way to compare with and without.
 - **Optimiser.** Adam, with the learning rates of the 3DGS paper. It only
   updates Gaussians the current view sees: the rest keep their values and
   moments, which also spares most of its memory traffic. `--full-adam`
-  updates them all, which on the test set is a fifth slower and 0.5 dB
-  better on held-out views.
-- **Density.** Every 100 iterations in the first half of training, a Gaussian
-  whose screen position keeps wanting to move is cloned if small and split in
-  two if large, and nearly transparent ones are removed. Opacity is capped every
-  3000 iterations, so that those no longer needed fade away.
-- **Pruning.** At the end of densification and again halfway through the
-  rest, every training view is rendered once without a
-  step, adding up each Gaussian's blending weight over all their pixels. The
-  70% adding least are removed (`--prune` sets the share, 0 turns it off),
-  and the rest keep training to fill in. On the 194-photo test set at 10000
-  iterations this ends with 193k Gaussians instead of 2.2M, for 0.1 dB less
-  PSNR on held-out views, and the run takes 36% less time.
+  updates them all, about a tenth slower. It used to be 0.5 dB better on
+  held-out views, but with scored densification it made no clear difference.
+- **Density.** Every 100 iterations in the first half of training, 10 random
+  views are scored, as in FastGS: for each Gaussian, how many pixels it reaches
+  whose error is above a tenth of that view's worst. Only those reaching more
+  than 5 per view may multiply (`--score-views 0` turns this off). Of those, a
+  small one whose screen position keeps wanting to move is cloned. A large one
+  is split in two on the same gradient without the cancelling between pixels
+  pulling opposite ways, as in AbsGS. Nearly transparent ones are removed.
+  Opacity is capped every 3000 iterations, so that those no longer needed fade away.
+- **Pruning.** With `--prune <share>`, at the end of densification and again
+  halfway through the rest, every training view is rendered once without a
+  step, adding up each Gaussian's blending weight over all their pixels, and
+  that share of those adding least is removed. Off by default: the scoring above
+  already keeps the count down, and at 5000 iterations more costs real quality.
+- **Options that did not help on the test scenes, and are off.** `--second-order`
+  (3DGS^2-TR, after densification), `--explore` (random splits and new
+  Gaussians, from the blur trap paper), `--threshold-rise` (Improving ADC),
+  `--significance-prune` and `--point-extent`.
+- **Poses.** `--refine-poses` refines the training cameras along with the
+  Gaussians. It helps when poses are a little off and costs a little when they
+  are good, so it is off by default.
 - **View dependence.** SH starts at degree 0 and gains a degree every 1000
   iterations, up to `--sh-degree`.
 - **Memory.** A hard budget, by default 90% of the GPU's free memory

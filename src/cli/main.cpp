@@ -116,35 +116,35 @@ train options (writes project/splat.ply and project/preview_*.png):
   --no-densify            Keep the initial Gaussians, without adding or removing any
   --full-resolution       Train at full size from the start, rather than coarse to fine
   --full-adam             Update every Gaussian each step, not only those in view:
-                          about 0.5 dB better on held-out views, a fifth slower
+                          about a tenth slower, with no clear gain in quality
   --exposure              Learn each photo's exposure and white balance, for
                           photos or video whose exposure varies
   --gradient-threshold <x>  Lower adds more Gaussians (default 0.0002)
   --vram-budget <GiB>     Default: 90% of the GPU's free memory
   --max-gaussians <n>     Default: what the budget allows
   --prune <share>         Remove this share of Gaussians, those adding least, at the
-                          end of densification and again halfway to the end
-                          (default 0.7, which leaves a tenth; 0 keeps all)
+                          end of densification and again halfway to the end, for a
+                          smaller file at some cost in quality (default 0: keep all)
   --threshold-rise <x>    The gradient threshold rises by this factor over
                           densification, centred on its value (default 1: fixed)
   --split-threshold <x>   Large Gaussians split on the gradient that pixels pulling
-                          opposite ways do not cancel, above this (default 0: off)
+                          opposite ways do not cancel, above this (default 0.0012; 0: off)
   --dense-fraction <x>    Larger than this share of the scene: split; smaller: clone
-                          (default 0.01)
+                          (default 0.001)
   --densify-interval <n>  Iterations between densification rounds (default 100)
   --score-views <n>       Densify only Gaussians reaching many high-error pixels in
-                          this many views per round (default 0: off)
+                          this many views per round (default 10; 0: off)
   --score-min-pixels <x>  How many per view (default 5)
   --explore <n>           Per round, split n random large Gaussians and place n new
                           ones at random (default 0)
   --significance-prune    Of the too transparent, remove the half adding least, and
                           remove none for their size
-  --adaptive-schedule     Choose the coarse-to-fine sizes from the photos' spectra, and
-                          grow the Gaussians with the image size
+  --fixed-schedule        Fixed coarse-to-fine sizes, rather than from the photos'
+                          spectra, and no limit growing with the image size
   --refine-poses          Refine the training cameras along with the Gaussians
   --second-order          After densification, step by estimated curvature, not Adam
   --dense-init <n>        Start from up to n more points than the sparse model has,
-                          found by matching patches between the photos (default 0)
+                          found by matching patches between the photos (default 200000)
   --point-extent          Take the scene's extent from the sparse points, not the cameras
 
 make-test-views options:
@@ -463,11 +463,11 @@ int cmd_train(const GlobalOptions &opts) {
   for (auto &a : rest) {
     if (a == "-o") a = "--out";
   }
-  const splat::cli::Args args(rest, {"--no-densify", "--full-resolution", "--exposure", "--full-adam", "--significance-prune", "--point-extent", "--adaptive-schedule", "--refine-poses", "--second-order"});
+  const splat::cli::Args args(rest, {"--no-densify", "--full-resolution", "--exposure", "--full-adam", "--significance-prune", "--point-extent", "--fixed-schedule", "--refine-poses", "--second-order"});
   args.allow_only({"out", "iterations", "lambda-ssim", "sh-degree", "max-size", "max-views", "holdout", "seed", "report-every", "save-every",
                    "no-densify", "gradient-threshold", "vram-budget", "max-gaussians", "prune", "full-resolution", "exposure", "full-adam",
                    "threshold-rise", "split-threshold", "dense-fraction", "densify-interval", "score-views", "score-min-pixels", "explore",
-                   "significance-prune", "point-extent", "adaptive-schedule", "refine-poses", "second-order", "dense-init"});
+                   "significance-prune", "point-extent", "fixed-schedule", "refine-poses", "second-order", "dense-init"});
   if (args.positionals().size() != 1) {
     std::println(stderr, "Usage: splat train <project> [options]  (see splat --help)");
     return 2;
@@ -501,10 +501,10 @@ int cmd_train(const GlobalOptions &opts) {
   options.explore = std::max(args.number("explore", options.explore), 0);
   options.significancePrune = args.has("significance-prune");
   options.pointExtent = args.has("point-extent");
-  options.adaptiveSchedule = args.has("adaptive-schedule");
+  options.adaptiveSchedule = !args.has("fixed-schedule");
   options.refinePoses = args.has("refine-poses");
   options.secondOrder = args.has("second-order");
-  options.densePoints = args.number<std::size_t>("dense-init", 0);
+  options.densePoints = args.number<std::size_t>("dense-init", options.densePoints);
   splat::vk::Context ctx(opts.context);
   std::println("Device: {}", ctx.info().name);
   splat::run_train(ctx, options);
