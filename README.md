@@ -183,6 +183,12 @@ does automatic differentiation: each pass has a hand-derived counterpart.
   opacity scaled to match) and `--mip-filter-3d` (each Gaussian widened to its
   smallest footprint in the photos, baked into saved scenes): 24.0-24.1 dB, the
   same as without, and the 3D filter costs a tenth of the speed (96 it/s).
+  From Improving Densification in 3DGS: `--edge-split` (each candidate splits
+  with probability score / the round's best, into two children along its
+  longest axis, in place of cloning and splitting) grows only to 86k Gaussians
+  and reaches 22.6 dB at 170-190 it/s, and `--recovery-prune 0.2` (the least
+  opaque fifth removed 300 iterations after each opacity reset) 24.15-24.2 dB
+  at 104-119 it/s, within noise of the default.
 - **Poses.** `--refine-poses` refines the training cameras along with the
   Gaussians. It helps when poses are a little off and costs a little when they
   are good, so it is off by default.
