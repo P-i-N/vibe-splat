@@ -22,6 +22,14 @@ struct ReferenceOptions {
   // transmittance 1e-4. They are steps, which finite differences see and true
   // derivatives do not, so checking gradients needs them gone.
   bool noCutoffs = false;
+  float opacityReg = 0.f; // The 3DGS-MCMC penalties, as TrainerOptions
+  float scaleReg = 0.f;
+  // Mip-Splatting's 2D filter: a 0.1 pixel dilation instead of 0.3, with the
+  // opacity scaled by sqrt(det(cov) / det(cov + 0.1 I)) to keep the integral.
+  bool mipFilter2d = false;
+  // Mip-Splatting's 3D smoothing filter per Gaussian (see smoothing_filter()),
+  // or empty for none: added to the covariance, with the opacity scaled to match.
+  std::vector<float> filter3d;
 };
 
 struct ReferenceImage {
@@ -40,6 +48,11 @@ struct ReferenceImage {
 // backward pass adds up for pruning.
 [[nodiscard]] std::vector<double> reference_contributions(const GaussianCloud &cloud, const Camera &camera, const ReferenceOptions &options);
 
+// Per Gaussian, how many pixels it reaches whose mean error is at least `share`
+// of the image's worst, as Trainer::score_view() counts them. `target` is RGBA8.
+[[nodiscard]] std::vector<double> reference_marked_pixels(const GaussianCloud &cloud, const Camera &camera, const std::vector<std::uint8_t> &target,
+                                                          double share, const ReferenceOptions &options);
+
 struct ReferenceLoss {
   double loss = 0.0;
   double l1 = 0.0;   // Mean absolute difference
@@ -52,6 +65,7 @@ struct ReferenceLoss {
 
 struct ParameterGradients {
   std::vector<double> positions, scales, rotations, opacities, sh;
+  std::vector<double> absoluteCentre; // 2 per Gaussian: |dL/dcentre| summed per pixel, so nothing cancels
 };
 
 // Gradients of the scalar sum(adjoint * image) with respect to all parameters.

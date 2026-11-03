@@ -85,7 +85,7 @@ the later stages to read. Rerun it with `--force` to replace them.
 
 - **Photos** can be JPEG, PNG, BMP or TGA. HEIC and raw files need converting
   first. EXIF orientation is applied, so stored images are always upright.
-- **Videos** (needs a build with FFmpeg) keep the sharpest frame of each interval
+- **Videos** (needs a build with FFmpeg, or `ffmpeg` 5.1+ on PATH) keep the sharpest frame of each interval
   of 1/`--fps` seconds, since motion blur ruins training images. Rotation
   metadata is applied.
 - **Size**: the longest side is reduced to `--max-size` (default 1600).
@@ -166,30 +166,70 @@ does automatic differentiation: each pass has a hand-derived counterpart.
 - **Overlap.** One submission per iteration (forward, loss, backward, Adam),
   and the next view's image is copied to staging memory on a worker thread
   while the GPU works on the current one.
-- **Coarse to fine.** The first 15% of iterations train on images at a
-  quarter of their size and the next 20% at half, made by averaging 2x2
-  pixels, as the early iterations only need the broad shapes
-  (`--full-resolution` turns this off).
+- **Starting points.** Besides the sparse model, up to 50000 more points come
+  from matching patches along epipolar lines between the photos, checked in a
+  third one (`--dense-init` sets how many, 0 turns it off). The idea is from
+  EDGS, without its neural matcher.
+- **Coarse to fine.** Training starts on images at a quarter of their size
+  until 15% of the way through, then half until 35%, made by averaging 2x2
+  pixels, as the early iterations only need the broad shapes. The Gaussians may
+  grow to `--max-growth` times the starting points (4 by default), which keeps
+  7000 iterations on the bicycle scene above 100 it/s on a laptop; more adds
+  little (24.1 dB held out at 400k, 24.2 at 600k). `--adaptive-schedule`
+  instead switches sizes where the photos' spectra fall off and lets the count
+  grow with the size, as in DashGaussian: faster, but 0.7 dB worse on that
+  scene at 7000 iterations (23.4 dB), and the default until now.
+  `--full-resolution` stays at full size throughout.
 - **Exposure.** With `--exposure`, each training view also learns a 3x4
   colour transform that the loss compares its photo through, so that
   changes in exposure and white balance between photos, as auto exposure
   makes in video, do not end up in the Gaussians. The output stays neutral.
+  Held-out views are also scored with an exposure fitted on one half of each
+  image and scored on the other, the only fair way to compare with and without.
 - **Optimiser.** Adam, with the learning rates of the 3DGS paper. It only
   updates Gaussians the current view sees: the rest keep their values and
   moments, which also spares most of its memory traffic. `--full-adam`
-  updates them all, which on the test set is a fifth slower and 0.5 dB
-  better on held-out views.
-- **Density.** Every 100 iterations in the first half of training, a Gaussian
-  whose screen position keeps wanting to move is cloned if small and split in
-  two if large, and nearly transparent ones are removed. Opacity is capped every
-  3000 iterations, so that those no longer needed fade away.
-- **Pruning.** At the end of densification and again halfway through the
-  rest, every training view is rendered once without a
-  step, adding up each Gaussian's blending weight over all their pixels. The
-  70% adding least are removed (`--prune` sets the share, 0 turns it off),
-  and the rest keep training to fill in. On the 194-photo test set at 10000
-  iterations this ends with 193k Gaussians instead of 2.2M, for 0.1 dB less
-  PSNR on held-out views, and the run takes 36% less time.
+  updates them all, about a tenth slower. It used to be 0.5 dB better on
+  held-out views, but with scored densification it made no clear difference.
+- **Density.** Every 100 iterations in the first half of training, 10 random
+  views are scored, as in FastGS: for each Gaussian, how many pixels it reaches
+  whose error is above a tenth of that view's worst. Only those reaching more
+  than 5 per view may multiply (`--score-views 0` turns this off). Of those, a
+  small one whose screen position keeps wanting to move is cloned. A large one
+  is split in two on the same gradient without the cancelling between pixels
+  pulling opposite ways, as in AbsGS. Nearly transparent ones are removed.
+  Opacity is capped every 3000 iterations, so that those no longer needed fade away.
+- **Pruning.** With `--prune <share>`, at the end of densification and again
+  halfway through the rest, every training view is rendered once without a
+  step, adding up each Gaussian's blending weight over all their pixels, and
+  that share of those adding least is removed. Off by default: the scoring above
+  already keeps the count down, and at 5000 iterations more costs real quality.
+- **Options that did not help on the test scenes, and are off.** `--second-order`
+  (3DGS^2-TR, after densification), `--explore` (random splits and new
+  Gaussians, from the blur trap paper), `--threshold-rise` (Improving ADC),
+  `--significance-prune` and `--point-extent`. From 3DGS-MCMC, measured on the
+  bicycle scene at 7000 iterations against 24.1 dB held out at 107 it/s:
+  `--opacity-reg 0.01 --scale-reg 0.01` (22.5-23.0 dB: with the opacity reset
+  the penalties thin the cloud to 270k), `--densify mcmc` (relocation in place
+  of clone, split and prune: 23.2 dB, 87 it/s as the relocated Gaussians are
+  opaque and large), `--position-noise 5e5` on top (23.3 dB), and all of them
+  together (23.7 dB, 98 it/s). Its gains are reported at 30000 iterations; at
+  7000 the relocation has not converged. Mip-Splatting's filters,
+  `--mip-filter` (both), `--mip-filter-2d` (a 0.1 pixel dilation with the
+  opacity scaled to match) and `--mip-filter-3d` (each Gaussian widened to its
+  smallest footprint in the photos, baked into saved scenes): 24.0-24.1 dB, the
+  same as without, and the 3D filter costs a tenth of the speed (96 it/s).
+  From Improving Densification in 3DGS: `--edge-split` (each candidate splits
+  with probability score / the round's best, into two children along its
+  longest axis, in place of cloning and splitting) grows only to 86k Gaussians
+  and reaches 22.6 dB at 170-190 it/s, and `--recovery-prune 0.2` (the least
+  opaque fifth removed 300 iterations after each opacity reset) 24.15-24.2 dB
+  at 104-119 it/s, within noise of the default. `--sh-dropout 0.2` (Dropping
+  Anchor and Spherical Harmonics: a Gaussian keeps only its low SH degrees on
+  a fifth of the iterations): 24.1 dB, the same as without.
+- **Poses.** `--refine-poses` refines the training cameras along with the
+  Gaussians. It helps when poses are a little off and costs a little when they
+  are good, so it is off by default.
 - **View dependence.** SH starts at degree 0 and gains a degree every 1000
   iterations, up to `--sh-degree`.
 - **Memory.** A hard budget, by default 90% of the GPU's free memory
@@ -202,8 +242,9 @@ Images are undistorted when loaded, since the renderer is a pinhole camera.
 `src/train/reference.cpp` has every kernel again on the CPU: the tests check it
 against finite differences, and the GPU against it.
 
-`--holdout 8` keeps every 8th view out of training and reports PSNR on those,
-which says more about quality than PSNR on images it has seen.
+`--holdout 8` keeps the first and every 8th view out of training, the split 3DGS
+uses, and reports PSNR on those, which says more about quality than PSNR on
+images it has seen.
 
 ## How rendering works
 
@@ -287,12 +328,22 @@ splat info
 3DGS data normally uses the COLMAP convention, where "up" is -y. If a scene
 appears upside down, pass `--up +y` (or `+z`/`-z`).
 
+`splat train` saves its output, checkpoints included, with the floor level at
+y = 0 under the scene's centre, -y up. Training itself stays in the cameras'
+frame; only the saved copy is turned (positions, orientations and the
+view-dependent colour). Up comes from the cameras, whose x axes lie level when
+held by people, and the floor is the plane holding the most opaque Gaussians,
+by RANSAC, within 20 degrees of that, favouring level ones and with the
+cameras above it. If no such plane stands out, the scene is only levelled by
+the cameras' up. Pass `--no-align` to save in the cameras' frame.
+
 ## Building
 
 Requirements: CMake 3.28+, Ninja, git, and a C++23 compiler (GCC 14+,
 Clang 18+ or Visual Studio 2022 17.10+). Video input uses the system's FFmpeg
 6.1 or newer, found through pkg-config (Ubuntu: `libavformat-dev libavcodec-dev
-libswscale-dev`); without it, `splat ingest` handles photos only. Everything else, including the
+libswscale-dev`); without it, `splat ingest` runs the `ffmpeg` program from PATH
+(5.1 or newer) for videos, or handles photos only. Everything else, including the
 shader compiler, is fetched and built by vcpkg, which is a git submodule.
 
 ```

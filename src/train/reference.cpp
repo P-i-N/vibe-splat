@@ -116,22 +116,36 @@ std::vector<Splat> prepare(const GaussianCloud &cloud, const Camera &cam, const 
   for (std::size_t i = 0; i < cloud.size(); ++i) {
     const dvec3 p = position_of(cloud, i);
     const dvec3 t = dvec3(view * glm::dvec4(p, 1.0));
-    if (t.z < options.nearPlane) continue;
+    if (!(t.z >= options.nearPlane)) continue;
     const double opacity = 1.0 / (1.0 + std::exp(-static_cast<double>(cloud.opacities[i])));
-    if (opacity < 1.0 / 255.0) continue;
+    if (!(opacity >= 1.0 / 255.0)) continue;
+    double quatLength = 0.0;
+    const dvec4 quat = quat_of(cloud, i, &quatLength);
+    if (!(quatLength >= 1e-4)) continue;
 
     const dvec3 s(std::exp(static_cast<double>(cloud.scales[i * 3])), std::exp(static_cast<double>(cloud.scales[i * 3 + 1])),
                   std::exp(static_cast<double>(cloud.scales[i * 3 + 2])));
-    const dmat3 M = quat_to_mat(quat_of(cloud, i)) * dmat3(s.x, 0, 0, 0, s.y, 0, 0, 0, s.z);
-    const dmat3 sigma = M * glm::transpose(M);
+    const dmat3 M = quat_to_mat(quat) * dmat3(s.x, 0, 0, 0, s.y, 0, 0, 0, s.z);
+    const double filter = i < options.filter3d.size() ? options.filter3d[i] : 0.0;
+    const dmat3 sigma = M * glm::transpose(M) + dmat3(filter);
+    double opacity3 = opacity;
+    for (int a = 0; a < 3; ++a) opacity3 *= std::sqrt(s[a] * s[a] / (s[a] * s[a] + filter));
+    if (!(opacity3 >= 1.0 / 255.0)) continue;
 
     const double tx = std::clamp(t.x / t.z, -limX, limX) * t.z, ty = std::clamp(t.y / t.z, -limY, limY) * t.z;
     const dmat3 J(fx / t.z, 0, 0, 0, fy / t.z, 0, -fx * tx / (t.z * t.z), -fy * ty / (t.z * t.z), 0);
     const dmat3 T = J * Rv;
     const dmat3 cov = T * sigma * glm::transpose(T);
-    const double a = cov[0][0] + 0.3, b = cov[0][1], c = cov[1][1] + 0.3;
+    const double dilation = options.mipFilter2d ? 0.1 : 0.3;
+    const double a = cov[0][0] + dilation, b = cov[0][1], c = cov[1][1] + dilation;
     const double det = a * c - b * b;
-    if (det <= 0.0) continue;
+    if (!(det > 1e-6)) continue;
+    double opacityUsed = opacity3;
+    if (options.mipFilter2d) {
+      const double rawDet = cov[0][0] * cov[1][1] - b * b;
+      opacityUsed = rawDet > 0.0 ? opacity3 * std::sqrt(rawDet / det) : 0.0;
+      if (!(opacityUsed >= 1.0 / 255.0)) continue;
+    }
     const double mid = 0.5 * (a + c);
     const double lambda = mid + std::sqrt(std::max(0.1, mid * mid - det));
 
@@ -145,7 +159,7 @@ std::vector<Splat> prepare(const GaussianCloud &cloud, const Camera &cam, const 
     }
     out.depth = t.z;
     out.conic = dvec3(c, -b, a) / det;
-    out.opacity = opacity;
+    out.opacity = opacityUsed;
     const auto basis = sh_basis(glm::normalize(p - dvec3(cam.position)), cloud.shDegree);
     const std::size_t coefficients = static_cast<std::size_t>(cloud.shCoeffs());
     dvec3 color(0.5);
@@ -153,6 +167,7 @@ std::vector<Splat> prepare(const GaussianCloud &cloud, const Camera &cam, const 
       const std::size_t at = (i * coefficients + k) * 3;
       color += basis[k] * dvec3(cloud.sh[at], cloud.sh[at + 1], cloud.sh[at + 2]);
     }
+    if (!(std::abs(color.r) < 1e30 && std::abs(color.g) < 1e30 && std::abs(color.b) < 1e30)) continue;
     out.color = glm::max(color, dvec3(0.0));
     splats.push_back(out);
   }
@@ -228,6 +243,34 @@ std::vector<double> reference_contributions(const GaussianCloud &cloud, const Ca
   std::vector<double> contributions(cloud.size(), 0.0);
   (void)composite(cloud, camera, options, &contributions);
   return contributions;
+}
+
+std::vector<double> reference_marked_pixels(const GaussianCloud &cloud, const Camera &camera, const std::vector<std::uint8_t> &target, double share,
+                                            const ReferenceOptions &options) {
+  const ReferenceImage image = composite(cloud, camera, options, nullptr);
+  std::vector<double> errors(image.rgb.size());
+  double worst = 0.0;
+  for (std::size_t at = 0; at < errors.size(); ++at) {
+    for (std::size_t c = 0; c < 3; ++c) errors[at] += std::abs(image.rgb[at][static_cast<int>(c)] - target[at * 4 + c] / 255.0) / 3.0;
+    worst = std::max(worst, errors[at]);
+  }
+  std::vector<double> counts(cloud.size(), 0.0);
+  const std::vector<Splat> splats = prepare(cloud, camera, options);
+  for (std::size_t j = 0; j < splats.size(); ++j) {
+    const Splat &s = splats[j];
+    const int x0 = std::max(0, static_cast<int>(std::floor(s.center.x - s.radius)) - 1), x1 = std::min(camera.width - 1, static_cast<int>(std::ceil(s.center.x + s.radius)) + 1);
+    const int y0 = std::max(0, static_cast<int>(std::floor(s.center.y - s.radius)) - 1), y1 = std::min(camera.height - 1, static_cast<int>(std::ceil(s.center.y + s.radius)) + 1);
+    for (int y = y0; y <= y1; ++y) {
+      for (int x = x0; x <= x1; ++x) {
+        dvec2 d;
+        double power = 0.0, alpha = 0.0;
+        if (!splat_at(s, x, y, d, power, alpha, options.noCutoffs)) continue;
+        const std::size_t at = static_cast<std::size_t>(y) * camera.width + x;
+        if (j >= image.stop[at] && errors[at] >= share * worst) counts[s.index] += 1.0;
+      }
+    }
+  }
+  return counts;
 }
 
 ReferenceLoss reference_loss(const ReferenceImage &image, const std::vector<std::uint8_t> &target, double lambda) {
@@ -311,6 +354,7 @@ ParameterGradients reference_gradients(const GaussianCloud &cloud, const Camera 
   out.rotations.assign(n * 4, 0.0);
   out.opacities.assign(n, 0.0);
   out.sh.assign(cloud.sh.size(), 0.0);
+  out.absoluteCentre.assign(n * 2, 0.0);
 
   // train_backward.glsl
   std::vector<std::array<double, 9>> raw(n, std::array<double, 9>{});
@@ -344,6 +388,8 @@ ParameterGradients reference_gradients(const GaussianCloud &cloud, const Camera 
           const dvec2 v(s.conic.x * d.x + s.conic.y * d.y, s.conic.y * d.x + s.conic.z * d.y);
           g[1] += dPower * v.x;
           g[2] += dPower * v.y;
+          out.absoluteCentre[s.index * 2] += std::abs(dPower * v.x);
+          out.absoluteCentre[s.index * 2 + 1] += std::abs(dPower * v.y);
           g[3] += dPower * 0.5 * v.x * v.x;
           g[4] += dPower * 0.5 * v.x * v.y;
           g[5] += dPower * 0.5 * v.y * v.y;
@@ -368,17 +414,39 @@ ParameterGradients reference_gradients(const GaussianCloud &cloud, const Camera 
     const dvec3 t = dvec3(view * glm::dvec4(p, 1.0));
     const double z = t.z, iz = 1.0 / z, iz2 = iz * iz;
     const dvec2 gCentre(g[1], g[2]);
-    const dmat2 G(g[3], g[4], g[4], g[5]);
+    dmat2 G(g[3], g[4], g[4], g[5]);
+    const double opacity = 1.0 / (1.0 + std::exp(-static_cast<double>(cloud.opacities[i])));
+    double k2 = 1.0; // The 2D Mip filter's factor
     const dmat3 R = quat_to_mat(quat);
     const dvec3 s2(std::exp(2.0 * static_cast<double>(cloud.scales[i * 3])), std::exp(2.0 * static_cast<double>(cloud.scales[i * 3 + 1])),
                    std::exp(2.0 * static_cast<double>(cloud.scales[i * 3 + 2])));
     const dmat3 D(s2.x, 0, 0, 0, s2.y, 0, 0, 0, s2.z);
-    const dmat3 X = Rv * (R * D * glm::transpose(R)) * glm::transpose(Rv);
+    const double filter = i < options.filter3d.size() ? options.filter3d[i] : 0.0;
+    const dmat3 X = Rv * (R * D * glm::transpose(R) + dmat3(filter)) * glm::transpose(Rv);
+    // The 3D filter scales the opacity by k3 = prod sqrt(s2 / (s2 + f)).
+    double k3 = 1.0;
+    for (int a = 0; a < 3; ++a) k3 *= std::sqrt(s2[a] / (s2[a] + filter));
+    const double opacity3 = opacity * k3; // What the 2D stage sees
 
     const double rx = t.x * iz, ry = t.y * iz;
     const bool clampedX = std::abs(rx) > limX, clampedY = std::abs(ry) > limY;
     const double tx = std::clamp(rx, -limX, limX) * z, ty = std::clamp(ry, -limY, limY) * z;
     const dmat3x2 J(dvec2(fx * iz, 0.0), dvec2(0.0, fy * iz), dvec2(-fx * tx * iz2, -fy * ty * iz2));
+    if (options.mipFilter2d) {
+      // The filter scales the opacity by k = sqrt(det C / det(C + 0.1 I)) with C
+      // the 2D covariance before dilation: that also moves the covariance gradient.
+      const dmat2 C = J * X * glm::transpose(J);
+      const dmat2 F = C + dmat2(0.1);
+      const double detC = glm::determinant(C), detF = glm::determinant(F);
+      if (detC > 0.0 && detF > 0.0) {
+        const double k = std::sqrt(detC / detF);
+        const dmat2 cofC(C[1][1], -C[0][1], -C[1][0], C[0][0]), cofF(F[1][1], -F[0][1], -F[1][0], F[0][0]);
+        G += g[0] * opacity3 * 0.5 * k * (cofC / detC - cofF / detF);
+        k2 = k;
+      } else {
+        k2 = 0.0;
+      }
+    }
     const dmat3x2 Jc(dvec2(fx * iz, 0.0), dvec2(0.0, fy * iz), dvec2(-fx * t.x * iz2, -fy * t.y * iz2));
     dvec3 gT = glm::transpose(Jc) * gCentre;
     const dmat3x2 dJx(dvec2(0.0), dvec2(0.0), dvec2(clampedX ? 0.0 : -fx * iz2, 0.0));
@@ -391,7 +459,10 @@ ParameterGradients reference_gradients(const GaussianCloud &cloud, const Camera 
 
     const dmat3x2 T = J * Rv;
     const dmat3 G3 = glm::transpose(T) * G * T;
-    for (int a = 0; a < 3; ++a) out.scales[i * 3 + a] = 2.0 * s2[a] * glm::dot(R[a], G3 * R[a]);
+    // The filter's opacity factor also moves with the scales: dk3 / dlog s_a = k3 f / (s2_a + f).
+    for (int a = 0; a < 3; ++a) {
+      out.scales[i * 3 + a] = 2.0 * s2[a] * glm::dot(R[a], G3 * R[a]) + g[0] * k2 * opacity * k3 * filter / (s2[a] + filter);
+    }
 
     const dmat3 P = 2.0 * G3 * R * D;
     const double w = quat.x, x = quat.y, y = quat.z, zq = quat.w;
@@ -404,8 +475,7 @@ ParameterGradients reference_gradients(const GaussianCloud &cloud, const Camera 
     const dvec4 tangent = (gq - quat * glm::dot(quat, gq)) / std::max(quatLength, 1e-12);
     for (int k = 0; k < 4; ++k) out.rotations[i * 4 + k] = tangent[k];
 
-    const double opacity = 1.0 / (1.0 + std::exp(-static_cast<double>(cloud.opacities[i])));
-    out.opacities[i] = g[0] * opacity * (1.0 - opacity);
+    out.opacities[i] = g[0] * k2 * k3 * opacity * (1.0 - opacity);
 
     const dvec3 gColour(g[6], g[7], g[8]);
     const auto basis = sh_basis(glm::normalize(p - dvec3(cam.position)), cloud.shDegree);
@@ -434,6 +504,15 @@ ParameterGradients reference_gradients(const GaussianCloud &cloud, const Camera 
     for (std::size_t k = 0; k < coefficients; ++k) {
       const std::size_t at = (i * coefficients + k) * 3;
       for (int c = 0; c < 3; ++c) out.sh[at + static_cast<std::size_t>(c)] = colour[c] > 0.0 ? basis[k] * gColour[c] : 0.0;
+    }
+  }
+  // 3DGS-MCMC's penalties, on every Gaussian whether or not a pixel saw it.
+  if (options.opacityReg > 0.f || options.scaleReg > 0.f) {
+    const double n = static_cast<double>(cloud.size());
+    for (std::size_t i = 0; i < cloud.size(); ++i) {
+      const double o = 1.0 / (1.0 + std::exp(-static_cast<double>(cloud.opacities[i])));
+      out.opacities[i] += options.opacityReg / n * o * (1.0 - o);
+      for (std::size_t a = 0; a < 3; ++a) out.scales[i * 3 + a] += options.scaleReg / n * std::exp(static_cast<double>(cloud.scales[i * 3 + a]));
     }
   }
   return out;

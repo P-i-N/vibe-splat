@@ -1,0 +1,29 @@
+#version 460
+// Second-order training: an adjoint of random signs, one per pixel and channel.
+// Taken through the backward pass it gives J^T u, whose square has the diagonal
+// of J^T J as its expected value (Hutchinson's estimator, in image space).
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) writeonly buffer Adjoint { vec4 adjoint[]; };
+
+layout(push_constant) uniform Push {
+  uint pixels;
+  uint seed;
+} pc;
+
+uint hash(uint x) {
+  x ^= x >> 16u;
+  x *= 0x7feb352du;
+  x ^= x >> 15u;
+  x *= 0x846ca68bu;
+  x ^= x >> 16u;
+  return x;
+}
+
+void main() {
+  const uint i = gl_GlobalInvocationID.x;
+  if (i < pc.pixels) {
+    const uint bits = hash(i ^ hash(pc.seed));
+    adjoint[i] = vec4((bits & 1u) != 0u ? 1.0 : -1.0, (bits & 2u) != 0u ? 1.0 : -1.0, (bits & 4u) != 0u ? 1.0 : -1.0, 0.0);
+  }
+}

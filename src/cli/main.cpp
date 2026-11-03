@@ -98,7 +98,7 @@ ingest options (inputs are image files, video files or folders of them):
   --max-size <px>         Longest side of stored images, 0 keeps it (default 1600)
   --png                   Store PNG instead of JPEG
   --jpeg-quality <1-100>  Default 95
-  --fps <n>               Video frames kept per second, 0 keeps all (default 2)
+  --fps <n>               Video frames kept per second, 0 keeps all (default 4)
   --max-frames <n>        Frames kept per video, lowering --fps to fit
   --threads <n>           Photo threads, 0 uses all cores (default 0)
   --force                 Replace a previous ingest in this project
@@ -126,22 +126,66 @@ train options (writes project/splat.ply and project/preview_*.png):
   --sh-degree <0-3>       Default 3
   --max-size <px>         Shrink training images to this (default: keep size)
   --max-views <n>         Use only the first n views
-  --holdout <n>           Keep every nth view out of training, to measure quality
+  --holdout <n>           Keep the first and every nth view out of training, to
+                          measure quality on the same views as 3DGS does
   --seed <n>              Default 1
   --report-every <n>      Default 500
   --save-every <n>        Save the output this often, 0 only at the end (default 5000)
   --no-densify            Keep the initial Gaussians, without adding or removing any
+  --densify <mode>        adc: clone, split and prune as in the paper (default);
+                          mcmc: relocate the transparent and grow by sampling (3DGS-MCMC)
   --full-resolution       Train at full size from the start, rather than coarse to fine
   --full-adam             Update every Gaussian each step, not only those in view:
-                          about 0.5 dB better on held-out views, a fifth slower
+                          about a tenth slower, with no clear gain in quality
   --exposure              Learn each photo's exposure and white balance, for
                           photos or video whose exposure varies
   --gradient-threshold <x>  Lower adds more Gaussians (default 0.0002)
   --vram-budget <GiB>     Default: 90% of the GPU's free memory (75% with --view)
   --max-gaussians <n>     Default: what the budget allows
   --prune <share>         Remove this share of Gaussians, those adding least, at the
-                          end of densification and again halfway to the end
-                          (default 0.7, which leaves a tenth; 0 keeps all)
+                          end of densification and again halfway to the end, for a
+                          smaller file at some cost in quality (default 0: keep all)
+  --threshold-rise <x>    The gradient threshold rises by this factor over
+                          densification, centred on its value (default 1: fixed)
+  --split-threshold <x>   Large Gaussians split on the gradient that pixels pulling
+                          opposite ways do not cancel, above this (default 0.0012; 0: off)
+  --dense-fraction <x>    Larger than this share of the scene: split; smaller: clone
+                          (default 0.001)
+  --opacity-reg <x>       Penalise opacity by this times its mean, so that unneeded
+                          Gaussians fade (3DGS-MCMC uses 0.01; default 0)
+  --scale-reg <x>         Penalise size the same way (3DGS-MCMC uses 0.01; default 0)
+  --position-noise <x>    Move nearly transparent Gaussians at random each step, by this
+                          times the position rate (3DGS-MCMC uses 5e5; default 0)
+  --mip-filter            Mip-Splatting's filters against aliasing: a 0.1 pixel dilation
+                          with the opacity scaled to match, in place of 0.3, and a 3D
+                          filter at each Gaussian's smallest footprint in the photos
+                          (--mip-filter-2d and --mip-filter-3d: one of the two)
+  --edge-split            Split in proportion to the edges a Gaussian covers, into two
+                          children along its longest axis (Improving Densification)
+  --recovery-prune <x>    300 iterations after each opacity reset, remove this share of
+                          Gaussians, the least opaque (Improving Densification; default 0)
+  --sh-dropout <p>        Each iteration, with this probability a Gaussian keeps only its
+                          low SH degrees, so that colour settles there (default 0)
+  --densify-interval <n>  Iterations between densification rounds (default 100)
+  --score-views <n>       Densify only Gaussians reaching many high-error pixels in
+                          this many views per round (default 10; 0: off)
+  --score-min-pixels <x>  How many per view (default 5)
+  --explore <n>           Per round, split n random large Gaussians and place n new
+                          ones at random (default 0)
+  --significance-prune    Of the too transparent, remove the half adding least, and
+                          remove none for their size
+  --adaptive-schedule     Coarse-to-fine sizes from the photos' spectra, with the
+                          Gaussians growing with the image size (DashGaussian),
+                          rather than at 15% and 35% of training
+  --max-growth <x>        Let the Gaussians grow to this multiple of the starting
+                          points (default 4, 0 no cap)
+  --refine-poses          Refine the training cameras along with the Gaussians
+  --second-order          After densification, step by estimated curvature, not Adam
+  --dense-init <n>        Start from up to n more points than the sparse model has,
+                          found by matching patches between the photos (default 50000)
+  --point-extent          Take the scene's extent from the sparse points, not the cameras
+  --no-align              Save in the cameras' frame, rather than with the floor
+                          level at y = 0 (-y up) under the scene's centre
   --view                  Train in the viewer window, watching it as it goes
 
 make-test-views options:
@@ -480,10 +524,11 @@ int cmd_train(const GlobalOptions &opts) {
   for (auto &a : rest) {
     if (a == "-o") a = "--out";
   }
-  const splat::cli::Args args(rest, {"--no-densify", "--full-resolution", "--exposure", "--full-adam", "--view"});
+  const splat::cli::Args args(rest, {"--no-densify", "--full-resolution", "--exposure", "--full-adam", "--significance-prune", "--point-extent", "--adaptive-schedule", "--mip-filter", "--mip-filter-2d", "--mip-filter-3d", "--edge-split", "--refine-poses", "--second-order", "--no-align", "--view"});
   args.allow_only({"out", "iterations", "lambda-ssim", "sh-degree", "max-size", "max-views", "holdout", "seed", "report-every", "save-every",
-                   "no-densify", "gradient-threshold", "vram-budget", "max-gaussians", "prune", "full-resolution", "exposure", "full-adam",
-                   "view"});
+                   "no-densify", "densify", "gradient-threshold", "vram-budget", "max-gaussians", "prune", "full-resolution", "exposure", "full-adam",
+                   "threshold-rise", "split-threshold", "dense-fraction", "densify-interval", "score-views", "score-min-pixels", "explore",
+                   "significance-prune", "point-extent", "adaptive-schedule", "max-growth", "opacity-reg", "scale-reg", "position-noise", "mip-filter", "mip-filter-2d", "mip-filter-3d", "edge-split", "recovery-prune", "sh-dropout", "refine-poses", "second-order", "dense-init", "no-align", "view"});
   if (args.positionals().size() != 1) {
     std::println(stderr, "Usage: splat train <project> [options]  (see splat --help)");
     return 2;
@@ -501,6 +546,12 @@ int cmd_train(const GlobalOptions &opts) {
   options.reportEvery = std::max(args.number("report-every", options.reportEvery), 1);
   options.saveEvery = std::max(args.number("save-every", options.saveEvery), 0);
   options.densify = !args.has("no-densify");
+  if (const std::string mode = args.get("densify", "adc"); mode == "mcmc") {
+    options.densifyMode = splat::TrainOptions::DensifyMode::Mcmc;
+  } else if (mode != "adc") {
+    std::println(stderr, "--densify must be adc or mcmc, not {}", mode);
+    return 2;
+  }
   options.fullResolution = args.has("full-resolution");
   options.exposure = args.has("exposure");
   options.fullAdam = args.has("full-adam");
@@ -508,6 +559,29 @@ int cmd_train(const GlobalOptions &opts) {
   options.vramBudgetGiB = args.number("vram-budget", 0.0);
   options.maxGaussians = args.number<std::size_t>("max-gaussians", 0);
   options.pruneShare = std::clamp(args.number("prune", options.pruneShare), 0.0, 0.95);
+  options.thresholdRise = std::max(args.number("threshold-rise", options.thresholdRise), 1.0);
+  options.splitThreshold = std::max(args.number("split-threshold", options.splitThreshold), 0.f);
+  options.denseFraction = args.number("dense-fraction", options.denseFraction);
+  options.densifyInterval = std::max(args.number("densify-interval", options.densifyInterval), 1);
+  options.scoreViews = std::max(args.number("score-views", options.scoreViews), 0);
+  options.scoreMinPixels = args.number("score-min-pixels", options.scoreMinPixels);
+  options.explore = std::max(args.number("explore", options.explore), 0);
+  options.significancePrune = args.has("significance-prune");
+  options.pointExtent = args.has("point-extent");
+  options.adaptiveSchedule = args.has("adaptive-schedule");
+  options.maxGrowth = std::max(args.number("max-growth", options.maxGrowth), 0.0);
+  options.opacityReg = std::max(args.number("opacity-reg", options.opacityReg), 0.f);
+  options.scaleReg = std::max(args.number("scale-reg", options.scaleReg), 0.f);
+  options.positionNoise = std::max(args.number("position-noise", options.positionNoise), 0.f);
+  options.mipFilter2d = args.has("mip-filter") || args.has("mip-filter-2d");
+  options.mipFilter3d = args.has("mip-filter") || args.has("mip-filter-3d");
+  options.edgeSplit = args.has("edge-split");
+  options.recoveryPrune = std::clamp(args.number("recovery-prune", options.recoveryPrune), 0.0, 0.95);
+  options.shDropout = std::clamp(args.number("sh-dropout", options.shDropout), 0.f, 1.f);
+  options.refinePoses = args.has("refine-poses");
+  options.secondOrder = args.has("second-order");
+  options.densePoints = args.number<std::size_t>("dense-init", options.densePoints);
+  options.alignFloor = !args.has("no-align");
   if (args.has("view")) {
 #ifdef SPLAT_WITH_VIEWER
     splat::ViewerOptions vo;

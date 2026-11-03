@@ -335,7 +335,7 @@ IngestReport run_ingest(const IngestOptions &options) {
     if (is_image_file(file)) {
       sources.push_back({file, false});
     } else if (is_video_file(file)) {
-      if (!video_supported()) throw std::runtime_error("this build of splat cannot read videos (built without FFmpeg)");
+      if (!video_supported()) throw std::runtime_error("cannot read videos: splat was built without FFmpeg and ffmpeg is not on PATH");
       sources.push_back({file, true});
     } else {
       const std::string hint = is_unsupported_photo(file) ? " (convert it to JPEG or PNG first)" : "";

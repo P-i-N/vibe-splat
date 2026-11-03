@@ -1,0 +1,41 @@
+#version 460
+// Backward pass, step 3 when refining poses: how the loss changes with the
+// camera, from how it changes with each Gaussian's position. Moving the camera
+// by (rotation w, translation v) moves a point t in camera space by w x t + v, so
+//   dL/dv = sum dL/dt    dL/dw = sum t x dL/dt
+// over each workgroup's Gaussians. It leaves out how the camera's rotation turns
+// each Gaussian's shape and view direction, which is much the smaller part.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_GOOGLE_include_directive : require
+#include "splat_types.glsl"
+#include "train_types.glsl"
+#include "workgroup_sum.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Positions { float positions[]; };
+layout(std430, binding = 1) readonly buffer GradPositions { float gradPositions[]; };
+layout(std430, binding = 2) readonly buffer Camera { CameraParams cam; };
+layout(std430, binding = 3) writeonly buffer GroupTotals { float groupTotals[]; }; // 6 per workgroup: w, v
+
+void main() {
+  const uint i = gl_GlobalInvocationID.x;
+  vec3 v = vec3(0.0), w = vec3(0.0);
+  if (i < cam.counts.x) {
+    const vec3 g = vec3(gradPositions[i * 3u], gradPositions[i * 3u + 1u], gradPositions[i * 3u + 2u]);
+    if (g != vec3(0.0)) {
+      const vec3 t = (cam.view * vec4(positions[i * 3u], positions[i * 3u + 1u], positions[i * 3u + 2u], 1.0)).xyz;
+      v = mat3(cam.view) * g;
+      w = cross(t, v);
+    }
+  }
+  for (uint k = 0u; k < 3u; ++k) {
+    const float totalW = workgroup_sum(w[k]);
+    const float totalV = workgroup_sum(v[k]);
+    if (gl_LocalInvocationIndex == 0u) {
+      groupTotals[gl_WorkGroupID.x * 6u + k] = totalW;
+      groupTotals[gl_WorkGroupID.x * 6u + 3u + k] = totalV;
+    }
+  }
+}

@@ -27,7 +27,7 @@ void main() {
     g = adjoint[i].rgb;
     rgb1 = vec4(image[i].rgb, 1.0);
     const vec3 back = g.r * pc.transform[0].rgb + g.g * pc.transform[1].rgb + g.b * pc.transform[2].rgb;
-    adjoint[i] = vec4(back, 0.0);
+    adjoint[i].rgb = back;
   }
   for (uint row = 0u; row < 3u; ++row) {
     for (uint column = 0u; column < 4u; ++column) {

@@ -8,7 +8,7 @@
 namespace splat {
 
 struct VideoOptions {
-  double fps = 2.0;  // Frames to keep per second of video; 0 keeps every frame
+  double fps = 4.0;  // Frames to keep per second of video; 0 keeps every frame
   int maxFrames = 0; // 0 means no limit. Lowers the rate to cover the whole video.
 };
 

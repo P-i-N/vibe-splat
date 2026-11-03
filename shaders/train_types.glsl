@@ -9,7 +9,16 @@ const uint INVISIBLE = 0xFFFFFFFFu;
 // A pixel takes no more splats once its transmittance would fall below
 // 1e-4, as in the 3DGS paper. Compared as logarithms: this is log(1e-4).
 const float LOG_MIN_TRANSMITTANCE = -9.210340372;
-const uint RAW_PER_SPLAT = 10u; // Sums per splat from the backward pass, listed in train_backward.glsl
+// Below these a Gaussian is degenerate and is not drawn, as in Faster-GS.
+const float MIN_QUATERNION_LENGTH = 1e-4;
+const float MIN_CONIC_DETERMINANT = 1e-6;
+const uint RAW_PER_SPLAT = 14u; // Sums per splat from the backward pass, listed in train_backward.glsl
+
+// What densification decides on, per Gaussian.
+struct DensifyStat {
+  vec4 main; // x: gradient sum, y: visits, z: largest radius, w: contribution
+  vec4 more; // x: sum of the gradient without cancelling, y: marked pixels, z: those by loss, w: edge score
+};
 
 struct TrainSplat {
   vec4 centerRadius; // xy pixel centre, z radius in pixels, w view depth
@@ -131,6 +140,23 @@ void sh_basis_gradient(vec3 dir, uint degree, out vec3 g[16]) {
     g[14] = H * vec3(2.0 * x * z, -2.0 * y * z, xx - yy);
     g[15] = C * vec3(3.0 * xx - 3.0 * yy, -6.0 * x * y, 0.0);
   }
+}
+
+// PCG's output permutation over a 32-bit state, as a hash to a uniform in [0, 1).
+float train_uniform(uint index, uint seed) {
+  const uint state = (index ^ (seed * 0x9E3779B9u)) * 747796405u + 2891336453u;
+  const uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+  return float((word >> 22u) ^ word) / 4294967296.0;
+}
+
+// SH dropout (Dropping Anchor and Spherical Harmonics, CVPR 2026): with the
+// given probability a Gaussian keeps only the coefficients up to `retained`
+// this iteration, so that its colour settles in the low degrees.
+uint train_sh_coefficients(uint index, uint coefficients, float dropout, uint retained, uint seed) {
+  if (dropout > 0.0 && train_uniform(index, seed) < dropout) {
+    return min(coefficients, (retained + 1u) * (retained + 1u));
+  }
+  return coefficients;
 }
 
 mat3 train_quat_to_mat(vec4 q) {

@@ -21,7 +21,19 @@ layout(std430, binding = 9) writeonly buffer GradRotations { float gradRotations
 layout(std430, binding = 10) writeonly buffer GradOpacities { float gradOpacities[]; };
 layout(std430, binding = 11) writeonly buffer GradSH { float gradSh[]; };
 layout(std430, binding = 12) readonly buffer Splats { TrainSplat splats[]; };
-layout(std430, binding = 13) buffer DensifyStats { vec4 densifyStats[]; }; // x: gradient sum, y: visits, z: largest radius, w: contribution
+layout(std430, binding = 13) buffer DensifyStats { DensifyStat densifyStats[]; };
+layout(std430, binding = 14) readonly buffer Filter3d { float filter3d[]; }; // As in train_preprocess.comp
+
+// 3DGS-MCMC's penalties, reg * mean(sigmoid(opacity)) and reg * mean(exp(scale))
+// over the Gaussians, already divided by their count.
+layout(push_constant) uniform Push {
+  float opacityReg;
+  float scaleReg;
+  uint mipFilter; // As in train_preprocess.comp
+  float shDropout;
+  uint shRetained;
+  uint shSeed;
+} pc;
 
 // tr(G A X J^T) for 2x2 symmetric G, with A and J 2x3 and X 3x3.
 float trace_term(mat2 G, mat3x2 A, mat3 X, mat3x2 J) {
@@ -41,6 +53,14 @@ void main() {
     touched = touched || raw[i * RAW_PER_SPLAT + k] != 0.0;
   }
   if (!touched) {
+    // Nothing from the pixels, but the penalties still apply.
+    if (pc.opacityReg > 0.0 || pc.scaleReg > 0.0) {
+      const float o = 1.0 / (1.0 + exp(-opacities[i]));
+      gradOpacities[i] = pc.opacityReg * o * (1.0 - o);
+      for (uint a = 0u; a < 3u; ++a) {
+        gradScales[i * 3u + a] = pc.scaleReg * exp(scales[i * 3u + a]);
+      }
+    }
     return;
   }
 
@@ -60,24 +80,47 @@ void main() {
 
   // What densification decides on. Only this invocation touches this element.
   // Per half the image rather than per pixel, so that one threshold suits any resolution.
-  densifyStats[i].x += length(gCentre * 0.5 * cam.viewport.xy);
-  densifyStats[i].y += 1.0;
-  densifyStats[i].z = max(densifyStats[i].z, splats[i].centerRadius.z);
-  densifyStats[i].w += raw[at + 9u] * 3.0 * cam.viewport.x * cam.viewport.y; // In pixels
-  const mat2 G = mat2(raw[at + 3u], raw[at + 4u], raw[at + 4u], raw[at + 5u]);
+  densifyStats[i].main.x += length(gCentre * 0.5 * cam.viewport.xy);
+  densifyStats[i].main.y += 1.0;
+  densifyStats[i].main.z = max(densifyStats[i].main.z, splats[i].centerRadius.z);
+  densifyStats[i].main.w += raw[at + 9u] * 3.0 * cam.viewport.x * cam.viewport.y; // In pixels
+  densifyStats[i].more.x += length(vec2(raw[at + 10u], raw[at + 11u]) * 0.5 * cam.viewport.xy);
+  mat2 G = mat2(raw[at + 3u], raw[at + 4u], raw[at + 4u], raw[at + 5u]);
+  const float opacity = 1.0 / (1.0 + exp(-opacities[i]));
+  float k2 = 1.0; // The 2D Mip filter's opacity factor
 
   const mat3 Rv = mat3(cam.view);
   const mat3 R = train_quat_to_mat(quat);
   const vec3 s2 = exp(2.0 * logScale);
   const mat3 D = mat3(s2.x, 0.0, 0.0, 0.0, s2.y, 0.0, 0.0, 0.0, s2.z);
-  const mat3 sigma = R * D * transpose(R);
+  const float smooth3d = filter3d[i];
+  const mat3 sigma = R * D * transpose(R) + mat3(smooth3d);
   const mat3 X = Rv * sigma * transpose(Rv);
+  // The 3D filter's opacity factor, k3 = prod sqrt(s2 / (s2 + f)), and what the 2D stage saw.
+  const float k3 = sqrt(s2.x / (s2.x + smooth3d) * s2.y / (s2.y + smooth3d) * s2.z / (s2.z + smooth3d));
+  const float opacity3 = opacity * k3;
 
   const float limX = 1.3 * cam.viewport.z, limY = 1.3 * cam.viewport.w;
   const float rx = t.x * iz, ry = t.y * iz;
   const bool clampedX = abs(rx) > limX, clampedY = abs(ry) > limY;
   const float tx = clamp(rx, -limX, limX) * z, ty = clamp(ry, -limY, limY) * z;
   const mat3x2 J = mat3x2(vec2(fx * iz, 0.0), vec2(0.0, fy * iz), vec2(-fx * tx * iz2, -fy * ty * iz2));
+
+  if (pc.mipFilter != 0u) {
+    // The filter scales the opacity by k = sqrt(det C / det(C + 0.1 I)) with C
+    // the 2D covariance before dilation: that also moves the covariance gradient.
+    const mat2 C = J * X * transpose(J);
+    const mat2 F = C + mat2(0.1);
+    const float detC = determinant(C), detF = determinant(F);
+    if (detC > 0.0 && detF > 0.0) {
+      const float k = sqrt(detC / detF);
+      const mat2 cofC = mat2(C[1][1], -C[0][1], -C[1][0], C[0][0]), cofF = mat2(F[1][1], -F[0][1], -F[1][0], F[0][0]);
+      G += raw[at] * opacity3 * 0.5 * k * (cofC / detC - cofF / detF);
+      k2 = k;
+    } else {
+      k2 = 0.0;
+    }
+  }
 
   // Position moves the centre, and also how the covariance projects.
   const mat3x2 Jc = mat3x2(vec2(fx * iz, 0.0), vec2(0.0, fy * iz), vec2(-fx * t.x * iz2, -fy * t.y * iz2));
@@ -95,7 +138,8 @@ void main() {
   const mat3 G3 = transpose(T) * G * T;
   for (int a = 0; a < 3; ++a) {
     const vec3 axis = R[a];
-    gradScales[i * 3u + uint(a)] = 2.0 * s2[a] * dot(axis, G3 * axis);
+    // Plus the filter's opacity factor moving with the scale, and the penalty.
+    gradScales[i * 3u + uint(a)] = 2.0 * s2[a] * dot(axis, G3 * axis) + raw[at] * k2 * opacity * k3 * smooth3d / (s2[a] + smooth3d) + pc.scaleReg * exp(logScale[a]);
   }
 
   // Rotation: dL = tr(P^T dR). The matrices are dR/dw, dR/dx, dR/dy, dR/dz of
@@ -117,13 +161,12 @@ void main() {
   gradRotations[i * 4u + 2u] = tangent.z;
   gradRotations[i * 4u + 3u] = tangent.w;
 
-  const float opacity = 1.0 / (1.0 + exp(-opacities[i]));
-  gradOpacities[i] = raw[at] * opacity * (1.0 - opacity);
+  gradOpacities[i] = (raw[at] * k2 * k3 + pc.opacityReg) * opacity * (1.0 - opacity);
 
   const vec3 gColour = vec3(raw[at + 6u], raw[at + 7u], raw[at + 8u]);
   float basis[16];
   sh_basis(normalize(p - cam.position.xyz), cam.counts.y, basis);
-  const uint coefficients = cam.counts.w;
+  const uint coefficients = train_sh_coefficients(i, cam.counts.w, pc.shDropout, pc.shRetained, pc.shSeed);
   const uint base = i * cam.counts.z;
   vec3 colour = vec3(0.5);
   for (uint k = 0u; k < coefficients; ++k) {

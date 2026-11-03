@@ -11,6 +11,7 @@ add_library(splat_core STATIC
   splat/gaussian_cloud.cpp
   splat/lzma.cpp
   splat/cgc.cpp
+  splat/align.cpp
   render/camera.cpp
   render/splat_renderer.cpp
   render/offscreen.cpp
@@ -28,6 +29,10 @@ add_library(splat_core STATIC
   sfm/test_views.cpp
   train/reference.cpp
   train/densify.cpp
+  train/mip.cpp
+  train/dense_points.cpp
+  train/evaluate.cpp
+  train/schedule.cpp
   train/trainer.cpp
   train/train.cpp
 )

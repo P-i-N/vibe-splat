@@ -17,8 +17,10 @@ layout(std430, binding = 1) readonly buffer Target { uint target[]; };
 layout(std430, binding = 2) readonly buffer Fields { vec4 fields[]; }; // Plane j at j * pixels
 layout(std430, binding = 3) writeonly buffer Adjoint { vec4 adjoint[]; };
 layout(std430, binding = 4) buffer GroupTotals { vec2 groupTotals[]; }; // x: SSIM, y: L1
+layout(std430, binding = 5) buffer ErrorMax { uint errorMax; }; // The worst pixel, over 65535, when scoring
+layout(std430, binding = 6) writeonly buffer Edge { float edge[]; }; // When scoring: how much of an edge the target has at each pixel
 
-layout(push_constant) uniform Push { uint width; uint height; uint gridW; float lambda; } pc;
+layout(push_constant) uniform Push { uint width; uint height; uint gridW; float lambda; uint scoring; } pc;
 
 const float WEIGHTS[11] = float[](0.00102838, 0.00759876, 0.03600077, 0.10936069, 0.21300554, 0.26601172,
                                   0.21300554, 0.10936069, 0.03600077, 0.00759876, 0.00102838);
@@ -27,6 +29,23 @@ const int ROWS = 16 + 2 * HALO;
 
 // Horizontal window sums of the three fields for the tile's columns and ROWS rows.
 shared float h[3][3][ROWS * 16];
+
+// The target's luminance at a pixel, clamped to the image.
+float target_luminance(int x, int y) {
+  x = clamp(x, 0, int(pc.width) - 1);
+  y = clamp(y, 0, int(pc.height) - 1);
+  return dot(unpackUnorm4x8(target[uint(y) * pc.width + uint(x)]).rgb, vec3(0.299, 0.587, 0.114));
+}
+
+// A Laplacian of the target's luminance, in [0, 1): the edge weight of the
+// edge-aware score (Improving Densification in 3DGS, CVPR 2026).
+float target_edge(int x, int y) {
+  // As differences, so that a flat patch gives exactly zero in float.
+  const float centre = target_luminance(x, y);
+  const float laplacian = (target_luminance(x - 1, y) - centre) + (target_luminance(x + 1, y) - centre) +
+                          (target_luminance(x, y - 1) - centre) + (target_luminance(x, y + 1) - centre);
+  return clamp(abs(laplacian) / 4.0, 0.0, 0.999);
+}
 
 void main() {
   const uint tile = gl_WorkGroupID.x;
@@ -77,7 +96,13 @@ void main() {
       }
     }
     const vec3 result = (1.0 - pc.lambda) * sign(difference) - pc.lambda * (p + 2.0 * x * q + y * r);
-    adjoint[pixel] = vec4(result * perValue, 0.0);
+    // When scoring, alpha holds the pixel's mean error, for train_error_mask.comp.
+    const float error = own / 3.0;
+    adjoint[pixel] = vec4(result * perValue, pc.scoring != 0u ? error : 0.0);
+    if (pc.scoring != 0u) {
+      atomicMax(errorMax, uint(clamp(error, 0.0, 1.0) * 65535.0));
+      edge[pixel] = target_edge(px, py);
+    }
   }
   const float total = workgroup_sum(own);
   if (gl_LocalInvocationIndex == 0u) {

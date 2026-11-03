@@ -8,6 +8,7 @@
 #extension GL_KHR_shader_subgroup_shuffle : require
 
 layout(std430, binding = 6) buffer Gradients { float gradients[]; };
+layout(std430, binding = 7) readonly buffer Edge { float edge[]; }; // From train_loss.comp, when scoring
 
 void add_gradient(uint at, float value) { atomicAdd(gradients[at], value); }
 
