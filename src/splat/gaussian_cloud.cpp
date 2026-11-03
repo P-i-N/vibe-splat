@@ -11,6 +11,7 @@
 #include <cstring>
 #include <format>
 #include <fstream>
+#include <limits>
 #include <numbers>
 #include <optional>
 #include <random>

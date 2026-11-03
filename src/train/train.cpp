@@ -1,5 +1,6 @@
 #include "train/train.hpp"
 
+#include "core/parallel.hpp"
 #include "core/progress.hpp"
 #include "ingest/image.hpp"
 #include "render/camera.hpp"
@@ -8,19 +9,22 @@
 #include "splat/cgc.hpp"
 #include "splat/gaussian_cloud.hpp"
 #include "train/dense_points.hpp"
-#include "train/mip.hpp"
 #include "train/densify.hpp"
 #include "train/evaluate.hpp"
+#include "train/mip.hpp"
 #include "train/schedule.hpp"
 #include "train/trainer.hpp"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <exception>
 #include <format>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <print>
 #include <random>
@@ -46,24 +50,16 @@ constexpr float kScoreErrorShare = 0.1f;
 constexpr int kOpacityResetInterval = 3000;
 // A cloud just after an opacity reset renders almost black, so checkpoints wait this long.
 constexpr int kCheckpointRecovery = 1000;
+// Recovery-aware pruning looks this long after a reset.
+constexpr int kRecoveryDelay = 300;
 constexpr std::uint64_t kBudgetReserve = 256ull * 1024 * 1024; // Sort scratch, staging, the driver's share
 constexpr float kShC0 = 0.28209479177387814f;
 constexpr float kExposureRate = 5e-3f; // Adam's step for the per-view exposure transforms
-// Coarse to fine: training starts at a quarter of the image size and is at
-// half size until kCoarseUntil[0] of the way through, full size after.
-constexpr std::size_t kCoarseLevels = 2;
-constexpr std::array<double, kCoarseLevels> kCoarseUntil{0.35, 0.15};
 // Second order, as in 3DGS^2-TR: the trust region shrinks over the rest of training.
 constexpr float kTrustStart = 1e-6f, kTrustEnd = 1e-8f;
 constexpr int kCurvatureInterval = 10;
 constexpr double kPoseStart = 0.1; // Of training: until then the Gaussians are too rough to say much about the cameras
 constexpr int kSpectrumViews = 8; // Photos looked at to choose the image sizes
-
-struct View {
-  Camera camera;
-  std::vector<std::uint8_t> rgba;
-  std::string name;
-};
 
 glm::dvec2 focal_of(const ColmapCamera &c) {
   // PINHOLE, OPENCV and FULL_OPENCV list fx and fy; the others share one f.
@@ -119,7 +115,7 @@ std::vector<std::uint8_t> read_file(const fs::path &path) {
   return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 }
 
-View load_view(const fs::path &project, const ColmapImage &image, const ColmapCamera &camera, int maxSize) {
+TrainView load_view(const fs::path &project, const ColmapImage &image, const ColmapCamera &camera, int maxSize) {
   const fs::path file = project / image.name;
   RgbImage rgb = decode_image(read_file(file));
   if (static_cast<std::uint64_t>(rgb.width) != camera.width || static_cast<std::uint64_t>(rgb.height) != camera.height) {
@@ -130,28 +126,11 @@ View load_view(const fs::path &project, const ColmapImage &image, const ColmapCa
   rgb = downscale_to_fit(std::move(rgb), maxSize);
   const double scale = static_cast<double>(std::max(rgb.width, rgb.height)) / original;
 
-  View view;
+  TrainView view;
   view.name = image.name;
-  const glm::dvec2 f = focal_of(camera) * scale, c = principal_of(camera) * scale;
-  view.camera.fx = static_cast<float>(f.x);
-  view.camera.fy = static_cast<float>(f.y);
-  view.camera.cx = static_cast<float>(c.x);
-  view.camera.cy = static_cast<float>(c.y);
+  view.camera = posed_camera(image, camera, scale);
   view.camera.width = rgb.width;
   view.camera.height = rgb.height;
-
-  // World to camera, from the quaternion (w, x, y, z).
-  const double w = image.rotation[0], x = image.rotation[1], y = image.rotation[2], z = image.rotation[3];
-  const double n = std::sqrt(w * w + x * x + y * y + z * z);
-  const double qw = w / n, qx = x / n, qy = y / n, qz = z / n;
-  const glm::dmat3 R(1.0 - 2.0 * (qy * qy + qz * qz), 2.0 * (qx * qy + qw * qz), 2.0 * (qx * qz - qw * qy),
-                     2.0 * (qx * qy - qw * qz), 1.0 - 2.0 * (qx * qx + qz * qz), 2.0 * (qy * qz + qw * qx),
-                     2.0 * (qx * qz + qw * qy), 2.0 * (qy * qz - qw * qx), 1.0 - 2.0 * (qx * qx + qy * qy));
-  glm::dmat4 viewMatrix(R);
-  viewMatrix[3] = glm::dvec4(image.translation, 1.0);
-  view.camera.view = glm::mat4(viewMatrix);
-  view.camera.position = glm::vec3(image.center());
-
   view.rgba.resize(static_cast<std::size_t>(rgb.width) * rgb.height * 4);
   for (std::size_t i = 0; i < static_cast<std::size_t>(rgb.width) * rgb.height; ++i) {
     std::copy_n(rgb.pixels.data() + i * 3, 3, view.rgba.data() + i * 4);
@@ -230,7 +209,7 @@ GaussianCloud initial_cloud(const std::vector<ColmapPoint> &points, int shDegree
   return cloud;
 }
 
-void write_preview(const std::vector<float> &render, const View &view, const fs::path &path) {
+void write_preview(const std::vector<float> &render, const TrainView &view, const fs::path &path) {
   // Rendered on the left, the real image on the right.
   RgbImage out;
   out.width = view.camera.width * 2;
@@ -249,50 +228,10 @@ void write_preview(const std::vector<float> &render, const View &view, const fs:
   write_image(out, path, 95);
 }
 
-// How a training view's camera exposed its photo, learned with its own Adam:
-// a view comes round only once per pass over all of them, too seldom to share
-// the Gaussians' optimiser.
-struct ViewExposure {
-  Exposure value = kNeutralExposure;
-  std::array<float, 12> first{}, second{};
-  int steps = 0;
-
-  void step(const std::array<float, 12> &gradient) {
-    ++steps;
-    const float correction1 = 1.f - std::pow(0.9f, static_cast<float>(steps));
-    const float correction2 = 1.f - std::pow(0.999f, static_cast<float>(steps));
-    for (std::size_t k = 0; k < 12; ++k) {
-      first[k] = 0.9f * first[k] + 0.1f * gradient[k];
-      second[k] = 0.999f * second[k] + 0.001f * gradient[k] * gradient[k];
-      value[k] -= kExposureRate * (first[k] / correction1) / (std::sqrt(second[k] / correction2) + 1e-15f);
-    }
-  }
-};
-
-// The same for a training view's camera. Its rotation and its translation
-// have their own steps, as they are in different units.
-struct ViewPose {
-  std::array<float, 6> first{}, second{};
-  int steps = 0;
-
-  std::array<float, 6> step(const std::array<float, 6> &gradient, float rotationRate, float translationRate) {
-    ++steps;
-    const float correction1 = 1.f - std::pow(0.9f, static_cast<float>(steps));
-    const float correction2 = 1.f - std::pow(0.999f, static_cast<float>(steps));
-    std::array<float, 6> move{};
-    for (std::size_t k = 0; k < 6; ++k) {
-      first[k] = 0.9f * first[k] + 0.1f * gradient[k];
-      second[k] = 0.999f * second[k] + 0.001f * gradient[k] * gradient[k];
-      move[k] = -(k < 3 ? rotationRate : translationRate) * (first[k] / correction1) / (std::sqrt(second[k] / correction2) + 1e-15f);
-    }
-    return move;
-  }
-};
-
 // Half the size, each pixel the mean of four. Pixel x of the result covers
 // pixels 2x and 2x + 1, so the focal length and principal point just halve.
-View half_size(const View &view) {
-  View out;
+TrainView half_size(const TrainView &view) {
+  TrainView out;
   out.name = view.name;
   out.camera = view.camera;
   out.camera.width = view.camera.width / 2;
@@ -317,60 +256,139 @@ View half_size(const View &view) {
 
 } // namespace
 
-TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
-  const ColmapModel model = load_colmap_model(options.project / "sparse" / "0");
+// How a training view's camera exposed its photo, learned with its own Adam:
+// a view comes round only once per pass over all of them, too seldom to share
+// the Gaussians' optimiser.
+struct TrainSession::ViewExposure {
+  Exposure value = kNeutralExposure;
+  std::array<float, 12> first{}, second{};
+  int steps = 0;
+
+  void step(const std::array<float, 12> &gradient) {
+    ++steps;
+    const float correction1 = 1.f - std::pow(0.9f, static_cast<float>(steps));
+    const float correction2 = 1.f - std::pow(0.999f, static_cast<float>(steps));
+    for (std::size_t k = 0; k < 12; ++k) {
+      first[k] = 0.9f * first[k] + 0.1f * gradient[k];
+      second[k] = 0.999f * second[k] + 0.001f * gradient[k] * gradient[k];
+      value[k] -= kExposureRate * (first[k] / correction1) / (std::sqrt(second[k] / correction2) + 1e-15f);
+    }
+  }
+};
+
+// The same for a training view's camera. Its rotation and its translation
+// have their own steps, as they are in different units.
+struct TrainSession::ViewPose {
+  std::array<float, 6> first{}, second{};
+  int steps = 0;
+
+  std::array<float, 6> step(const std::array<float, 6> &gradient, float rotationRate, float translationRate) {
+    ++steps;
+    const float correction1 = 1.f - std::pow(0.9f, static_cast<float>(steps));
+    const float correction2 = 1.f - std::pow(0.999f, static_cast<float>(steps));
+    std::array<float, 6> move{};
+    for (std::size_t k = 0; k < 6; ++k) {
+      first[k] = 0.9f * first[k] + 0.1f * gradient[k];
+      second[k] = 0.999f * second[k] + 0.001f * gradient[k] * gradient[k];
+      move[k] = -(k < 3 ? rotationRate : translationRate) * (first[k] / correction1) / (std::sqrt(second[k] / correction2) + 1e-15f);
+    }
+    return move;
+  }
+};
+
+Camera posed_camera(const ColmapImage &image, const ColmapCamera &camera, double scale) {
+  Camera out;
+  const glm::dvec2 f = focal_of(camera) * scale, c = principal_of(camera) * scale;
+  out.fx = static_cast<float>(f.x);
+  out.fy = static_cast<float>(f.y);
+  out.cx = static_cast<float>(c.x);
+  out.cy = static_cast<float>(c.y);
+  out.width = static_cast<int>(std::lround(static_cast<double>(camera.width) * scale));
+  out.height = static_cast<int>(std::lround(static_cast<double>(camera.height) * scale));
+
+  // World to camera, from the quaternion (w, x, y, z).
+  const double w = image.rotation[0], x = image.rotation[1], y = image.rotation[2], z = image.rotation[3];
+  const double n = std::sqrt(w * w + x * x + y * y + z * z);
+  const double qw = w / n, qx = x / n, qy = y / n, qz = z / n;
+  const glm::dmat3 R(1.0 - 2.0 * (qy * qy + qz * qz), 2.0 * (qx * qy + qw * qz), 2.0 * (qx * qz - qw * qy),
+                     2.0 * (qx * qy - qw * qz), 1.0 - 2.0 * (qx * qx + qz * qz), 2.0 * (qy * qz + qw * qx),
+                     2.0 * (qx * qz + qw * qy), 2.0 * (qy * qz - qw * qx), 1.0 - 2.0 * (qx * qx + qy * qy));
+  glm::dmat4 viewMatrix(R);
+  viewMatrix[3] = glm::dvec4(image.translation, 1.0);
+  out.view = glm::mat4(viewMatrix);
+  out.position = glm::vec3(image.center());
+  return out;
+}
+
+TrainData load_train_data(const TrainOptions &options, const std::function<void(std::size_t, std::size_t)> &progress) {
+  TrainData data;
+  data.model = load_colmap_model(options.project / "sparse" / "0");
+  const ColmapModel &model = data.model;
   if (model.points.empty() || model.images.empty()) throw std::runtime_error("the sparse model has no points or no images");
 
-  std::vector<View> trainViews, holdoutViews;
-  int number = 0;
+  std::vector<const ColmapImage *> chosen;
   for (const auto &[id, image] : model.images) {
-    if (options.maxViews > 0 && number >= options.maxViews) break;
-    View view = load_view(options.project, image, model.cameras.at(image.cameraId), options.maxSize);
-    // The first view and every nth after it, as 3DGS and gsplat split, so that
-    // held-out PSNRs compare with published ones. On the Mip-NeRF 360 bicycle
-    // scene the photos alternate between tilted down and tilted up, and holding
-    // out the nth instead of the first tested only the upward ones: 4 dB less.
-    if (options.holdout > 0 && number % options.holdout == 0) {
-      holdoutViews.push_back(std::move(view));
-    } else {
-      trainViews.push_back(std::move(view));
-    }
-    ++number;
+    if (options.maxViews > 0 && chosen.size() >= static_cast<std::size_t>(options.maxViews)) break;
+    chosen.push_back(&image);
   }
-  if (trainViews.empty()) throw std::runtime_error("no training views");
+
+  // Decoding and undistorting is most of the time: one image per thread.
+  std::vector<TrainView> views(chosen.size());
+  std::atomic<std::size_t> done{0};
+  std::mutex mutex; // Guards `error` and the progress callback
+  std::exception_ptr error;
+  parallel_for(chosen.size(), 0, [&](std::size_t i) {
+    {
+      const std::lock_guard lock(mutex);
+      if (error) return;
+    }
+    try {
+      views[i] = load_view(options.project, *chosen[i], model.cameras.at(chosen[i]->cameraId), options.maxSize);
+    } catch (...) {
+      const std::lock_guard lock(mutex);
+      if (!error) error = std::current_exception();
+      return;
+    }
+    const std::size_t finished = ++done;
+    const std::lock_guard lock(mutex);
+    if (progress) progress(finished, chosen.size());
+  });
+  if (error) std::rethrow_exception(error);
+
+  // The first view and every nth after it, as 3DGS and gsplat split, so that
+  // held-out PSNRs compare with published ones. On the Mip-NeRF 360 bicycle
+  // scene the photos alternate between tilted down and tilted up, and holding
+  // out the nth instead of the first tested only the upward ones: 4 dB less.
+  for (std::size_t i = 0; i < views.size(); ++i) {
+    if (options.holdout > 0 && i % static_cast<std::size_t>(options.holdout) == 0) {
+      data.holdoutViews.push_back(std::move(views[i]));
+    } else {
+      data.trainViews.push_back(std::move(views[i]));
+    }
+  }
+  if (data.trainViews.empty()) throw std::runtime_error("no training views");
 
   // Coarse to fine, as in DashGaussian: the first iterations only need the
   // broad shapes, which smaller images show as well for far fewer pixels.
-  // smaller[l][i] is view i at 1 / 2^(l + 1) of its size.
-  std::array<std::vector<View>, kCoarseLevels> smaller;
+  // smallerViews[l][i] is view i at 1 / 2^(l + 1) of its size.
   if (!options.fullResolution) {
+    data.smallerViews.resize(kCoarseLevels);
     for (std::size_t level = 0; level < kCoarseLevels; ++level) {
-      for (const View &view : level == 0 ? trainViews : smaller[level - 1]) smaller[level].push_back(half_size(view));
+      for (const TrainView &view : level == 0 ? data.trainViews : data.smallerViews[level - 1]) {
+        data.smallerViews[level].push_back(half_size(view));
+      }
+    }
+    if (options.adaptiveSchedule) {
+      std::array<double, 3> energy{};
+      const std::size_t step = std::max<std::size_t>(data.trainViews.size() / kSpectrumViews, 1);
+      for (std::size_t i = 0; i < data.trainViews.size(); i += step) {
+        const TrainView &view = data.trainViews[i];
+        const std::vector<double> x = frequency_energy(view.rgba, view.camera.width, view.camera.height, {1, 2, 4});
+        for (std::size_t k = 0; k < energy.size(); ++k) energy[k] += x[k];
+      }
+      data.coarseUntil = resolution_switches(energy[0], energy[1], energy[2]);
     }
   }
-  std::array<double, kCoarseLevels> coarseUntil = kCoarseUntil;
-  if (options.adaptiveSchedule && !options.fullResolution) {
-    std::array<double, 3> energy{};
-    const std::size_t step = std::max<std::size_t>(trainViews.size() / kSpectrumViews, 1);
-    for (std::size_t i = 0; i < trainViews.size(); i += step) {
-      const std::vector<double> x = frequency_energy(trainViews[i].rgba, trainViews[i].camera.width, trainViews[i].camera.height, {1, 2, 4});
-      for (std::size_t k = 0; k < energy.size(); ++k) energy[k] += x[k];
-    }
-    coarseUntil = resolution_switches(energy[0], energy[1], energy[2]);
-    std::println("Image sizes: quarter until {:.0f}% of training, half until {:.0f}%, then full", 100.0 * coarseUntil[1], 100.0 * coarseUntil[0]);
-  }
-  const auto coarse_level = [&](int iteration) -> std::size_t { // kCoarseLevels at full size
-    if (options.fullResolution) return kCoarseLevels;
-    const double progress = static_cast<double>(iteration - 1) / std::max(options.iterations - 1, 1);
-    for (std::size_t level = kCoarseLevels; level-- > 0;) {
-      if (progress < coarseUntil[level]) return level;
-    }
-    return kCoarseLevels;
-  };
-  const auto view_at = [&](std::size_t index, int iteration) -> const View & {
-    const std::size_t level = coarse_level(iteration);
-    return level == kCoarseLevels ? trainViews[index] : smaller[level][index];
-  };
 
   // The scene's size sets the position learning rate and the near plane.
   glm::dvec3 middle(0.0);
@@ -383,373 +401,413 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
   for (const ColmapPoint &p : model.points) depths.push_back(glm::length(p.position - middle));
   // Cameras close together say little about the size of what they look at.
   if (options.pointExtent) extent = std::max(std::accumulate(depths.begin(), depths.end(), 0.0) / static_cast<double>(depths.size()), 1e-6);
+  data.extent = extent;
   std::nth_element(depths.begin(), depths.begin() + static_cast<std::ptrdiff_t>(depths.size() / 2), depths.end());
-  const double typicalDepth = std::max(depths[depths.size() / 2] + extent, 1e-6);
+  data.typicalDepth = std::max(depths[depths.size() / 2] + extent, 1e-6);
 
-  TrainerOptions trainerOptions;
-  trainerOptions.lambdaSsim = options.lambdaSsim;
-  trainerOptions.selectiveAdam = !options.fullAdam;
-  trainerOptions.poseGradients = options.refinePoses;
-  trainerOptions.opacityReg = options.opacityReg;
-  trainerOptions.scaleReg = options.scaleReg;
-  trainerOptions.positionNoise = options.positionNoise;
-  trainerOptions.mipFilter2d = options.mipFilter2d;
-  trainerOptions.nearPlane = static_cast<float>(typicalDepth * 0.01);
-  // Asked for before anything is allocated, so that it is all ours to spend.
-  double budgetGiB = options.vramBudgetGiB;
-  if (budgetGiB <= 0.0) budgetGiB = 0.9 * static_cast<double>(ctx.free_device_memory()) / (1024.0 * 1024.0 * 1024.0);
-  const auto budgetBytes = static_cast<std::uint64_t>(budgetGiB * 1024.0 * 1024.0 * 1024.0);
-  const std::uint64_t reserve = std::max(kBudgetReserve, budgetBytes / 20);
-  trainerOptions.memoryBudget = budgetBytes > reserve ? budgetBytes - reserve : 0;
-  std::uint64_t largestView = 0;
-  for (const View &view : trainViews) {
-    largestView = std::max(largestView, static_cast<std::uint64_t>(view.camera.width) * view.camera.height);
-  }
-  if (largestView * Trainer::kBytesPerPixel >= trainerOptions.memoryBudget) {
-    throw std::runtime_error(std::format("{:.2f} GiB of VRAM is not enough for images of this size; try --max-size",
-                                         budgetGiB));
-  }
-  std::vector<ColmapPoint> startingPoints = model.points;
+  // Besides the sparse points, more from matching patches between the photos.
+  data.startingPoints = model.points;
   if (options.densePoints > 0) {
     const auto started = std::chrono::steady_clock::now();
     std::vector<DensePointsView> densePointsViews;
-    for (const View &view : trainViews) densePointsViews.push_back({view.camera, view.rgba});
+    for (const TrainView &view : data.trainViews) densePointsViews.push_back({view.camera, view.rgba});
     const std::vector<ColmapPoint> dense = dense_points(densePointsViews, model.points, options.densePoints);
-    startingPoints.insert(startingPoints.end(), dense.begin(), dense.end());
+    data.startingPoints.insert(data.startingPoints.end(), dense.begin(), dense.end());
     std::println("Patch matching found {} more starting points in {:.1f} s", dense.size(),
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
   }
-  Trainer trainer(ctx, initial_cloud(startingPoints, options.shDegree), trainerOptions);
+  return data;
+}
 
-  // Drawn from the first iteration on. Output in the meantime goes through it.
-  Progress bar("Train", static_cast<std::size_t>(options.iterations));
-
-  // A view that does not fit gives up its largest Gaussians, rather than the
-  // run ending. They grow back where they are needed, within the budget.
-  // Mip-Splatting's 3D smoothing filter, from the training cameras of the
-  // current image size; recomputed after every change of the cloud or the size.
-  std::vector<float> filter3d;
-  constexpr std::size_t kFilterStale = ~std::size_t{0}; // Also after any change of the count outside a round
-  std::size_t filterLevel = kFilterStale;
-  int currentIteration = 1;
-  const auto refresh_filter = [&](int iteration) {
-    if (!options.mipFilter3d) return;
-    std::vector<Camera> cameras;
-    cameras.reserve(trainViews.size());
-    for (std::size_t i = 0; i < trainViews.size(); ++i) cameras.push_back(view_at(i, iteration).camera);
-    filter3d = smoothing_filter(trainer.cloud(), cameras);
-    trainer.set_filter3d(filter3d);
-    filterLevel = coarse_level(iteration);
-  };
-  const auto fitting = [&](auto &&work) {
-    for (;;) {
-      try {
-        return work();
-      } catch (const BudgetExceeded &e) {
-        const std::size_t removed = trainer.remove_largest_gaussians(0.05);
-        filterLevel = kFilterStale;
-        bar.message(std::format("  {}: removed the {} largest Gaussians", e.what(), removed));
-        if (removed == 0) throw;
-      }
-    }
-  };
+TrainSession::TrainSession(vk::Context &ctx, const TrainOptions &options, TrainData data, std::function<void(const std::string &)> log)
+    : ctx_(ctx), options_(options), data_(std::move(data)), log_(std::move(log)), rng_(options.seed), densifyRng_(options.seed + 1),
+      growth_(data_.startingPoints.size(), options.maxGrowth), lastOpacityReset_(-kCheckpointRecovery) {
+  if (!log_) log_ = [](const std::string &line) { std::println("{}", line); };
+  if (options_.adaptiveSchedule && !options_.fullResolution) {
+    log_(std::format("Image sizes: quarter until {:.0f}% of training, half until {:.0f}%, then full", 100.0 * data_.coarseUntil[1],
+                     100.0 * data_.coarseUntil[0]));
+  }
+  trainerOptions_.lambdaSsim = options_.lambdaSsim;
+  trainerOptions_.selectiveAdam = !options_.fullAdam;
+  trainerOptions_.poseGradients = options_.refinePoses;
+  trainerOptions_.opacityReg = options_.opacityReg;
+  trainerOptions_.scaleReg = options_.scaleReg;
+  trainerOptions_.positionNoise = options_.positionNoise;
+  trainerOptions_.mipFilter2d = options_.mipFilter2d;
+  trainerOptions_.nearPlane = static_cast<float>(data_.typicalDepth * 0.01);
+  // Asked for before anything is allocated, so that it is all ours to spend.
+  budgetGiB_ = options_.vramBudgetGiB;
+  if (budgetGiB_ <= 0.0) budgetGiB_ = options_.vramShare * static_cast<double>(ctx_.free_device_memory()) / (1024.0 * 1024.0 * 1024.0);
+  const auto budgetBytes = static_cast<std::uint64_t>(budgetGiB_ * 1024.0 * 1024.0 * 1024.0);
+  const std::uint64_t reserve = std::max(kBudgetReserve, budgetBytes / 20);
+  trainerOptions_.memoryBudget = budgetBytes > reserve ? budgetBytes - reserve : 0;
+  std::uint64_t largestView = 0;
+  for (const TrainView &view : data_.trainViews) {
+    largestView = std::max(largestView, static_cast<std::uint64_t>(view.camera.width) * view.camera.height);
+  }
+  if (largestView * Trainer::kBytesPerPixel >= trainerOptions_.memoryBudget) {
+    throw std::runtime_error(std::format("{:.2f} GiB of VRAM is not enough for images of this size; try --max-size", budgetGiB_));
+  }
+  trainer_ = std::make_unique<Trainer>(ctx_, initial_cloud(data_.startingPoints, options_.shDegree), trainerOptions_);
 
   // The schedule of the paper for 30000 iterations, proportional when shorter.
-  const int densifyFrom = std::min(500, options.iterations / 20 + 1);
-  const int densifyUntil = options.iterations / 2;
-  const int pruneAgainAt = (densifyUntil + options.iterations) / 2;
-  const int shInterval = std::max(1, std::min(1000, options.iterations / 10));
-  trainer.set_active_sh_degree(0);
-  std::mt19937 densifyRng(options.seed + 1);
-  double entriesPerVisible = 16.0;
-  std::println("Training from {} Gaussians on {} views ({} held out) at {}x{} for {} iterations, SH degree {}, VRAM budget {:.1f} GiB{}",
-               startingPoints.size(), trainViews.size(), holdoutViews.size(), trainViews[0].camera.width, trainViews[0].camera.height,
-               options.iterations, options.shDegree, budgetGiB,
-               trainer.uses_fixed_point() ? " (fixed-point gradients: this GPU has no float atomics)" : "");
-
-  std::vector<ViewExposure> exposures(trainViews.size());
-  std::vector<ViewPose> poses(trainViews.size());
-  std::mt19937 rng(options.seed);
-  std::vector<std::size_t> order;
-  TrainReport report;
-  LearningRates rates;
-  const double positionStart = 1.6e-4 * extent, positionEnd = 1.6e-6 * extent;
-  GrowthBudget growth(startingPoints.size(), options.maxGrowth);
-  double lossSum = 0.0;
-  int lossCount = 0;
-  int lastOpacityReset = -kCheckpointRecovery;
-  bool checkpointDue = false;
-  double densifySeconds = 0.0;
-  int densifyRounds = 0;
-  double pruneSeconds = 0.0;
-  std::vector<Camera> allCameras;
-  for (const auto *views : {&trainViews, &holdoutViews}) {
-    for (const View &view : *views) allCameras.push_back(view.camera);
+  densifyFrom_ = std::min(500, options_.iterations / 20 + 1);
+  densifyUntil_ = options_.iterations / 2;
+  pruneAgainAt_ = (densifyUntil_ + options_.iterations) / 2;
+  shInterval_ = std::max(1, std::min(1000, options_.iterations / 10));
+  trainer_->set_active_sh_degree(0);
+  exposures_.resize(data_.trainViews.size());
+  poses_.resize(data_.trainViews.size());
+  positionStart_ = 1.6e-4 * data_.extent;
+  positionEnd_ = 1.6e-6 * data_.extent;
+  for (const auto *views : {&data_.trainViews, &data_.holdoutViews}) {
+    for (const TrainView &view : *views) allCameras_.push_back(view.camera);
   }
+  log_(std::format("Training from {} Gaussians on {} views ({} held out) at {}x{} for {} iterations, SH degree {}, VRAM budget {:.1f} GiB{}",
+                   data_.startingPoints.size(), data_.trainViews.size(), data_.holdoutViews.size(), data_.trainViews[0].camera.width,
+                   data_.trainViews[0].camera.height, options_.iterations, options_.shDegree, budgetGiB_,
+                   trainer_->uses_fixed_point() ? " (fixed-point gradients: this GPU has no float atomics)" : ""));
+  refresh_filter(1);
+}
+
+TrainSession::~TrainSession() = default;
+
+// A view that does not fit gives up its largest Gaussians, rather than the run
+// ending. They grow back where they are needed, within the budget.
+template <class F> auto TrainSession::fitting(F &&work) {
+  for (;;) {
+    try {
+      return work();
+    } catch (const BudgetExceeded &e) {
+      const std::size_t removed = trainer_->remove_largest_gaussians(0.05);
+      filterLevel_ = ~std::size_t{0};
+      log_(std::format("  {}: removed the {} largest Gaussians", e.what(), removed));
+      if (removed == 0) throw;
+    }
+  }
+}
+
+std::size_t TrainSession::coarse_level(int iteration) const noexcept {
+  if (data_.smallerViews.empty()) return kCoarseLevels;
+  const double progress = static_cast<double>(iteration - 1) / std::max(options_.iterations - 1, 1);
+  for (std::size_t level = kCoarseLevels; level-- > 0;) {
+    if (progress < data_.coarseUntil[level]) return level;
+  }
+  return kCoarseLevels;
+}
+
+const TrainView &TrainSession::view_at(std::size_t index, int iteration) const {
+  const std::size_t level = coarse_level(iteration);
+  return level == kCoarseLevels ? data_.trainViews[index] : data_.smallerViews[level][index];
+}
+
+void TrainSession::refill_order() {
+  if (!order_.empty()) return;
+  order_.resize(data_.trainViews.size());
+  std::iota(order_.begin(), order_.end(), std::size_t{0});
+  std::shuffle(order_.begin(), order_.end(), rng_);
+}
+
+// Mip-Splatting's 3D smoothing filter, from the training cameras of the
+// current image size; recomputed after every change of the cloud or the size.
+void TrainSession::refresh_filter(int iteration) {
+  if (!options_.mipFilter3d) return;
+  std::vector<Camera> cameras;
+  cameras.reserve(data_.trainViews.size());
+  for (std::size_t i = 0; i < data_.trainViews.size(); ++i) cameras.push_back(view_at(i, iteration).camera);
+  filter3d_ = smoothing_filter(trainer_->cloud(), cameras);
+  trainer_->set_filter3d(filter3d_);
+  filterLevel_ = coarse_level(iteration);
+}
+
+StepStats TrainSession::step() {
+  if (finished()) throw std::logic_error("training has already finished");
+  const auto start = std::chrono::steady_clock::now();
+  const int iteration = ++iteration_;
+  Trainer &trainer = *trainer_;
+  const TrainOptions &options = options_;
+  refill_order();
+  lastView_ = order_.back();
+  const std::size_t viewIndex = lastView_;
+  const TrainView &view = view_at(viewIndex, iteration);
+  order_.pop_back();
+  refill_order();
+  const TrainView &nextView = view_at(order_.back(), iteration + 1);
+  if (options.mipFilter3d && coarse_level(iteration) != filterLevel_) refresh_filter(iteration);
+
+  const double progress = static_cast<double>(iteration - 1) / std::max(options.iterations - 1, 1);
+  // With the adaptive schedule, held while the image is still growing.
+  const double held = options.adaptiveSchedule && !options.fullResolution ? data_.coarseUntil[0] : 0.0;
+  const double decay = std::clamp((progress - held) / std::max(1.0 - held, 1e-9), 0.0, 1.0);
+  rates_.position = static_cast<float>(positionStart_ * std::pow(positionEnd_ / positionStart_, decay));
+  trainer.set_active_sh_degree((iteration - 1) / shInterval_);
+  trainer.set_exposure(exposures_[viewIndex].value);
+  if (options.secondOrder && iteration > densifyUntil_) {
+    if (rates_.trustRegion == 0.f) trainer.enable_second_order();
+    const double rest = static_cast<double>(iteration - densifyUntil_) / std::max(options.iterations - densifyUntil_, 1);
+    rates_.trustRegion = static_cast<float>(kTrustStart * std::pow(kTrustEnd / kTrustStart, rest));
+  }
+  if (options.shDropout > 0.f) {
+    trainer.set_sh_dropout(options.shDropout, progress < 0.2 ? 0 : progress < 0.4 ? 1 : 2, static_cast<std::uint32_t>(iteration));
+  }
+  const StepStats stats = fitting([&] { return trainer.step(view.camera, view.rgba, rates_, nextView.rgba); });
+  if (rates_.trustRegion > 0.f && (iteration - densifyUntil_) % kCurvatureInterval == 1) trainer.update_curvature();
+  if (options.exposure) exposures_[viewIndex].step(stats.exposureGradient);
+  if (options.refinePoses && progress >= kPoseStart) {
+    const std::array<float, 6> move =
+        poses_[viewIndex].step(stats.poseGradient, rates_.position / static_cast<float>(data_.extent), rates_.position);
+    // The smaller images hold the same camera at other intrinsics, which this keeps.
+    Camera &full = data_.trainViews[viewIndex].camera;
+    const Camera moved = refined_pose(full, move);
+    full.view = moved.view;
+    full.position = moved.position;
+    for (auto &level : data_.smallerViews) {
+      level[viewIndex].camera.view = moved.view;
+      level[viewIndex].camera.position = moved.position;
+    }
+  }
+  if (!std::isfinite(stats.loss)) throw std::runtime_error(std::format("the loss became {} at iteration {}", stats.loss, iteration));
+  if (iteration == 1) report_.firstLoss = stats.loss;
+  report_.lastLoss = stats.loss;
+  lossSum_ += stats.loss;
+  ++lossCount_;
+  if (stats.visibleSplats > 0) {
+    entriesPerVisible_ = 0.98 * entriesPerVisible_ + 0.02 * stats.tileEntries / stats.visibleSplats;
+  }
+  report_.peakGpuBytes = std::max(report_.peakGpuBytes, trainer.gpu_bytes());
+
+  // Measured now, before this iteration's pruning and opacity reset: a cloud
+  // just after a reset is nearly transparent and its PSNR says nothing about
+  // what training reached. Reported below, once the Gaussian count is final.
+  const bool reportDue = iteration % options.reportEvery == 0 || iteration == options.iterations;
+  double probePsnr = 0.0;
+  if (reportDue) {
+    const TrainView &probe = data_.holdoutViews.empty() ? data_.trainViews[0] : data_.holdoutViews[0];
+    probePsnr = psnr_of(fitting([&] { return trainer.render(probe.camera); }), probe.rgba);
+  }
+
+  // Before densification, which may cap the opacities the ranking depends on.
+  if (options.pruneShare > 0.0 && (iteration == densifyUntil_ || iteration == pruneAgainAt_)) {
+    const auto pruneStart = std::chrono::steady_clock::now();
+    const std::size_t before = trainer.gaussian_count();
+    // The first time, the statistics only cover the last densification
+    // interval, so every view is rendered once to score them. The second
+    // time, they have run since the first and seen every view many times.
+    if (iteration == densifyUntil_) {
+      trainer.reset_densify_stats();
+      for (std::size_t i = 0; i < data_.trainViews.size(); ++i) {
+        trainer.set_exposure(exposures_[i].value);
+        fitting([&] { return trainer.compute_gradients(data_.trainViews[i].camera, data_.trainViews[i].rgba); });
+      }
+    }
+    const std::size_t removed = trainer.remove_least_contributing_gaussians(options.pruneShare);
+    filterLevel_ = ~std::size_t{0};
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - pruneStart).count();
+    pruneSeconds_ += seconds;
+    log_(std::format("  iteration {}: removed {} of {} Gaussians, those adding least to the views ({:.1f} s)", iteration, removed, before,
+                     seconds));
+  }
+
+  if (options.densify && iteration >= densifyFrom_ && iteration <= densifyUntil_ && iteration % options.densifyInterval == 0) {
+    // What a Gaussian costs, with the tile entries it brings and room for them to grow.
+    const double perGaussian = static_cast<double>(trainer.bytes_per_gaussian()) + 1.5 * Trainer::kBytesPerTileEntry * entriesPerVisible_;
+    const std::uint64_t available = trainerOptions_.memoryBudget;
+    const std::uint64_t pixelBytes = static_cast<std::uint64_t>(view.camera.width) * view.camera.height * Trainer::kBytesPerPixel;
+    DensifyOptions densifyOptions;
+    const double densifyProgress = static_cast<double>(iteration) / std::max(densifyUntil_, 1);
+    const auto rise = static_cast<float>(std::pow(options.thresholdRise, densifyProgress - 0.5));
+    densifyOptions.gradientThreshold = options.gradientThreshold * rise;
+    densifyOptions.splitThreshold = options.splitThreshold * rise;
+    densifyOptions.denseScale = static_cast<float>(options.denseFraction * data_.extent);
+    densifyOptions.maxWorldScale = static_cast<float>(kMaxWorldFraction * data_.extent);
+    densifyOptions.maxScreenRadius = static_cast<float>(kMaxScreenFraction * std::max(view.camera.width, view.camera.height));
+    densifyOptions.pruneLarge = iteration > kOpacityResetInterval && !options.significancePrune;
+    if (options.significancePrune) densifyOptions.transparentShare = 0.5;
+    densifyOptions.exploreSplits = densifyOptions.exploreSeeds = static_cast<std::size_t>(options.explore);
+    densifyOptions.edgeSplit = options.edgeSplit;
+    densifyOptions.maxGaussians = available > pixelBytes ? static_cast<std::size_t>(static_cast<double>(available - pixelBytes) / perGaussian) : 0;
+    if (options.maxGaussians > 0) densifyOptions.maxGaussians = std::min(densifyOptions.maxGaussians, options.maxGaussians);
+    const auto densifyStart = std::chrono::steady_clock::now();
+    if (options.scoreViews > 0 && options.densifyMode == TrainOptions::DensifyMode::Adc) { // Scores play no part in relocation
+      densifyOptions.scoredViews = options.scoreViews;
+      densifyOptions.minMarkedPixels = options.scoreMinPixels;
+      std::uniform_int_distribution<std::size_t> pick(0, data_.trainViews.size() - 1);
+      for (int k = 0; k < options.scoreViews; ++k) {
+        const std::size_t i = pick(densifyRng_);
+        const TrainView &scored = view_at(i, iteration);
+        // A pixel of a smaller image stands for several of the full one.
+        const float area = static_cast<float>(data_.trainViews[i].camera.width) / static_cast<float>(scored.camera.width);
+        trainer.set_exposure(exposures_[i].value);
+        fitting([&] { return trainer.score_view(scored.camera, scored.rgba, kScoreErrorShare, area * area); });
+      }
+    }
+    if (options.adaptiveSchedule) {
+      const std::size_t level = coarse_level(iteration);
+      const double factor = level == kCoarseLevels ? 1.0 : std::pow(2.0, static_cast<double>(level + 1));
+      densifyOptions.maxGaussians = std::min(densifyOptions.maxGaussians, growth_.limit(factor, progress));
+    } else {
+      // A fixed cap: on the bicycle scene quality saturates from about 5
+      // times the starting points, and 4 keeps 7000 iterations above 100 it/s.
+      densifyOptions.maxGaussians = std::min(densifyOptions.maxGaussians, growth_.limit(1.0, 1.0));
+    }
+    if (options.densifyMode == TrainOptions::DensifyMode::Mcmc) {
+      RelocateOptions relocateOptions;
+      relocateOptions.maxGaussians = densifyOptions.maxGaussians;
+      trainer.relocate(relocateOptions, densifyRng_);
+    } else {
+      const DensifyResult result = trainer.densify(densifyOptions, densifyRng_);
+      if (options.adaptiveSchedule) growth_.observe(result.cloned + result.split + result.heldBack);
+      report_.heldBack += result.heldBack;
+      // Not on the last round: as in the paper, and the cloud would have
+      // no densification left to recover with.
+      if (iteration % kOpacityResetInterval == 0 && iteration < densifyUntil_) {
+        trainer.reset_opacity(kResetOpacity);
+        lastOpacityReset_ = iteration;
+      }
+    }
+    refresh_filter(iteration);
+    densifySeconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - densifyStart).count();
+    ++densifyRounds_;
+  }
+
+  if (options.recoveryPrune > 0.0 && lastOpacityReset_ > 0 && iteration == lastOpacityReset_ + kRecoveryDelay) {
+    const std::size_t before = trainer.gaussian_count();
+    const std::size_t removed = trainer.remove_least_opaque_gaussians(options.recoveryPrune);
+    log_(std::format("  iteration {}: removed {} of {} Gaussians, the least opaque since the reset", iteration, removed, before));
+    refresh_filter(iteration);
+  }
+  trainingSeconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+
+  if (reportDue) {
+    lastPsnr_ = probePsnr;
+    report_.progressPsnr.emplace_back(iteration, probePsnr);
+    log_(std::format("  iteration {:6}: loss {:.4f}, {} PSNR {:.2f} dB, {} Gaussians, {} visible, {} tile entries, {:.2f} GiB, {:.1f} it/s", iteration,
+                     lossSum_ / lossCount_, data_.holdoutViews.empty() ? "training view" : "held-out view", probePsnr, trainer.gaussian_count(),
+                     stats.visibleSplats, stats.tileEntries, static_cast<double>(trainer.gpu_bytes()) / (1024.0 * 1024.0 * 1024.0),
+                     iteration / std::max(trainingSeconds_, 1e-9)));
+    lossSum_ = 0.0;
+    lossCount_ = 0;
+  }
+  if (options.saveEvery > 0 && iteration % options.saveEvery == 0) checkpointDue_ = true;
+  if (checkpointDue_ && iteration - lastOpacityReset_ >= kCheckpointRecovery && iteration < options.iterations) {
+    checkpointDue_ = false;
+    save(options.out);
+  }
+  return stats;
+}
+
+std::string TrainSession::save_output(const fs::path &path, const CgcOptions &cgcOptions) {
+  if (options_.mipFilter3d && (filterLevel_ == ~std::size_t{0} || filter3d_.size() != trainer_->gaussian_count())) {
+    refresh_filter(std::max(iteration_, 1));
+  }
+  GaussianCloud cloud = trainer_->cloud();
+  if (options_.mipFilter3d) bake_filter(cloud, filter3d_);
+  // The format follows the output's name, also for a temporary file.
+  const CloudFormat format = cloud_format(options_.out);
   // CGC refuses NaN and infinity, which a few Gaussians can pick up after
   // densification has stopped pruning them, so those are left out of CGC files.
-  // Returns how the floor was found, or nothing if it was not looked for.
-  const auto save_output = [&](const fs::path &path, const CgcOptions &cgcOptions) {
-    if (options.mipFilter3d && (filterLevel == kFilterStale || filter3d.size() != trainer.gaussian_count())) refresh_filter(currentIteration);
-    GaussianCloud cloud = trainer.cloud();
-    if (options.mipFilter3d) bake_filter(cloud, filter3d);
-    const CloudFormat format = cloud_format(options.out);
-    if (format == CloudFormat::Cgc) {
-      if (const std::size_t removed = remove_non_finite(cloud); removed > 0) {
-        bar.message(std::format("  left out {} Gaussians with NaN or infinite values", removed));
-      }
-    }
-    std::string floorNote;
-    if (options.alignFloor) {
-      const FloorEstimate floor = estimate_floor(cloud, allCameras);
-      transform_cloud(cloud, floor_alignment(floor, cloud));
-      const double tilt = glm::degrees(std::acos(std::clamp(glm::dot(floor.normal, estimate_up(allCameras)), -1.0, 1.0)));
-      floorNote = floor.fitted ? std::format("floor plane through {} of {} opaque Gaussians, {:.1f} deg off the cameras' up", floor.inliers,
-                                             floor.candidates, tilt)
-                               : "no floor plane found, levelled by the cameras' up";
-    }
-    save_cloud(cloud, path, format, cgcOptions);
-    return floorNote;
-  };
-  const auto start = std::chrono::steady_clock::now();
-  refresh_filter(1);
-  bar.start();
-  for (int iteration = 1; iteration <= options.iterations; ++iteration) {
-    if (order.empty()) {
-      order.resize(trainViews.size());
-      std::iota(order.begin(), order.end(), std::size_t{0});
-      std::shuffle(order.begin(), order.end(), rng);
-    }
-    const std::size_t viewIndex = order.back();
-    const View &view = view_at(viewIndex, iteration);
-    order.pop_back();
-    if (order.empty()) {
-      order.resize(trainViews.size());
-      std::iota(order.begin(), order.end(), std::size_t{0});
-      std::shuffle(order.begin(), order.end(), rng);
-    }
-    const View &nextView = view_at(order.back(), iteration + 1);
-    currentIteration = iteration;
-    if (options.mipFilter3d && coarse_level(iteration) != filterLevel) refresh_filter(iteration);
-
-    const double progress = static_cast<double>(iteration - 1) / std::max(options.iterations - 1, 1);
-    // With the adaptive schedule, held while the image is still growing.
-    const double held = options.adaptiveSchedule && !options.fullResolution ? coarseUntil[0] : 0.0;
-    const double decay = std::clamp((progress - held) / std::max(1.0 - held, 1e-9), 0.0, 1.0);
-    rates.position = static_cast<float>(positionStart * std::pow(positionEnd / positionStart, decay));
-    trainer.set_active_sh_degree((iteration - 1) / shInterval);
-    trainer.set_exposure(exposures[viewIndex].value);
-    if (options.secondOrder && iteration > densifyUntil) {
-      if (rates.trustRegion == 0.f) trainer.enable_second_order();
-      const double rest = static_cast<double>(iteration - densifyUntil) / std::max(options.iterations - densifyUntil, 1);
-      rates.trustRegion = static_cast<float>(kTrustStart * std::pow(kTrustEnd / kTrustStart, rest));
-    }
-    if (options.shDropout > 0.f) {
-      trainer.set_sh_dropout(options.shDropout, progress < 0.2 ? 0 : progress < 0.4 ? 1 : 2, static_cast<std::uint32_t>(iteration));
-    }
-    const StepStats stats = fitting([&] { return trainer.step(view.camera, view.rgba, rates, nextView.rgba); });
-    if (rates.trustRegion > 0.f && (iteration - densifyUntil) % kCurvatureInterval == 1) trainer.update_curvature();
-    if (options.exposure) exposures[viewIndex].step(stats.exposureGradient);
-    if (options.refinePoses && progress >= kPoseStart) {
-      const std::array<float, 6> move = poses[viewIndex].step(stats.poseGradient, rates.position / static_cast<float>(extent), rates.position);
-      // The smaller images hold the same camera at other intrinsics, which this keeps.
-      Camera &full = trainViews[viewIndex].camera;
-      const Camera moved = refined_pose(full, move);
-      full.view = moved.view;
-      full.position = moved.position;
-      if (!options.fullResolution) {
-        for (auto &level : smaller) {
-          level[viewIndex].camera.view = moved.view;
-          level[viewIndex].camera.position = moved.position;
-        }
-      }
-    }
-    if (!std::isfinite(stats.loss)) throw std::runtime_error(std::format("the loss became {} at iteration {}", stats.loss, iteration));
-    if (iteration == 1) report.firstLoss = stats.loss;
-    report.lastLoss = stats.loss;
-    lossSum += stats.loss;
-    ++lossCount;
-    if (stats.visibleSplats > 0) {
-      entriesPerVisible = 0.98 * entriesPerVisible + 0.02 * stats.tileEntries / stats.visibleSplats;
-    }
-    report.peakGpuBytes = std::max(report.peakGpuBytes, trainer.gpu_bytes());
-
-    // Measured now, before this iteration's pruning and opacity reset: a cloud
-    // just after a reset is nearly transparent and its PSNR says nothing about
-    // what training reached. Reported below, once the Gaussian count is final.
-    const bool reportDue = iteration % options.reportEvery == 0 || iteration == options.iterations;
-    double probePsnr = 0.0;
-    if (reportDue) {
-      const View &probe = holdoutViews.empty() ? trainViews[0] : holdoutViews[0];
-      probePsnr = psnr_of(fitting([&] { return trainer.render(probe.camera); }), probe.rgba);
-    }
-
-    // Before densification, which may cap the opacities the ranking depends on.
-    if (options.pruneShare > 0.0 && (iteration == densifyUntil || iteration == pruneAgainAt)) {
-      const auto pruneStart = std::chrono::steady_clock::now();
-      const std::size_t before = trainer.gaussian_count();
-      // The first time, the statistics only cover the last densification
-      // interval, so every view is rendered once to score them. The second
-      // time, they have run since the first and seen every view many times.
-      if (iteration == densifyUntil) {
-        trainer.reset_densify_stats();
-        for (std::size_t i = 0; i < trainViews.size(); ++i) {
-          trainer.set_exposure(exposures[i].value);
-          fitting([&] { return trainer.compute_gradients(trainViews[i].camera, trainViews[i].rgba); });
-        }
-      }
-      const std::size_t removed = trainer.remove_least_contributing_gaussians(options.pruneShare);
-      filterLevel = kFilterStale;
-      const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - pruneStart).count();
-      pruneSeconds += seconds;
-      bar.message(std::format("  iteration {}: removed {} of {} Gaussians, those adding least to the views ({:.1f} s)", iteration, removed,
-                              before, seconds));
-    }
-
-    if (options.densify && iteration >= densifyFrom && iteration <= densifyUntil && iteration % options.densifyInterval == 0) {
-      // What a Gaussian costs, with the tile entries it brings and room for them to grow.
-      const double perGaussian = static_cast<double>(trainer.bytes_per_gaussian()) + 1.5 * Trainer::kBytesPerTileEntry * entriesPerVisible;
-      const std::uint64_t available = trainerOptions.memoryBudget;
-      const std::uint64_t pixelBytes = static_cast<std::uint64_t>(view.camera.width) * view.camera.height * Trainer::kBytesPerPixel;
-      DensifyOptions densifyOptions;
-      const double densifyProgress = static_cast<double>(iteration) / std::max(densifyUntil, 1);
-      const auto rise = static_cast<float>(std::pow(options.thresholdRise, densifyProgress - 0.5));
-      densifyOptions.gradientThreshold = options.gradientThreshold * rise;
-      densifyOptions.splitThreshold = options.splitThreshold * rise;
-      densifyOptions.denseScale = static_cast<float>(options.denseFraction * extent);
-      densifyOptions.maxWorldScale = static_cast<float>(kMaxWorldFraction * extent);
-      densifyOptions.maxScreenRadius = static_cast<float>(kMaxScreenFraction * std::max(view.camera.width, view.camera.height));
-      densifyOptions.pruneLarge = iteration > kOpacityResetInterval && !options.significancePrune;
-      if (options.significancePrune) densifyOptions.transparentShare = 0.5;
-      densifyOptions.exploreSplits = densifyOptions.exploreSeeds = static_cast<std::size_t>(options.explore);
-      densifyOptions.edgeSplit = options.edgeSplit;
-      densifyOptions.maxGaussians = available > pixelBytes ? static_cast<std::size_t>(static_cast<double>(available - pixelBytes) / perGaussian) : 0;
-      if (options.maxGaussians > 0) densifyOptions.maxGaussians = std::min(densifyOptions.maxGaussians, options.maxGaussians);
-      const auto densifyStart = std::chrono::steady_clock::now();
-      if (options.scoreViews > 0 && options.densifyMode == TrainOptions::DensifyMode::Adc) { // Scores play no part in relocation
-        densifyOptions.scoredViews = options.scoreViews;
-        densifyOptions.minMarkedPixels = options.scoreMinPixels;
-        std::uniform_int_distribution<std::size_t> pick(0, trainViews.size() - 1);
-        for (int k = 0; k < options.scoreViews; ++k) {
-          const std::size_t i = pick(densifyRng);
-          const View &scored = view_at(i, iteration);
-          // A pixel of a smaller image stands for several of the full one.
-          const float area = static_cast<float>(trainViews[i].camera.width) / static_cast<float>(scored.camera.width);
-          trainer.set_exposure(exposures[i].value);
-          fitting([&] { return trainer.score_view(scored.camera, scored.rgba, kScoreErrorShare, area * area); });
-        }
-      }
-      if (options.adaptiveSchedule) {
-        const std::size_t level = coarse_level(iteration);
-        const double factor = level == kCoarseLevels ? 1.0 : std::pow(2.0, static_cast<double>(level + 1));
-        densifyOptions.maxGaussians = std::min(densifyOptions.maxGaussians, growth.limit(factor, progress));
-      } else {
-        // A fixed cap: on the bicycle scene quality saturates from about 5
-        // times the starting points, and 4 keeps 7000 iterations above 100 it/s.
-        densifyOptions.maxGaussians = std::min(densifyOptions.maxGaussians, growth.limit(1.0, 1.0));
-      }
-      if (options.densifyMode == TrainOptions::DensifyMode::Mcmc) {
-        RelocateOptions relocateOptions;
-        relocateOptions.maxGaussians = densifyOptions.maxGaussians;
-        trainer.relocate(relocateOptions, densifyRng);
-      } else {
-        const DensifyResult result = trainer.densify(densifyOptions, densifyRng);
-        if (options.adaptiveSchedule) growth.observe(result.cloned + result.split + result.heldBack);
-        report.heldBack += result.heldBack;
-        // Not on the last round: as in the paper, and the cloud would have
-        // no densification left to recover with.
-        if (iteration % kOpacityResetInterval == 0 && iteration < densifyUntil) {
-          trainer.reset_opacity(kResetOpacity);
-          lastOpacityReset = iteration;
-        }
-      }
-      refresh_filter(iteration);
-      densifySeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - densifyStart).count();
-      ++densifyRounds;
-    }
-
-    constexpr int kRecoveryDelay = 300;
-    if (options.recoveryPrune > 0.0 && lastOpacityReset > 0 && iteration == lastOpacityReset + kRecoveryDelay) {
-      const std::size_t before = trainer.gaussian_count();
-      const std::size_t removed = trainer.remove_least_opaque_gaussians(options.recoveryPrune);
-      bar.message(std::format("  iteration {}: removed {} of {} Gaussians, the least opaque since the reset", iteration, removed, before));
-      refresh_filter(iteration);
-    }
-
-    if (reportDue) {
-      const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-      report.progressPsnr.emplace_back(iteration, probePsnr);
-      bar.message(std::format("  iteration {:6}: loss {:.4f}, {} PSNR {:.2f} dB, {} Gaussians, {} visible, {} tile entries, {:.2f} GiB, {:.1f} it/s", iteration,
-                   lossSum / lossCount, holdoutViews.empty() ? "training view" : "held-out view", probePsnr, trainer.gaussian_count(), stats.visibleSplats, stats.tileEntries,
-                   static_cast<double>(trainer.gpu_bytes()) / (1024.0 * 1024.0 * 1024.0), iteration / seconds));
-      lossSum = 0.0;
-      lossCount = 0;
-    }
-    if (options.saveEvery > 0 && iteration % options.saveEvery == 0) checkpointDue = true;
-    if (checkpointDue && iteration - lastOpacityReset >= kCheckpointRecovery && iteration < options.iterations) {
-      checkpointDue = false;
-      // Through a temporary file, so that a crash never leaves half a checkpoint.
-      const fs::path temporary = fs::path(options.out).concat(".tmp");
-      // Quick settings, so that CGC checkpoints don't hold up training.
-      const std::string floorNote = save_output(temporary, CgcOptions{.fast = true});
-      fs::rename(temporary, options.out);
-      bar.message(std::format("  iteration {:6}: checkpoint saved to {}{}", iteration, options.out.string(), floorNote.empty() ? "" : " (" + floorNote + ")"));
-    }
-    if (iteration % 10 == 0 || iteration == options.iterations) {
-      const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-      bar.set(static_cast<std::size_t>(iteration),
-              std::format("loss {:.4f}  {} Gaussians  {:.1f} it/s", stats.loss, trainer.gaussian_count(), iteration / elapsed));
+  if (format == CloudFormat::Cgc) {
+    if (const std::size_t removed = remove_non_finite(cloud); removed > 0) {
+      log_(std::format("  left out {} Gaussians with NaN or infinite values", removed));
     }
   }
-  bar.finish();
-  const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-  report.iterationsPerSecond = options.iterations / seconds;
+  std::string floorNote;
+  if (options_.alignFloor) {
+    const FloorEstimate floor = estimate_floor(cloud, allCameras_);
+    transform_cloud(cloud, floor_alignment(floor, cloud));
+    const double tilt = glm::degrees(std::acos(std::clamp(glm::dot(floor.normal, estimate_up(allCameras_)), -1.0, 1.0)));
+    floorNote = floor.fitted ? std::format("floor plane through {} of {} opaque Gaussians, {:.1f} deg off the cameras' up", floor.inliers,
+                                           floor.candidates, tilt)
+                             : "no floor plane found, levelled by the cameras' up";
+  }
+  save_cloud(cloud, path, format, cgcOptions);
+  return floorNote;
+}
 
-  trainer.set_active_sh_degree(options.shDegree);
+void TrainSession::save(const fs::path &path) {
+  // Through a temporary file, so that a crash never leaves half a checkpoint.
+  // Quick settings, so that CGC checkpoints don't hold up training.
+  const fs::path temporary = fs::path(path).concat(".tmp");
+  const std::string floorNote = save_output(temporary, CgcOptions{.fast = true});
+  fs::rename(temporary, path);
+  log_(std::format("  iteration {:6}: checkpoint saved to {}{}", iteration_, path.string(), floorNote.empty() ? "" : " (" + floorNote + ")"));
+}
+
+TrainReport TrainSession::finish() {
+  Trainer &trainer = *trainer_;
+  report_.iterationsPerSecond = iteration_ / std::max(trainingSeconds_, 1e-9);
+
+  trainer.set_active_sh_degree(options_.shDegree);
+  trainer.set_sh_dropout(0.f, 0, 0);
   // Training views through the exposures they learned, or they would be
   // compared with photos the Gaussians were never fitted to.
-  for (std::size_t i = 0; i < trainViews.size(); ++i) {
-    std::vector<float> rendered = fitting([&] { return trainer.render(trainViews[i].camera); });
-    apply_exposure(rendered, exposures[i].value);
-    report.trainPsnr += psnr_of(rendered, trainViews[i].rgba) / static_cast<double>(trainViews.size());
+  report_.trainPsnr = 0.0;
+  for (std::size_t i = 0; i < data_.trainViews.size(); ++i) {
+    std::vector<float> rendered = fitting([&] { return trainer.render(data_.trainViews[i].camera); });
+    apply_exposure(rendered, exposures_[i].value);
+    report_.trainPsnr += psnr_of(rendered, data_.trainViews[i].rgba) / static_cast<double>(data_.trainViews.size());
   }
   // A held-out view has no learned exposure, so it is scored both as it is and
   // with one fitted to its own photo. Only the second is fair to --exposure.
-  for (const View &view : holdoutViews) {
+  report_.holdoutPsnr = report_.holdoutFittedPsnr = 0.0;
+  for (const TrainView &view : data_.holdoutViews) {
     const std::vector<float> rendered = fitting([&] { return trainer.render(view.camera); });
-    report.holdoutPsnr += psnr_of(rendered, view.rgba) / static_cast<double>(holdoutViews.size());
-    report.holdoutFittedPsnr += cross_fitted_psnr(rendered, view.rgba, view.camera.width, view.camera.height) / static_cast<double>(holdoutViews.size());
+    report_.holdoutPsnr += psnr_of(rendered, view.rgba) / static_cast<double>(data_.holdoutViews.size());
+    report_.holdoutFittedPsnr +=
+        cross_fitted_psnr(rendered, view.rgba, view.camera.width, view.camera.height) / static_cast<double>(data_.holdoutViews.size());
   }
 
-  trainer.set_active_sh_degree(options.shDegree);
-  trainer.set_sh_dropout(0.f, 0, 0);
-  report.gaussians = trainer.gaussian_count();
-  if (const std::string floorNote = save_output(options.out, CgcOptions{}); !floorNote.empty()) {
-    std::println("Aligned to the floor: {}", floorNote);
+  report_.gaussians = trainer.gaussian_count();
+  if (const std::string floorNote = save_output(options_.out, CgcOptions{}); !floorNote.empty()) {
+    log_(std::format("Aligned to the floor: {}", floorNote));
   }
-  write_preview(trainer.render(trainViews[0].camera), trainViews[0], options.project / "preview_train.png");
-  if (!holdoutViews.empty()) {
-    write_preview(trainer.render(holdoutViews[0].camera), holdoutViews[0], options.project / "preview_holdout.png");
-    std::println("PSNR {:.2f} dB on training views, {:.2f} dB on held-out views ({:.2f} dB with exposure fitted to each)", report.trainPsnr,
-                 report.holdoutPsnr, report.holdoutFittedPsnr);
+  write_preview(trainer.render(data_.trainViews[0].camera), data_.trainViews[0], options_.project / "preview_train.png");
+  if (!data_.holdoutViews.empty()) {
+    write_preview(trainer.render(data_.holdoutViews[0].camera), data_.holdoutViews[0], options_.project / "preview_holdout.png");
+    log_(std::format("PSNR {:.2f} dB on training views, {:.2f} dB on held-out views ({:.2f} dB with exposure fitted to each)", report_.trainPsnr,
+                     report_.holdoutPsnr, report_.holdoutFittedPsnr));
   } else {
-    std::println("PSNR {:.2f} dB on training views", report.trainPsnr);
+    log_(std::format("PSNR {:.2f} dB on training views", report_.trainPsnr));
   }
-  std::println("{} Gaussians, peak {:.2f} GiB of VRAM{}", report.gaussians, static_cast<double>(report.peakGpuBytes) / (1024.0 * 1024.0 * 1024.0),
-               report.heldBack > 0 ? std::format(" ({} densifications held back by the budget)", report.heldBack) : "");
+  log_(std::format("{} Gaussians, peak {:.2f} GiB of VRAM{}", report_.gaussians, static_cast<double>(report_.peakGpuBytes) / (1024.0 * 1024.0 * 1024.0),
+                   report_.heldBack > 0 ? std::format(" ({} densifications held back by the budget)", report_.heldBack) : ""));
   std::string profile;
   double profileTotal = 0.0;
   for (const auto &[stage, ms] : trainer.timings()) {
     profile += std::format("{} {:.2f}, ", stage, ms);
     profileTotal += ms;
   }
-  std::println("GPU time per iteration: {:.1f} ms ({})", profileTotal, profile.substr(0, profile.size() > 2 ? profile.size() - 2 : 0));
-  if (densifyRounds > 0) {
-    std::println("Densification: {} rounds, {:.1f} s in total ({:.0f} ms each)", densifyRounds, densifySeconds, 1000.0 * densifySeconds / densifyRounds);
+  log_(std::format("GPU time per iteration: {:.1f} ms ({})", profileTotal, profile.substr(0, profile.size() > 2 ? profile.size() - 2 : 0)));
+  if (densifyRounds_ > 0) {
+    log_(std::format("Densification: {} rounds, {:.1f} s in total ({:.0f} ms each)", densifyRounds_, densifySeconds_,
+                     1000.0 * densifySeconds_ / densifyRounds_));
   }
-  if (pruneSeconds > 0.0) std::println("Pruning: {:.1f} s in total", pruneSeconds);
-  std::println("Finished in {:.1f} s ({:.1f} it/s) -> {}", seconds, report.iterationsPerSecond, options.out.string());
-  return report;
+  if (pruneSeconds_ > 0.0) log_(std::format("Pruning: {:.1f} s in total", pruneSeconds_));
+  log_(std::format("Finished in {:.1f} s ({:.1f} it/s) -> {}", trainingSeconds_, report_.iterationsPerSecond, options_.out.string()));
+  return report_;
+}
+
+TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
+  // Drawn from the first iteration on. Output in the meantime goes through it.
+  Progress bar("Train", static_cast<std::size_t>(options.iterations));
+  bool training = false;
+  TrainSession session(ctx, options, load_train_data(options), [&](const std::string &line) {
+    if (training) bar.message(line);
+    else std::println("{}", line);
+  });
+  training = true;
+  bar.start();
+  while (!session.finished()) {
+    const StepStats stats = session.step();
+    const int iteration = session.iteration();
+    if (iteration % 10 == 0 || session.finished()) {
+      bar.set(static_cast<std::size_t>(iteration), std::format("loss {:.4f}  {} Gaussians  {:.1f} it/s", stats.loss,
+                                                               session.trainer().gaussian_count(), iteration / std::max(session.training_seconds(), 1e-9)));
+    }
+  }
+  bar.finish();
+  training = false;
+  return session.finish();
 }
 
 } // namespace splat

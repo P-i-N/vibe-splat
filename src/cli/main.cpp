@@ -38,14 +38,31 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+// From kernel32, declared here rather than pulling in <windows.h>.
+extern "C" __declspec(dllimport) unsigned long __stdcall GetConsoleProcessList(unsigned long *list, unsigned long count);
+#endif
+
 namespace {
+
+// True when started by double-clicking (or dropping a file on) the program,
+// rather than from a terminal: then the console exists only for us.
+bool started_from_desktop() {
+#ifdef _WIN32
+  unsigned long processes[2];
+  return GetConsoleProcessList(processes, 2) == 1;
+#else
+  return false;
+#endif
+}
 
 constexpr std::string_view kUsage = R"(splat {} - Gaussian splat generator and viewer (Vulkan)
 
 Usage: splat <command> [options]
+       splat <scene.ply | project>   Same as 'splat view'
 
 Commands:
-  view <scene.ply|cgc>          Open the real-time viewer
+  view [scene | project]        Open the real-time viewer (scene: .ply or .cgc)
   render <scene.ply|cgc> -o <png>  Render one image without a window
   make-test-scene <out.ply|cgc> Write a synthetic scene for trying things out
   convert <in> <out>            Convert between .ply and compressed .cgc
@@ -123,7 +140,7 @@ train options (writes project/splat.ply and project/preview_*.png):
   --exposure              Learn each photo's exposure and white balance, for
                           photos or video whose exposure varies
   --gradient-threshold <x>  Lower adds more Gaussians (default 0.0002)
-  --vram-budget <GiB>     Default: 90% of the GPU's free memory
+  --vram-budget <GiB>     Default: 90% of the GPU's free memory (75% with --view)
   --max-gaussians <n>     Default: what the budget allows
   --prune <share>         Remove this share of Gaussians, those adding least, at the
                           end of densification and again halfway to the end, for a
@@ -169,18 +186,27 @@ train options (writes project/splat.ply and project/preview_*.png):
   --point-extent          Take the scene's extent from the sparse points, not the cameras
   --no-align              Save in the cameras' frame, rather than with the floor
                           level at y = 0 (-y up) under the scene's centre
+  --view                  Train in the viewer window, watching it as it goes
 
 make-test-views options:
   --count <n>             Number of images (default 12)
   --width <px>, --height <px>, --focal <px>   Default 640, 480, 500
 
-view options:
+view options (a project folder shows its splat.ply or splat.cgc, camera poses
+and sparse points, and can be trained from the window; drop files or folders on
+it too):
   --up <axis>             As for render
+  --no-vsync              Draw as fast as possible
 
-Viewer controls:
-  left mouse drag  look         right/middle drag  pan       wheel  zoom
-  W A S D / Q E    move         R  reset view                Esc    quit
-  gamepad: left stick move, right stick orbit, triggers zoom, A reset
+Viewer controls (H shows them in the window):
+  left mouse drag  look around  Ctrl+left drag  orbit        right/middle drag  pan
+  wheel            zoom         W A S D / Q E   move         F  frame  R  reset  T  turntable
+  1 / 2            splats / Gaussian centres                 Tab    hide UI
+  C / P / G        cameras / sparse points / grid            F12    screenshot
+  [ ]              look through the previous / next photo, X (hold) shows it
+  Space            pause training   Ctrl+S  save             Esc    quit
+  gamepad: left stick move, right stick orbit, triggers zoom, A reset,
+           LB/RB photos, Y hide UI
 
 Global options:
   --device <n>   Use Vulkan device n (see 'splat info')
@@ -343,18 +369,30 @@ int cmd_convert(const GlobalOptions &opts) {
 
 int cmd_view([[maybe_unused]] const GlobalOptions &opts) {
 #ifdef SPLAT_WITH_VIEWER
-  const splat::cli::Args args(opts.rest, {});
-  args.allow_only({"up"});
-  if (args.positionals().size() != 1) {
-    std::println(stderr, "Usage: splat view <scene.ply> [--up -y|+y|+z|-z]");
+  const splat::cli::Args args(opts.rest, {"--no-vsync"});
+  args.allow_only({"up", "no-vsync"});
+  if (args.positionals().size() > 1) {
+    std::println(stderr, "Usage: splat view [scene.ply | project folder] [--up -y|+y|+z|-z] [--no-vsync]");
     return 2;
   }
-  const auto cloud = load_scene(args.positionals()[0]);
   splat::ViewerOptions vo;
   vo.context = opts.context;
   vo.up = parse_up(args.get("up", "-y"));
-  vo.title = args.positionals()[0];
-  return splat::run_viewer(cloud, vo);
+  vo.vsync = !args.has("no-vsync");
+  // Without a path the window opens empty, for files dropped on it.
+  const std::filesystem::path path = args.positionals().empty() ? std::filesystem::path() : std::filesystem::path(args.positionals()[0]);
+  if (!path.empty() && std::filesystem::is_directory(path)) {
+    vo.project = path;
+    vo.scene = splat::project_scene(path);
+  } else if (!path.empty() && std::filesystem::exists(path)) {
+    vo.scene = path;
+    // A scene inside a project brings its camera poses along.
+    if (std::filesystem::exists(path.parent_path() / "sparse" / "0" / "images.bin")) vo.project = path.parent_path();
+  } else if (!path.empty()) {
+    std::println(stderr, "{} does not exist", path.string());
+    return 2;
+  }
+  return splat::run_viewer(vo);
 #else
   std::println(stderr, "This build of splat has no window viewer (built without SDL3). Use 'splat render'.");
   return 2;
@@ -486,11 +524,11 @@ int cmd_train(const GlobalOptions &opts) {
   for (auto &a : rest) {
     if (a == "-o") a = "--out";
   }
-  const splat::cli::Args args(rest, {"--no-densify", "--full-resolution", "--exposure", "--full-adam", "--significance-prune", "--point-extent", "--adaptive-schedule", "--mip-filter", "--mip-filter-2d", "--mip-filter-3d", "--edge-split", "--refine-poses", "--second-order", "--no-align"});
+  const splat::cli::Args args(rest, {"--no-densify", "--full-resolution", "--exposure", "--full-adam", "--significance-prune", "--point-extent", "--adaptive-schedule", "--mip-filter", "--mip-filter-2d", "--mip-filter-3d", "--edge-split", "--refine-poses", "--second-order", "--no-align", "--view"});
   args.allow_only({"out", "iterations", "lambda-ssim", "sh-degree", "max-size", "max-views", "holdout", "seed", "report-every", "save-every",
                    "no-densify", "densify", "gradient-threshold", "vram-budget", "max-gaussians", "prune", "full-resolution", "exposure", "full-adam",
                    "threshold-rise", "split-threshold", "dense-fraction", "densify-interval", "score-views", "score-min-pixels", "explore",
-                   "significance-prune", "point-extent", "adaptive-schedule", "max-growth", "opacity-reg", "scale-reg", "position-noise", "mip-filter", "mip-filter-2d", "mip-filter-3d", "edge-split", "recovery-prune", "sh-dropout", "refine-poses", "second-order", "dense-init", "no-align"});
+                   "significance-prune", "point-extent", "adaptive-schedule", "max-growth", "opacity-reg", "scale-reg", "position-noise", "mip-filter", "mip-filter-2d", "mip-filter-3d", "edge-split", "recovery-prune", "sh-dropout", "refine-poses", "second-order", "dense-init", "no-align", "view"});
   if (args.positionals().size() != 1) {
     std::println(stderr, "Usage: splat train <project> [options]  (see splat --help)");
     return 2;
@@ -544,6 +582,18 @@ int cmd_train(const GlobalOptions &opts) {
   options.secondOrder = args.has("second-order");
   options.densePoints = args.number<std::size_t>("dense-init", options.densePoints);
   options.alignFloor = !args.has("no-align");
+  if (args.has("view")) {
+#ifdef SPLAT_WITH_VIEWER
+    splat::ViewerOptions vo;
+    vo.context = opts.context;
+    vo.project = options.project;
+    vo.train = options;
+    return splat::run_viewer(vo);
+#else
+    std::println(stderr, "This build of splat has no window viewer (built without SDL3), so --view is not available.");
+    return 2;
+#endif
+  }
   splat::vk::Context ctx(opts.context);
   std::println("Device: {}", ctx.info().name);
   splat::run_train(ctx, options);
@@ -602,8 +652,12 @@ int main(int argc, char **argv) {
   }
 
   if (opts.command.empty()) {
-    std::print(kUsage, SPLAT_VERSION);
-    return 2;
+    if (started_from_desktop()) {
+      opts.command = "view";
+    } else {
+      std::print(kUsage, SPLAT_VERSION);
+      return 2;
+    }
   }
 
   try {
@@ -617,6 +671,11 @@ int main(int argc, char **argv) {
     if (opts.command == "render") return cmd_render(opts);
     if (opts.command == "make-test-scene") return cmd_make_test_scene(opts);
     if (opts.command == "convert") return cmd_convert(opts);
+    // A file or folder instead of a command: show it.
+    if (std::filesystem::exists(opts.command)) {
+      opts.rest.insert(opts.rest.begin(), opts.command);
+      return cmd_view(opts);
+    }
     std::println(stderr, "Unknown command '{}'. Run 'splat --help'.", opts.command);
     return 2;
   } catch (const splat::vk::Error &e) {

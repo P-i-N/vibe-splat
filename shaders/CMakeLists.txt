@@ -8,6 +8,11 @@ splat_add_shader_library(splat_shaders
     preprocess.comp
     splat.vert
     splat.frag
+    pack_gaussians.comp
+    debug_line.vert
+    debug_line.frag
+    imgui.vert
+    imgui.frag
     train_preprocess.comp
     train_bin_count.comp
     train_bin_emit.comp
