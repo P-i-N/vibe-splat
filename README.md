@@ -188,7 +188,9 @@ does automatic differentiation: each pass has a hand-derived counterpart.
   longest axis, in place of cloning and splitting) grows only to 86k Gaussians
   and reaches 22.6 dB at 170-190 it/s, and `--recovery-prune 0.2` (the least
   opaque fifth removed 300 iterations after each opacity reset) 24.15-24.2 dB
-  at 104-119 it/s, within noise of the default.
+  at 104-119 it/s, within noise of the default. `--sh-dropout 0.2` (Dropping
+  Anchor and Spherical Harmonics: a Gaussian keeps only its low SH degrees on
+  a fifth of the iterations): 24.1 dB, the same as without.
 - **Poses.** `--refine-poses` refines the training cameras along with the
   Gaussians. It helps when poses are a little off and costs a little when they
   are good, so it is off by default.
