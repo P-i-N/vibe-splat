@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 namespace splat {
@@ -24,7 +25,11 @@ namespace splat {
 // the image size so that small images are not given more than they can show.
 class GrowthBudget {
 public:
-  explicit GrowthBudget(std::size_t initial) : initial_(static_cast<double>(initial)), final_(5.0 * static_cast<double>(initial)) {}
+  // The final count is `factor` times the initial one, raised by what the
+  // scene asks for; a factor of 0 or less never caps.
+  explicit GrowthBudget(std::size_t initial, double factor = 5.0)
+      : initial_(static_cast<double>(initial)),
+        final_(factor > 0.0 ? factor * static_cast<double>(initial) : std::numeric_limits<double>::infinity()) {}
   // What the iteration at `progress` of training may have at 1 / factor of the image size.
   [[nodiscard]] std::size_t limit(double factor, double progress) const noexcept;
   // After a densification round, how many Gaussians it asked to add, allowed or not.

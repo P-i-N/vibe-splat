@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <limits>
 #include <complex>
 #include <numbers>
 
@@ -74,10 +75,14 @@ std::array<double, 2> resolution_switches(double full, double half, double quart
 }
 
 std::size_t GrowthBudget::limit(double factor, double progress) const noexcept {
+  if (std::isinf(final_)) return std::numeric_limits<std::size_t>::max();
   const double growth = (final_ - initial_) / std::pow(factor, 2.0 - progress);
   return static_cast<std::size_t>(initial_ + growth);
 }
 
-void GrowthBudget::observe(std::size_t wanted) noexcept { final_ = std::max(final_, 0.98 * final_ + static_cast<double>(wanted)); }
+void GrowthBudget::observe(std::size_t wanted) noexcept {
+  if (std::isinf(final_)) return;
+  final_ = std::max(final_, 0.98 * final_ + static_cast<double>(wanted));
+}
 
 } // namespace splat

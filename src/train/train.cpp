@@ -453,7 +453,7 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
   TrainReport report;
   LearningRates rates;
   const double positionStart = 1.6e-4 * extent, positionEnd = 1.6e-6 * extent;
-  GrowthBudget growth(startingPoints.size());
+  GrowthBudget growth(startingPoints.size(), options.maxGrowth);
   double lossSum = 0.0;
   int lossCount = 0;
   int lastOpacityReset = -kCheckpointRecovery;
@@ -612,9 +612,13 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
         const std::size_t level = coarse_level(iteration);
         const double factor = level == kCoarseLevels ? 1.0 : std::pow(2.0, static_cast<double>(level + 1));
         densifyOptions.maxGaussians = std::min(densifyOptions.maxGaussians, growth.limit(factor, progress));
+      } else {
+        // A fixed cap: on the bicycle scene quality saturates from about 5
+        // times the starting points, and 4 keeps 7000 iterations above 100 it/s.
+        densifyOptions.maxGaussians = std::min(densifyOptions.maxGaussians, growth.limit(1.0, 1.0));
       }
       const DensifyResult result = trainer.densify(densifyOptions, densifyRng);
-      growth.observe(result.cloned + result.split + result.heldBack);
+      if (options.adaptiveSchedule) growth.observe(result.cloned + result.split + result.heldBack);
       report.heldBack += result.heldBack;
       // Not on the last round: as in the paper, and the cloud would have
       // no densification left to recover with.

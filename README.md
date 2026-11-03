@@ -134,12 +134,16 @@ does automatic differentiation: each pass has a hand-derived counterpart.
   from matching patches along epipolar lines between the photos, checked in a
   third one (`--dense-init` sets how many, 0 turns it off). The idea is from
   EDGS, without its neural matcher.
-- **Coarse to fine.** Training starts on images at a quarter of their size,
-  then half, made by averaging 2x2 pixels, as the early iterations only need
-  the broad shapes. When to switch comes from how the photos' spectra fall off,
-  as in DashGaussian, and how many Gaussians are allowed grows with the size
-  (`--fixed-schedule` uses 15% and 35% with no such limit, `--full-resolution`
-  stays at full size).
+- **Coarse to fine.** Training starts on images at a quarter of their size
+  until 15% of the way through, then half until 35%, made by averaging 2x2
+  pixels, as the early iterations only need the broad shapes. The Gaussians may
+  grow to `--max-growth` times the starting points (4 by default), which keeps
+  7000 iterations on the bicycle scene above 100 it/s on a laptop; more adds
+  little (24.1 dB held out at 400k, 24.2 at 600k). `--adaptive-schedule`
+  instead switches sizes where the photos' spectra fall off and lets the count
+  grow with the size, as in DashGaussian: faster, but 0.7 dB worse on that
+  scene at 7000 iterations (23.4 dB), and the default until now.
+  `--full-resolution` stays at full size throughout.
 - **Exposure.** With `--exposure`, each training view also learns a 3x4
   colour transform that the loss compares its photo through, so that
   changes in exposure and white balance between photos, as auto exposure

@@ -321,6 +321,20 @@ TEST_CASE("Gaussians are allowed to grow with the image size", "[densify]") {
   CHECK(budget.final_count() == 0.98 * 5000.0 + 1000.0);
 }
 
+TEST_CASE("A growth factor sets the final count", "[densify]") {
+  GrowthBudget budget(1000, 8.0);
+  CHECK(budget.final_count() == 8000.0);
+  CHECK(budget.limit(1.0, 1.0) == 8000);
+}
+
+TEST_CASE("A growth factor of zero never caps", "[densify]") {
+  GrowthBudget budget(1000, 0.0);
+  CHECK(budget.limit(4.0, 0.0) == std::numeric_limits<std::size_t>::max());
+  budget.observe(5);
+  CHECK(budget.limit(1.0, 1.0) == std::numeric_limits<std::size_t>::max());
+  CHECK(std::isinf(budget.final_count()));
+}
+
 TEST_CASE("Patch matching finds points on a textured plane", "[densify]") {
   // Blobs on the plane z = 5, seen by cameras shifted sideways.
   std::mt19937 rng(11);

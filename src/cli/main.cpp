@@ -140,8 +140,11 @@ train options (writes project/splat.ply and project/preview_*.png):
                           ones at random (default 0)
   --significance-prune    Of the too transparent, remove the half adding least, and
                           remove none for their size
-  --fixed-schedule        Fixed coarse-to-fine sizes, rather than from the photos'
-                          spectra, and no limit growing with the image size
+  --adaptive-schedule     Coarse-to-fine sizes from the photos' spectra, with the
+                          Gaussians growing with the image size (DashGaussian),
+                          rather than at 15% and 35% of training
+  --max-growth <x>        Let the Gaussians grow to this multiple of the starting
+                          points (default 4, 0 no cap)
   --refine-poses          Refine the training cameras along with the Gaussians
   --second-order          After densification, step by estimated curvature, not Adam
   --dense-init <n>        Start from up to n more points than the sparse model has,
@@ -466,11 +469,11 @@ int cmd_train(const GlobalOptions &opts) {
   for (auto &a : rest) {
     if (a == "-o") a = "--out";
   }
-  const splat::cli::Args args(rest, {"--no-densify", "--full-resolution", "--exposure", "--full-adam", "--significance-prune", "--point-extent", "--fixed-schedule", "--refine-poses", "--second-order", "--no-align"});
+  const splat::cli::Args args(rest, {"--no-densify", "--full-resolution", "--exposure", "--full-adam", "--significance-prune", "--point-extent", "--adaptive-schedule", "--refine-poses", "--second-order", "--no-align"});
   args.allow_only({"out", "iterations", "lambda-ssim", "sh-degree", "max-size", "max-views", "holdout", "seed", "report-every", "save-every",
                    "no-densify", "gradient-threshold", "vram-budget", "max-gaussians", "prune", "full-resolution", "exposure", "full-adam",
                    "threshold-rise", "split-threshold", "dense-fraction", "densify-interval", "score-views", "score-min-pixels", "explore",
-                   "significance-prune", "point-extent", "fixed-schedule", "refine-poses", "second-order", "dense-init", "no-align"});
+                   "significance-prune", "point-extent", "adaptive-schedule", "max-growth", "refine-poses", "second-order", "dense-init", "no-align"});
   if (args.positionals().size() != 1) {
     std::println(stderr, "Usage: splat train <project> [options]  (see splat --help)");
     return 2;
@@ -504,7 +507,8 @@ int cmd_train(const GlobalOptions &opts) {
   options.explore = std::max(args.number("explore", options.explore), 0);
   options.significancePrune = args.has("significance-prune");
   options.pointExtent = args.has("point-extent");
-  options.adaptiveSchedule = !args.has("fixed-schedule");
+  options.adaptiveSchedule = args.has("adaptive-schedule");
+  options.maxGrowth = std::max(args.number("max-growth", options.maxGrowth), 0.0);
   options.refinePoses = args.has("refine-poses");
   options.secondOrder = args.has("second-order");
   options.densePoints = args.number<std::size_t>("dense-init", options.densePoints);

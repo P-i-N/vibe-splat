@@ -47,8 +47,12 @@ struct TrainOptions {
   int explore = 0;                // Random splits and random new Gaussians per round
   bool significancePrune = false; // Of the too transparent remove the half adding least, and none for size
   // Image sizes from the photos' spectra, Gaussians growing with the size, and
-  // the position rate held until full size (DashGaussian).
-  bool adaptiveSchedule = true;
+  // the position rate held until full size (DashGaussian). Off: it cost 0.7 dB
+  // on the bicycle scene at 7000 iterations against the fixed 15% and 35%.
+  bool adaptiveSchedule = false;
+  // The Gaussian count may grow to this multiple of the starting points (with
+  // the adaptive schedule, raised by what the scene asks for); 0: no such cap.
+  double maxGrowth = 4.0;
   // Refine each training view's camera along with the Gaussians, for poses that are a little off.
   bool refinePoses = false;
   std::size_t densePoints = 50000;  // Start from up to this many more points, by patch matching
