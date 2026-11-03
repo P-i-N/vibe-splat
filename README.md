@@ -175,10 +175,10 @@ does automatic differentiation: each pass has a hand-derived counterpart.
   bicycle scene at 7000 iterations against 24.1 dB held out at 107 it/s:
   `--opacity-reg 0.01 --scale-reg 0.01` (22.5-23.0 dB: with the opacity reset
   the penalties thin the cloud to 270k), `--densify mcmc` (relocation in place
-  of clone, split and prune: 23.2 dB, 76-83 it/s as the relocated Gaussians are
+  of clone, split and prune: 23.2 dB, 87 it/s as the relocated Gaussians are
   opaque and large), `--position-noise 5e5` on top (23.3 dB), and all of them
-  together (23.7 dB, 84-91 it/s). Its gains are reported at 30000 iterations;
-  at 7000 the relocation has not converged. Mip-Splatting's filters,
+  together (23.7 dB, 98 it/s). Its gains are reported at 30000 iterations; at
+  7000 the relocation has not converged. Mip-Splatting's filters,
   `--mip-filter` (both), `--mip-filter-2d` (a 0.1 pixel dilation with the
   opacity scaled to match) and `--mip-filter-3d` (each Gaussian widened to its
   smallest footprint in the photos, baked into saved scenes): 24.0-24.1 dB, the

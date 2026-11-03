@@ -647,19 +647,14 @@ TEST_CASE("Scoring a view accumulates the edge score", "[train][vulkan]") {
   for (std::size_t i = 0; i < 16; ++i) CHECK(scored.markedPixels[i] > 0.f);
 }
 
-TEST_CASE("SH dropout renders with the retained degrees only", "[train][vulkan]") {
+TEST_CASE("SH dropout trains with the retained degrees only and never renders with them", "[train][vulkan]") {
   vk::Context *ctx = test::context();
   if (ctx == nullptr) SKIP("No usable Vulkan device");
   const Camera camera = test_camera(72, 56);
   const auto target = noise_target(camera.width, camera.height, 17);
   const GaussianCloud cloud = random_cloud(300, 3, 7);
-  GaussianCloud truncated = cloud; // The same with every coefficient above degree 0 zeroed
   const auto coefficients = static_cast<std::size_t>(cloud.shCoeffs());
-  for (std::size_t i = 0; i < cloud.size(); ++i) {
-    std::fill_n(truncated.sh.begin() + static_cast<std::ptrdiff_t>((i * coefficients + 1) * 3), (coefficients - 1) * 3, 0.f);
-  }
   const ReferenceImage full = reference_render(cloud, camera, {});
-  const ReferenceImage degree0 = reference_render(truncated, camera, {});
   const auto worst_against = [&](const std::vector<float> &gpu, const ReferenceImage &cpu) {
     double worst = 0.0;
     for (std::size_t i = 0; i < cpu.rgb.size(); ++i) {
@@ -667,29 +662,43 @@ TEST_CASE("SH dropout renders with the retained degrees only", "[train][vulkan]"
     }
     return worst;
   };
+  const auto higher_degrees_touched = [&](const Trainer::Gradients &g) {
+    std::size_t touched = 0;
+    for (std::size_t i = 0; i < cloud.size(); ++i) {
+      bool any = false;
+      for (std::size_t k = 1; k < coefficients; ++k) {
+        for (int c = 0; c < 3; ++c) any = any || g.sh[(i * coefficients + k) * 3 + static_cast<std::size_t>(c)] != 0.f;
+      }
+      touched += any ? 1 : 0;
+    }
+    return touched;
+  };
 
   Trainer trainer(*ctx, cloud);
   trainer.set_active_sh_degree(3);
-  trainer.set_sh_dropout(1.f, 0, 1); // Every Gaussian keeps degree 0 only
-  CHECK(worst_against(trainer.render(camera), degree0) < 1e-3);
-  trainer.set_sh_dropout(0.f, 0, 1); // Off again
-  CHECK(worst_against(trainer.render(camera), full) < 1e-3);
+  LearningRates rates;
+  rates.position = 0.f; // Nothing moves, so the renders below stay comparable
+  rates.scale = rates.rotation = rates.opacity = rates.sh = 0.f;
 
-  // With half the Gaussians dropped, their higher coefficients get no gradient and the others do.
+  // Dropout on every Gaussian: a training step trains degree 0 only, but
+  // rendering, as the reports and the final evaluation do, still shows everything.
+  trainer.set_sh_dropout(1.f, 0, 1);
+  CHECK(worst_against(trainer.render(camera), full) < 1e-3);
+  trainer.step(camera, target, rates);
+  CHECK(higher_degrees_touched(trainer.gradients()) == 0);
+  trainer.compute_gradients(camera, target); // Statistics for densification: not training, not dropped
+  CHECK(higher_degrees_touched(trainer.gradients()) > 250);
+
+  // Half the Gaussians: about half keep their higher degrees in a step.
   trainer.set_sh_dropout(0.5f, 0, 9);
-  trainer.compute_gradients(camera, target);
-  const auto g = trainer.gradients();
-  std::size_t dropped = 0, kept = 0;
-  for (std::size_t i = 0; i < cloud.size(); ++i) {
-    bool anyHigher = false;
-    for (std::size_t k = 1; k < coefficients; ++k) {
-      for (int c = 0; c < 3; ++c) anyHigher = anyHigher || g.sh[(i * coefficients + k) * 3 + static_cast<std::size_t>(c)] != 0.f;
-    }
-    (anyHigher ? kept : dropped) += 1;
-  }
-  std::println("  SH dropout at 0.5: {} Gaussians kept their higher degrees, {} dropped them", kept, dropped);
-  CHECK(dropped > 100);
+  trainer.step(camera, target, rates);
+  const std::size_t kept = higher_degrees_touched(trainer.gradients());
+  std::println("  SH dropout at 0.5: {} of {} Gaussians kept their higher degrees in a step", kept, cloud.size());
   CHECK(kept > 100);
+  CHECK(kept < 200);
+  trainer.set_sh_dropout(0.f, 0, 1);
+  trainer.step(camera, target, rates);
+  CHECK(higher_degrees_touched(trainer.gradients()) > 250);
 }
 
 TEST_CASE("Pose gradients match finite differences of the loss", "[train][vulkan]") {

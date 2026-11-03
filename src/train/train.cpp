@@ -426,12 +426,28 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
 
   // A view that does not fit gives up its largest Gaussians, rather than the
   // run ending. They grow back where they are needed, within the budget.
+  // Mip-Splatting's 3D smoothing filter, from the training cameras of the
+  // current image size; recomputed after every change of the cloud or the size.
+  std::vector<float> filter3d;
+  constexpr std::size_t kFilterStale = ~std::size_t{0}; // Also after any change of the count outside a round
+  std::size_t filterLevel = kFilterStale;
+  int currentIteration = 1;
+  const auto refresh_filter = [&](int iteration) {
+    if (!options.mipFilter3d) return;
+    std::vector<Camera> cameras;
+    cameras.reserve(trainViews.size());
+    for (std::size_t i = 0; i < trainViews.size(); ++i) cameras.push_back(view_at(i, iteration).camera);
+    filter3d = smoothing_filter(trainer.cloud(), cameras);
+    trainer.set_filter3d(filter3d);
+    filterLevel = coarse_level(iteration);
+  };
   const auto fitting = [&](auto &&work) {
     for (;;) {
       try {
         return work();
       } catch (const BudgetExceeded &e) {
         const std::size_t removed = trainer.remove_largest_gaussians(0.05);
+        filterLevel = kFilterStale;
         bar.message(std::format("  {}: removed the {} largest Gaussians", e.what(), removed));
         if (removed == 0) throw;
       }
@@ -473,22 +489,10 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
   // CGC refuses NaN and infinity, which a few Gaussians can pick up after
   // densification has stopped pruning them, so those are left out of CGC files.
   // Returns how the floor was found, or nothing if it was not looked for.
-  // Mip-Splatting's 3D smoothing filter, from the training cameras of the
-  // current image size; recomputed after every change of the cloud or the size.
-  std::vector<float> filter3d;
-  std::size_t filterLevel = ~std::size_t{0};
-  const auto refresh_filter = [&](int iteration) {
-    if (!options.mipFilter3d) return;
-    std::vector<Camera> cameras;
-    cameras.reserve(trainViews.size());
-    for (std::size_t i = 0; i < trainViews.size(); ++i) cameras.push_back(view_at(i, iteration).camera);
-    filter3d = smoothing_filter(trainer.cloud(), cameras);
-    trainer.set_filter3d(filter3d);
-    filterLevel = coarse_level(iteration);
-  };
   const auto save_output = [&](const fs::path &path, const CgcOptions &cgcOptions) {
+    if (options.mipFilter3d && (filterLevel == kFilterStale || filter3d.size() != trainer.gaussian_count())) refresh_filter(currentIteration);
     GaussianCloud cloud = trainer.cloud();
-    if (options.mipFilter3d && filter3d.size() == cloud.size()) bake_filter(cloud, filter3d);
+    if (options.mipFilter3d) bake_filter(cloud, filter3d);
     const CloudFormat format = cloud_format(options.out);
     if (format == CloudFormat::Cgc) {
       if (const std::size_t removed = remove_non_finite(cloud); removed > 0) {
@@ -525,6 +529,7 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
       std::shuffle(order.begin(), order.end(), rng);
     }
     const View &nextView = view_at(order.back(), iteration + 1);
+    currentIteration = iteration;
     if (options.mipFilter3d && coarse_level(iteration) != filterLevel) refresh_filter(iteration);
 
     const double progress = static_cast<double>(iteration - 1) / std::max(options.iterations - 1, 1);
@@ -594,6 +599,7 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
         }
       }
       const std::size_t removed = trainer.remove_least_contributing_gaussians(options.pruneShare);
+      filterLevel = kFilterStale;
       const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - pruneStart).count();
       pruneSeconds += seconds;
       bar.message(std::format("  iteration {}: removed {} of {} Gaussians, those adding least to the views ({:.1f} s)", iteration, removed,
@@ -620,7 +626,7 @@ TrainReport run_train(vk::Context &ctx, const TrainOptions &options) {
       densifyOptions.maxGaussians = available > pixelBytes ? static_cast<std::size_t>(static_cast<double>(available - pixelBytes) / perGaussian) : 0;
       if (options.maxGaussians > 0) densifyOptions.maxGaussians = std::min(densifyOptions.maxGaussians, options.maxGaussians);
       const auto densifyStart = std::chrono::steady_clock::now();
-      if (options.scoreViews > 0) {
+      if (options.scoreViews > 0 && options.densifyMode == TrainOptions::DensifyMode::Adc) { // Scores play no part in relocation
         densifyOptions.scoredViews = options.scoreViews;
         densifyOptions.minMarkedPixels = options.scoreMinPixels;
         std::uniform_int_distribution<std::size_t> pick(0, trainViews.size() - 1);

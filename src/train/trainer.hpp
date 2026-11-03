@@ -210,7 +210,8 @@ private:
   std::uint32_t shFloats_ = 3;
   int activeShDegree_ = 0;
   std::uint32_t adamStep_ = 0;
-  float shDropout_ = 0.f;
+  float shDropout_ = 0.f;      // As set
+  float dropoutNow_ = 0.f;     // What the kernels of the current submission use: shDropout_ for a training step, 0 otherwise
   std::uint32_t shRetained_ = 0, shSeed_ = 0;
   bool fixedPoint_ = false;
   int width_ = 0, height_ = 0;

@@ -341,7 +341,7 @@ std::uint32_t Trainer::record_prepare() {
                          {groups_[0]->values.get(), groups_[1]->values.get(), groups_[2]->values.get(),
                           groups_[3]->values.get(), groups_[4]->values.get(), camera_.get(), splats_.get(), keys_.get(),
                           values_.get(), filter3d_.get()},
-                         PreprocessPush{options_.mipFilter2d ? 1u : 0u, shDropout_, shRetained_, shSeed_}, vk::div_up(count_, 256));
+                         PreprocessPush{options_.mipFilter2d ? 1u : 0u, dropoutNow_, shRetained_, shSeed_}, vk::div_up(count_, 256));
     vk::compute_barrier(cmd);
     mark(cmd, "project");
     sorter_.record(cmd, *keys_, *values_, *tmpKeys_, *tmpValues_, count_);
@@ -454,7 +454,7 @@ void Trainer::record_backward_from_adjoint(VkCommandBuffer cmd) {
                       groups_[4]->values.get(), camera_.get(), rawGradients_.get(), groups_[0]->gradients.get(),
                       groups_[1]->gradients.get(), groups_[2]->gradients.get(), groups_[3]->gradients.get(), groups_[4]->gradients.get(),
                       splats_.get(), stats_.get(), filter3d_.get()},
-                     GradientPush{options_.opacityReg / static_cast<float>(count_), options_.scaleReg / static_cast<float>(count_), options_.mipFilter2d ? 1u : 0u, shDropout_, shRetained_, shSeed_},
+                     GradientPush{options_.opacityReg / static_cast<float>(count_), options_.scaleReg / static_cast<float>(count_), options_.mipFilter2d ? 1u : 0u, dropoutNow_, shRetained_, shSeed_},
                      vk::div_up(count_, 256));
   vk::compute_barrier(cmd);
   if (options_.poseGradients) {
@@ -466,6 +466,7 @@ void Trainer::record_backward_from_adjoint(VkCommandBuffer cmd) {
 
 std::vector<float> Trainer::render(const Camera &camera) {
   upload_camera(camera);
+  dropoutNow_ = 0.f; // Reports and evaluation see the whole model
   const std::uint32_t entries = record_prepare();
   ctx_.submit_and_wait([&](VkCommandBuffer cmd) {
     begin_timing(cmd);
@@ -528,6 +529,7 @@ void Trainer::prefetch_target(std::span<const std::uint8_t> target) {
 
 StepStats Trainer::run(const Camera &camera, std::span<const std::uint8_t> target, const LearningRates *rates, std::span<const std::uint8_t> nextTarget) {
   upload_camera(camera);
+  dropoutNow_ = rates != nullptr ? shDropout_ : 0.f; // Dropout trains; scoring and statistics see the whole model
   const std::size_t bytes = static_cast<std::size_t>(width_) * height_ * 4;
   if (target.size() != bytes) throw std::runtime_error("the target image does not match the camera");
   if (prefetched_ == target.data() && prefetchedBytes_ == bytes) {

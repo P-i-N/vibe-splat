@@ -276,15 +276,22 @@ before the ladder was the adaptive schedule with growth 5: 23.42 / 23.44 dB,
 | 0 | fixed, 400k / 450k / 500k / 600k | 24.08 / 24.14 / 24.19 / 24.23 | | 104 / 102 / 93 / 91 | |
 | 0 | **fixed, growth 4 (new default)** | **24.11, 24.10** | **417k** | **107-117** | **yes** |
 | 1 | `--opacity-reg 0.01 --scale-reg 0.01` | 22.98 / 22.52 | 270k | 104-110 | no |
-| 1 | `--densify mcmc` | 23.19 / 23.18 | 417k | 76-83 | no |
+| 1 | `--densify mcmc` | 23.19 / 23.18, 23.21 after the fix below | 417k | 76-83, 87 after | no |
 | 1 | `--densify mcmc --position-noise 5e5` | 23.31 / 23.27 | 417k | 76-90 | no |
-| 1 | all four | 23.72 / 23.70 | 417k | 84-91 | no |
+| 1 | all four | 23.72 / 23.70, 23.69 after | 417k | 84-91, 98 after | no |
 | 2 | `--mip-filter` | 24.02 / 24.07 | 417k | 95-98 | no |
 | 2 | `--mip-filter-2d` / `--mip-filter-3d` | 24.08 / 24.09 | 417k | 108 / 96 | no |
 | 3 | `--edge-split` | 22.65 / 22.63 | 86k | 168-184 | no |
 | 3 | `--recovery-prune 0.2` | 24.15 / 24.20 | 405k | 104-119 | no |
 | 3 | both | 22.62 / 22.55 | 70k | 177-190 | no |
-| 4 | `--sh-dropout 0.2` | 24.08 / 24.09 | 417k | 116 | no |
+| 4 | `--sh-dropout 0.2` | 24.08 / 24.09 (mask on at evaluation), 24.08 / 24.10 after the fix | 417k | 104-116 | no |
+
+A final review found three faults, fixed in the branch: SH dropout was still
+applied in the reports and the final evaluation (it now applies to training
+steps only; rung 4 re-measured, unchanged), the FastGS scoring pass still ran
+under `--densify mcmc` (now gated; MCMC re-measured at 87 and 98 it/s, same
+PSNR), and `--mip-filter-3d` lost its filter after `--prune` or a budget
+recovery (now refreshed before the next step and before any save).
 
 The ladder's gain is rung 0's 0.7 dB, from the fixed 15% / 35% coarse-to-fine
 schedule in place of the adaptive one. Every technique from the literature
