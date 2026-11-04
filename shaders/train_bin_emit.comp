@@ -13,7 +13,7 @@ layout(std430, binding = 3) readonly buffer Offsets { uint offsets[]; };
 layout(std430, binding = 4) writeonly buffer EntryKeys { uint entryKeys[]; };
 layout(std430, binding = 5) writeonly buffer EntryValues { uint entryValues[]; };
 
-layout(push_constant) uniform Push { uint count; uint gridW; } pc;
+layout(push_constant) uniform Push { uint count; uint gridW; uint gridH; } pc;
 
 void main() {
   const uint r = gl_GlobalInvocationID.x;
@@ -22,7 +22,7 @@ void main() {
   }
   const uint splat = values[r];
   const TrainSplat s = splats[splat];
-  const uvec4 t = s.tiles;
+  const uvec4 t = splat_tiles(s, uvec2(pc.gridW, pc.gridH));
   uint slot = offsets[r];
   for (uint y = t.y; y <= t.w; ++y) {
     for (uint x = t.x; x <= t.z; ++x) {

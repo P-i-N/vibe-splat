@@ -132,7 +132,7 @@ void main() {
 
         // At the 0.99 clamp, alpha no longer depends on the parameters.
         if (s.conicOpacity.w * exp(power) < 0.99) {
-          const float dAlpha = T * dot(A, s.color.rgb - B);
+          const float dAlpha = T * dot(A, s.colorRadius.rgb - B);
           g[0] = dAlpha * exp(power);
           const float dPower = dAlpha * alpha;
           const vec2 v = vec2(q.x * d.x + q.y * d.y, q.y * d.x + q.z * d.y);
@@ -146,7 +146,7 @@ void main() {
         }
         any = true;
 
-        B = mix(B, s.color.rgb, alpha);
+        B = mix(B, s.colorRadius.rgb, alpha);
         logBehind += logRest;
       }
       // Uniform within the subgroup, as the reduction must be.

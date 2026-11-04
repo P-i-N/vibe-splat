@@ -122,15 +122,11 @@ void main() {
   const float reach = 2.0 * log(255.0 * opacityUsed);
   const vec2 extent = min(vec2(sqrt(reach * a), sqrt(reach * c)), vec2(radius));
 
-  const float gridW = ceil(cam.viewport.x / float(TILE_SIZE)), gridH = ceil(cam.viewport.y / float(TILE_SIZE));
-  const float size = float(TILE_SIZE);
-  splats[i].centerRadius = vec4(center, radius, t.z);
-  splats[i].conicOpacity = vec4(vec3(c, -b, a) / det, opacityUsed);
-  splats[i].color = vec4(max(color, vec3(0.0)), 1.0);
-  splats[i].extent = vec4(extent, 0.0, 0.0);
-  splats[i].tiles = uvec4(uint(clamp(floor((center.x - extent.x - 1.0) / size), 0.0, gridW - 1.0)),
-                          uint(clamp(floor((center.y - extent.y - 1.0) / size), 0.0, gridH - 1.0)),
-                          uint(clamp(floor((center.x + extent.x + 1.0) / size), 0.0, gridW - 1.0)),
-                          uint(clamp(floor((center.y + extent.y + 1.0) / size), 0.0, gridH - 1.0)));
+  TrainSplat splat;
+  splat.conicOpacity = vec4(vec3(c, -b, a) / det, opacityUsed);
+  splat.colorRadius = vec4(max(color, vec3(0.0)), radius);
+  splat.center = center;
+  splat.extent = extent;
+  splats[i] = splat;
   keys[i] = 0xFFFFFFFFu - floatBitsToUint(t.z);
 }

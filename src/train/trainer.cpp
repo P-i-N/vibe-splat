@@ -36,16 +36,15 @@ struct GpuCamera {
 static_assert(sizeof(GpuCamera) == 128);
 
 struct GpuSplat {
-  float data[16];
-  std::uint32_t tiles[4];
+  float data[12];
 };
-static_assert(sizeof(GpuSplat) == 80);
+static_assert(sizeof(GpuSplat) == 48);
 
 struct CountPush {
   std::uint32_t count;
 };
-struct EmitPush {
-  std::uint32_t count, gridW;
+struct BinPush {
+  std::uint32_t count, gridW, gridH;
 };
 struct TilePush {
   std::uint32_t width, height, gridW, tileCount;
@@ -99,7 +98,7 @@ struct AdamPush {
   float learningRate, beta1, beta2, epsilon, correction1, correction2;
   std::uint32_t dcStride;
   float restScale;
-  std::uint32_t selective;
+  std::uint32_t selective, seed;
 };
 struct HutchinsonPush {
   std::uint32_t pixels, seed;
@@ -114,8 +113,11 @@ struct SecondOrderPush {
   std::uint32_t kind, stride;
 };
 struct GatherPush {
-  std::uint32_t count, stride;
+  std::uint32_t count, stride, halves;
 };
+
+// Bytes of n bfloat16 values, two to a word (shaders/bf16.glsl).
+VkDeviceSize bf16_bytes(std::size_t n) { return VkDeviceSize{(n + 1) / 2} * 4; }
 
 std::unique_ptr<Buffer> gpu_buffer(vk::Context &ctx, VkDeviceSize bytes) {
   return std::make_unique<Buffer>(ctx, std::max<VkDeviceSize>(bytes, 4), kStorage, MemoryUsage::GpuOnly);
@@ -152,8 +154,8 @@ struct Trainer::Group {
     values = gpu_buffer(ctx, bytes);
     values->upload(ctx, initial);
     gradients = gpu_buffer(ctx, bytes);
-    first = gpu_buffer(ctx, bytes);
-    second = gpu_buffer(ctx, bytes);
+    first = gpu_buffer(ctx, bf16_bytes(initial.size()));
+    second = gpu_buffer(ctx, bf16_bytes(initial.size()));
     ctx.submit_and_wait([&](VkCommandBuffer cmd) {
       clear(cmd, *first);
       clear(cmd, *second);
@@ -164,8 +166,8 @@ struct Trainer::Group {
 
 Trainer::Trainer(vk::Context &ctx, const GaussianCloud &initial, const TrainerOptions &options)
     : ctx_(ctx), options_(options), preprocess_(ctx, shaders::train_preprocess_comp, 10, sizeof(PreprocessPush)),
-      binCount_(ctx, shaders::train_bin_count_comp, 5, sizeof(CountPush)),
-      binEmit_(ctx, shaders::train_bin_emit_comp, 6, sizeof(EmitPush)),
+      binCount_(ctx, shaders::train_bin_count_comp, 5, sizeof(BinPush)),
+      binEmit_(ctx, shaders::train_bin_emit_comp, 6, sizeof(BinPush)),
       tileRanges_(ctx, shaders::train_tile_ranges_comp, 2, sizeof(CountPush)),
       forward_(ctx, shaders::train_forward_comp, 5, sizeof(TilePush)),
       exposure_(ctx, shaders::train_exposure_comp, 2, sizeof(ExposurePush)),
@@ -348,7 +350,7 @@ std::uint32_t Trainer::record_prepare() {
     vk::compute_barrier(cmd);
     mark(cmd, "depth sort");
     binCount_.dispatch(cmd, {keys_.get(), values_.get(), splats_.get(), coverage_.get(), counters_.get()},
-                       CountPush{count_}, vk::div_up(count_, 256));
+                       BinPush{count_, gridW_, tileCount_ / gridW_}, vk::div_up(count_, 256));
     vk::compute_barrier(cmd);
     sorter_.record_scan(cmd, *coverage_, count_);
     vk::compute_barrier(cmd);
@@ -386,7 +388,7 @@ void Trainer::record_forward(VkCommandBuffer cmd, std::uint32_t entries) {
   vk::compute_barrier(cmd);
   if (entries > 0) {
     binEmit_.dispatch(cmd, {keys_.get(), values_.get(), splats_.get(), coverage_.get(), entryKeys_.get(), entryValues_.get()},
-                      EmitPush{count_, gridW_}, vk::div_up(count_, 256));
+                      BinPush{count_, gridW_, tileCount_ / gridW_}, vk::div_up(count_, 256));
     vk::compute_barrier(cmd);
     sorter_.record(cmd, *entryKeys_, *entryValues_, *tmpEntryKeys_, *tmpEntryValues_, entries, 16);
     vk::compute_barrier(cmd);
@@ -615,14 +617,15 @@ void Trainer::record_adam(VkCommandBuffer cmd, const LearningRates &rates) {
       const SecondOrderPush push{floats, kBeta1, correction1, 1.f / (1.f - std::pow(kCurvatureBeta, static_cast<float>(std::max(curvatureUpdates_, 1u)))),
                                  rates.trustRegion, kinds[g], strides[g]};
       secondOrder_.dispatch(cmd, {group.values.get(), group.gradients.get(), group.first.get(), group.curvature.get(), groups_[1]->values.get(),
-                                  groups_[3]->values.get(), groups_[4]->values.get()}, push, vk::div_up(floats, 256));
+                                  groups_[3]->values.get(), groups_[4]->values.get()}, push, vk::div_up(vk::div_up(floats, 2u), 256u));
       // The next group reads what this one wrote.
       vk::compute_barrier(cmd);
       continue;
     }
     const AdamPush push{floats, learning[g], kBeta1, kBeta2, kEpsilon, correction1, correction2,
-                        g == 4 ? shFloats_ : 0u, rates.shRestScale, options_.selectiveAdam ? 1u : 0u};
-    adam_.dispatch(cmd, {group.values.get(), group.gradients.get(), group.first.get(), group.second.get()}, push, vk::div_up(floats, 256));
+                        g == 4 ? shFloats_ : 0u, rates.shRestScale, options_.selectiveAdam ? 1u : 0u, adamStep_};
+    adam_.dispatch(cmd, {group.values.get(), group.gradients.get(), group.first.get(), group.second.get()}, push,
+                   vk::div_up(vk::div_up(floats, 2u), 256u));
   }
   vk::compute_barrier(cmd);
   mark(cmd, "adam");
@@ -754,10 +757,11 @@ void Trainer::apply_changes(const DensifyResult &result) {
     }
     sourceTable.flush();
   }
-  const auto gather = [&](std::unique_ptr<Buffer> &from, std::uint32_t floats, std::uint32_t stride) {
-    std::unique_ptr<Buffer> to = gpu_buffer(ctx_, VkDeviceSize{floats} * sizeof(float));
+  const auto gather = [&](std::unique_ptr<Buffer> &from, std::uint32_t floats, std::uint32_t stride, bool halves = false) {
+    std::unique_ptr<Buffer> to = gpu_buffer(ctx_, halves ? bf16_bytes(floats) : VkDeviceSize{floats} * sizeof(float));
+    const std::uint32_t words = halves ? vk::div_up(floats, 2u) : floats;
     ctx_.submit_and_wait([&](VkCommandBuffer cmd) {
-      gather_.dispatch(cmd, {&sourceTable, from.get(), to.get()}, GatherPush{floats, stride}, vk::div_up(floats, 256));
+      gather_.dispatch(cmd, {&sourceTable, from.get(), to.get()}, GatherPush{floats, stride, halves ? 1u : 0u}, vk::div_up(words, 256u));
       vk::compute_barrier(cmd);
     });
     from.reset();
@@ -768,8 +772,8 @@ void Trainer::apply_changes(const DensifyResult &result) {
     const auto floats = static_cast<std::uint32_t>(newValues[g]->size());
     auto moved = std::make_unique<Group>();
     if (groups_[g]->curvature) moved->curvature = gather(groups_[g]->curvature, floats, stride);
-    moved->first = gather(groups_[g]->first, floats, stride);
-    moved->second = gather(groups_[g]->second, floats, stride);
+    moved->first = gather(groups_[g]->first, floats, stride, true);
+    moved->second = gather(groups_[g]->second, floats, stride, true);
     groups_[g].reset();
     moved->values = gpu_buffer(ctx_, VkDeviceSize{floats} * sizeof(float));
     moved->values->upload(ctx_, std::span<const float>(*newValues[g]));
@@ -814,8 +818,12 @@ void Trainer::reset_opacity(float maximum) {
 }
 
 std::uint64_t Trainer::bytes_per_gaussian() const noexcept {
-  const std::uint64_t parameters = (3 + 3 + 4 + 1 + shFloats_) * sizeof(float) * (groups_[0]->curvature ? 5 : 4); // Value, gradient, 2 moments, curvature
-  return parameters + sizeof(GpuSplat) + 4 * 5 + kRawGradientsPerSplat * sizeof(float) + 32;
+  const std::uint64_t floats = 3 + 3 + 4 + 1 + shFloats_;
+  // Value and gradient as floats, the moments in bfloat16, and the curvature
+  // of all but the rotation when second-order steps are on.
+  const std::uint64_t parameters = floats * (2 * sizeof(float) + 2 * 2) + (groups_[0]->curvature ? (floats - 4) * sizeof(float) : 0);
+  // Sort keys and values with their copies, coverage and the 3D filter, then the backward sums and the densification stats.
+  return parameters + sizeof(GpuSplat) + 4 * 6 + kRawGradientsPerSplat * sizeof(float) + 32;
 }
 
 std::uint64_t Trainer::gpu_bytes() const {

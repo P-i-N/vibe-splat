@@ -13,7 +13,7 @@ layout(std430, binding = 2) readonly buffer Splats { TrainSplat splats[]; };
 layout(std430, binding = 3) writeonly buffer Coverage { uint coverage[]; };
 layout(std430, binding = 4) buffer Counters { uint visible; uint total; } counters;
 
-layout(push_constant) uniform Push { uint count; } pc;
+layout(push_constant) uniform Push { uint count; uint gridW; uint gridH; } pc;
 
 void main() {
   const uint r = gl_GlobalInvocationID.x;
@@ -25,7 +25,7 @@ void main() {
     return;
   }
   const TrainSplat s = splats[values[r]];
-  const uvec4 t = s.tiles;
+  const uvec4 t = splat_tiles(s, uvec2(pc.gridW, pc.gridH));
   uint n = 0u;
   for (uint y = t.y; y <= t.w; ++y) {
     for (uint x = t.x; x <= t.z; ++x) {
