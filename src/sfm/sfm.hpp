@@ -32,7 +32,7 @@ enum class Matcher {
 
 struct SfmOptions {
   std::filesystem::path project;
-  int maxFeatures = 4000; // Per image
+  int maxFeatures = 0; // Per image; 0 picks 8192 for images up to 1600 pixels across, more for larger ones (up to 16384)
   Matcher matcher = Matcher::Auto;
   int window = 8;  // Neighbours per image for the sequential matcher
   int threads = 0; // 0 uses all cores

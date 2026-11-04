@@ -670,3 +670,126 @@ TEST_CASE("Mutual nearest neighbours and the ratio test on a tiny set", "[sfm][f
   CHECK(matches[0] == std::pair{0, 0});
   CHECK(matches[1] == std::pair{3, 3});
 }
+
+namespace {
+
+void add_descriptor(ImageFeatures &f, const std::vector<float> &d) {
+  f.keypoints.push_back({});
+  float norm = 0.f;
+  for (const float v : d) norm += v * v;
+  for (const float v : d) f.descriptors.push_back(v / std::sqrt(norm));
+}
+
+// x_b^T E x_a = 0 for b = R a + t.
+Eigen::Matrix3d essential_of(const Eigen::Matrix3d &R, const Eigen::Vector3d &t) {
+  Eigen::Matrix3d tx;
+  tx << 0.0, -t.z(), t.y(), t.z(), 0.0, -t.x(), -t.y(), t.x(), 0.0;
+  return tx * R;
+}
+
+} // namespace
+
+TEST_CASE("Guided matching settles repeated patterns along epipolar lines", "[sfm][features]") {
+  // A sideways step: epipolar lines are horizontal, y_b = y_a.
+  const Eigen::Matrix3d E = essential_of(Eigen::Matrix3d::Identity(), Eigen::Vector3d(1.0, 0.0, 0.0));
+  // b's descriptors differ a little from a's, as they would in a real photo.
+  auto hot = [](int index, float spread = 0.02f) {
+    std::vector<float> d(static_cast<std::size_t>(kDescriptorSize), spread);
+    d[static_cast<std::size_t>(index)] = 1.f;
+    return d;
+  };
+  ImageFeatures a, b;
+  std::vector<Eigen::Vector2d> pa, pb;
+  add_descriptor(a, hot(5)), pa.emplace_back(0.1, 0.2);  // Two copies in b, one on its line
+  add_descriptor(a, hot(0)), pa.emplace_back(0.0, -0.3); // A unique match on its line
+  add_descriptor(a, hot(9)), pa.emplace_back(0.3, 0.4);  // Its twin in b is off the line
+  add_descriptor(b, hot(5, 0.04f)), pb.emplace_back(-0.2, 0.2);
+  add_descriptor(b, hot(5, 0.04f)), pb.emplace_back(0.0, -0.1);
+  add_descriptor(b, hot(0, 0.04f)), pb.emplace_back(0.2, -0.3);
+  add_descriptor(b, hot(9, 0.04f)), pb.emplace_back(0.0, 0.0);
+
+  // Against the whole image, the repeated pattern fails the ratio test.
+  const auto plain = match_features(a, b);
+  CHECK(std::find(plain.begin(), plain.end(), std::pair{0, 0}) == plain.end());
+  CHECK(std::find(plain.begin(), plain.end(), std::pair{2, 3}) != plain.end());
+
+  const auto guided = match_features_guided(a, b, pa, pb, E, 0.01, 0.01);
+  REQUIRE(guided.size() == 2);
+  CHECK(guided[0] == std::pair{0, 0});
+  CHECK(guided[1] == std::pair{1, 2});
+}
+
+TEST_CASE("Guided matching finds what a search of every pair finds", "[sfm][features]") {
+  // Descriptors drawn around a few shared directions, so features have many
+  // look-alikes and the ratio test has work to do; positions spread over a
+  // wide image. The grid search must give exactly what checking every pair
+  // gives.
+  std::mt19937 rng(7);
+  std::normal_distribution<float> noise(0.f, 1.f);
+  std::uniform_real_distribution<double> position(-0.8, 0.8);
+  std::vector<std::vector<float>> palette(12);
+  for (auto &p : palette) {
+    p.resize(static_cast<std::size_t>(kDescriptorSize));
+    for (float &v : p) v = std::abs(noise(rng));
+  }
+  auto draw = [&] {
+    std::vector<float> d = palette[static_cast<std::size_t>(rng() % palette.size())];
+    for (float &v : d) v = std::max(0.f, v + 0.15f * noise(rng));
+    return d;
+  };
+  ImageFeatures a, b;
+  std::vector<Eigen::Vector2d> pa, pb;
+  for (int i = 0; i < 600; ++i) add_descriptor(a, draw()), pa.emplace_back(position(rng), position(rng) * 1.3);
+  for (int i = 0; i < 1500; ++i) add_descriptor(b, draw()), pb.emplace_back(position(rng), position(rng) * 1.3);
+
+  for (const Eigen::Vector3d &t : {Eigen::Vector3d(1.0, 0.1, 0.05), Eigen::Vector3d(0.05, 1.0, 0.2), Eigen::Vector3d(0.1, 0.2, 1.0)}) {
+    const Eigen::Matrix3d R = rotation_from_vector(Eigen::Vector3d(0.1, -0.2, 0.15));
+    const Eigen::Matrix3d E = essential_of(R, t.normalized());
+    constexpr double kThreshold = 0.01;
+    const auto guided = match_features_guided(a, b, pa, pb, E, kThreshold, kThreshold);
+
+    // The same rules, checking every pair of features.
+    const int na = static_cast<int>(pa.size()), nb = static_cast<int>(pb.size());
+    std::vector<int> bestOfA(static_cast<std::size_t>(na), -1), bestOfB(static_cast<std::size_t>(nb), -1);
+    std::vector<float> bestDotOfB(static_cast<std::size_t>(nb), -2.f);
+    for (int i = 0; i < na; ++i) {
+      const Eigen::Vector3d xa(pa[static_cast<std::size_t>(i)].x(), pa[static_cast<std::size_t>(i)].y(), 1.0);
+      float first = -2.f, second = -2.f;
+      int firstIndex = -1;
+      for (int j = 0; j < nb; ++j) {
+        const Eigen::Vector3d xb(pb[static_cast<std::size_t>(j)].x(), pb[static_cast<std::size_t>(j)].y(), 1.0);
+        const Eigen::Vector3d inB = E * xa, inA = E.transpose() * xb;
+        const double residual = std::abs(xb.dot(inB));
+        if (residual >= kThreshold * inB.head<2>().norm() || residual >= kThreshold * inA.head<2>().norm()) continue;
+        float dot = 0.f;
+        for (int d = 0; d < kDescriptorSize; ++d) dot += a.descriptor(static_cast<std::size_t>(i))[d] * b.descriptor(static_cast<std::size_t>(j))[d];
+        if (dot > first) {
+          second = first;
+          first = dot;
+          firstIndex = j;
+        } else if (dot > second) {
+          second = dot;
+        }
+        if (dot > bestDotOfB[static_cast<std::size_t>(j)]) {
+          bestDotOfB[static_cast<std::size_t>(j)] = dot;
+          bestOfB[static_cast<std::size_t>(j)] = i;
+        }
+      }
+      if (firstIndex >= 0 && first >= 0.75f && (second <= -2.f || 2.f - 2.f * first < 0.64f * (2.f - 2.f * second))) {
+        bestOfA[static_cast<std::size_t>(i)] = firstIndex;
+      }
+    }
+    std::vector<std::pair<int, int>> expected;
+    for (int i = 0; i < na; ++i) {
+      const int j = bestOfA[static_cast<std::size_t>(i)];
+      if (j >= 0 && bestOfB[static_cast<std::size_t>(j)] == i) expected.emplace_back(i, j);
+    }
+    REQUIRE(expected.size() > 20);
+    // The reference works in double where the matcher uses float, so a
+    // candidate right at the threshold may come out either way.
+    std::size_t same = 0;
+    for (const auto &m : guided) same += std::find(expected.begin(), expected.end(), m) != expected.end() ? 1 : 0;
+    CHECK(same + 2 >= expected.size());
+    CHECK(guided.size() <= expected.size() + 2);
+  }
+}

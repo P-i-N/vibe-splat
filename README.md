@@ -105,7 +105,8 @@ the later stages to read. Rerun it with `--force` to replace them.
 scratch, needing only Eigen and, for matching, Vulkan:
 
 1. **Features.** SIFT: extrema of a difference-of-Gaussians pyramid, described
-   by gradient histograms (RootSIFT).
+   by gradient histograms (RootSIFT). The 8192 with the most contrast per
+   image, more for images over 1600 pixels across (up to 16384 from 3200).
 2. **Matching.** Brute-force mutual nearest neighbours with Lowe's ratio test.
    On the GPU, descriptors are quantised to 8 bits and compared with packed
    integer dot products in a compute shader (`--cpu` keeps it on the CPU,
@@ -114,7 +115,9 @@ scratch, needing only Eigen and, for matching, Vulkan:
    few at growing distances (`--matcher` overrides this).
 3. **Verification.** RANSAC around the five-point essential matrix solver,
    using ingest's intrinsics. Pairs that do not fit a rigid camera motion go.
-4. **Tracks.** Matches are chained into tracks that follow one 3D point.
+4. **Tracks.** Matches are chained into tracks that follow one 3D point. A
+   match that would give a track two features of one image, which a repeated
+   pattern causes, is left out; the best-matched pairs go first.
 5. **Start.** The best-matched pair with a wide enough baseline is triangulated.
 6. **Growth.** The image seeing the most known points is registered with P3P
    RANSAC, what it newly sees is triangulated, and the model is bundle adjusted
@@ -123,6 +126,19 @@ scratch, needing only Eigen and, for matching, Vulkan:
 7. **Finish.** A final bundle adjustment refines focal length and radial
    distortion (a focal length given by hand stays fixed), and points missing by
    more than 1.5 pixels are dropped.
+8. **Guided matching.** With the poses known, every two posed images that share
+   points are matched again, each feature only against the features near its
+   epipolar line, and the tracks are rebuilt, triangulated and adjusted once
+   more. Against a whole image, repeated patterns and weak texture (frets,
+   strings, wood grain, fabric) rarely pass the ratio test, so a subject in
+   front of a busy background used to get hardly any points. On 68 photos
+   around a guitar on a patterned play mat this took the points on the guitar
+   from a few dozen to about 25000.
+
+The pixel thresholds above are for images 1600 pixels across, ingest's default,
+and grow in proportion for larger ones, whose features are located less
+precisely in pixels. Held fixed, they had rejected most correct matches in
+3840 pixel photos and left most of those photos without a pose.
 
 The result goes to `project/sparse/0` in COLMAP's binary format, with a
 `SIMPLE_RADIAL` camera, so other tools can read it. `preview.ply` next to it
