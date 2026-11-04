@@ -178,7 +178,7 @@ train options (writes project/splat.ply and project/preview_*.png):
                           Gaussians growing with the image size (DashGaussian),
                           rather than at 15% and 35% of training
   --max-growth <x>        Let the Gaussians grow to this multiple of the starting
-                          points (default 4, 0 no cap)
+                          points (default 4 per 7000 iterations, 0 no cap)
   --refine-poses          Refine the training cameras along with the Gaussians
   --second-order          After densification, step by estimated curvature, not Adam
   --dense-init <n>        Start from up to n more points than the sparse model has,
@@ -570,7 +570,7 @@ int cmd_train(const GlobalOptions &opts) {
   options.significancePrune = args.has("significance-prune");
   options.pointExtent = args.has("point-extent");
   options.adaptiveSchedule = args.has("adaptive-schedule");
-  options.maxGrowth = std::max(args.number("max-growth", options.maxGrowth), 0.0);
+  if (args.has("max-growth")) options.maxGrowth = std::max(args.number("max-growth", 0.0), 0.0);
   options.opacityReg = std::max(args.number("opacity-reg", options.opacityReg), 0.f);
   options.scaleReg = std::max(args.number("scale-reg", options.scaleReg), 0.f);
   options.positionNoise = std::max(args.number("position-noise", options.positionNoise), 0.f);

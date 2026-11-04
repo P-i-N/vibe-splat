@@ -181,9 +181,12 @@ does automatic differentiation: each pass has a hand-derived counterpart.
 - **Coarse to fine.** Training starts on images at a quarter of their size
   until 15% of the way through, then half until 35%, made by averaging 2x2
   pixels, as the early iterations only need the broad shapes. The Gaussians may
-  grow to `--max-growth` times the starting points (4 by default), which keeps
-  7000 iterations on the bicycle scene above 100 it/s on a laptop; more adds
-  little (24.1 dB held out at 400k, 24.2 at 600k). `--adaptive-schedule`
+  grow to `--max-growth` times the starting points, by default 4 for every 7000
+  iterations: at 7000 that keeps the bicycle scene above 100 it/s on a laptop,
+  where more adds little (24.1 dB held out at 400k, 24.2 at 600k). Held to 4
+  over 30000 iterations, a guitar scene hit the cap after 2000 and gained no
+  detail after that; with room to grow it reached 408k Gaussians and 2 dB more
+  on its training views. `--adaptive-schedule`
   instead switches sizes where the photos' spectra fall off and lets the count
   grow with the size, as in DashGaussian: faster, but 0.7 dB worse on that
   scene at 7000 iterations (23.4 dB), and the default until now.

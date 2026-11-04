@@ -852,3 +852,17 @@ TEST_CASE("Training holds out views in file name order and samples the sparse po
   CHECK(load_train_data(options).startingPoints.size() == 500);
   fs::remove_all(project);
 }
+
+TEST_CASE("The growth cap scales with the length of training", "[train]") {
+  TrainOptions options;
+  options.iterations = 7000;
+  CHECK(growth_factor(options) == 4.0);
+  options.iterations = 3000;
+  CHECK(growth_factor(options) == 4.0);
+  options.iterations = 35000;
+  CHECK(growth_factor(options) == 20.0);
+  options.maxGrowth = 6.0;
+  CHECK(growth_factor(options) == 6.0);
+  options.maxGrowth = 0.0;
+  CHECK(growth_factor(options) == 0.0);
+}

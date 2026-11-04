@@ -320,6 +320,12 @@ Camera posed_camera(const ColmapImage &image, const ColmapCamera &camera, double
   return out;
 }
 
+double growth_factor(const TrainOptions &options) noexcept {
+  constexpr double kPerRun = 4.0, kRunLength = 7000.0;
+  if (options.maxGrowth >= 0.0) return options.maxGrowth;
+  return kPerRun * std::max(1.0, static_cast<double>(options.iterations) / kRunLength);
+}
+
 TrainData load_train_data(const TrainOptions &options, const std::function<void(std::size_t, std::size_t)> &progress) {
   TrainData data;
   data.model = load_colmap_model(options.project / "sparse" / "0");
@@ -428,7 +434,7 @@ TrainData load_train_data(const TrainOptions &options, const std::function<void(
 
 TrainSession::TrainSession(vk::Context &ctx, const TrainOptions &options, TrainData data, std::function<void(const std::string &)> log)
     : ctx_(ctx), options_(options), data_(std::move(data)), log_(std::move(log)), rng_(options.seed), densifyRng_(options.seed + 1),
-      growth_(data_.startingPoints.size(), options.maxGrowth), lastOpacityReset_(-kCheckpointRecovery) {
+      growth_(data_.startingPoints.size(), growth_factor(options)), lastOpacityReset_(-kCheckpointRecovery) {
   if (!log_) log_ = [](const std::string &line) { std::println("{}", line); };
   if (options_.adaptiveSchedule && !options_.fullResolution) {
     log_(std::format("Image sizes: quarter until {:.0f}% of training, half until {:.0f}%, then full", 100.0 * data_.coarseUntil[1],
@@ -653,8 +659,9 @@ StepStats TrainSession::step() {
       const double factor = level == kCoarseLevels ? 1.0 : std::pow(2.0, static_cast<double>(level + 1));
       densifyOptions.maxGaussians = std::min(densifyOptions.maxGaussians, growth_.limit(factor, progress));
     } else {
-      // A fixed cap: on the bicycle scene quality saturates from about 5
-      // times the starting points, and 4 keeps 7000 iterations above 100 it/s.
+      // A fixed cap (see growth_factor()): at 7000 iterations on the bicycle
+      // scene quality saturates from about 5 times the starting points, and 4
+      // keeps it above 100 it/s.
       densifyOptions.maxGaussians = std::min(densifyOptions.maxGaussians, growth_.limit(1.0, 1.0));
     }
     if (options.densifyMode == TrainOptions::DensifyMode::Mcmc) {
