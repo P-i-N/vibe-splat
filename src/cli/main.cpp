@@ -114,7 +114,7 @@ it here for a better start; sizes are for the input after rotation):
 sfm options (writes project/sparse/0 in COLMAP's format, plus preview.ply):
   --matcher <m>           auto (default), exhaustive or sequential
   --window <n>            Neighbours per image when sequential (default 8)
-  --max-features <n>      Per image (default 8192, up to 16384 for larger images)
+  --max-features <n>      Per image (default 8192)
   --threads <n>           0 uses all cores (default 0)
   --cpu                   Match features on the CPU even when a GPU is available
   --import <dir>          Instead of estimating, import a COLMAP sparse model
@@ -482,7 +482,7 @@ int cmd_sfm(const GlobalOptions &opts) {
 
   splat::SfmOptions options;
   options.project = project;
-  if (const int n = args.number("max-features", 0); n > 0) options.maxFeatures = std::max(n, 16);
+  options.maxFeatures = std::max(args.number("max-features", options.maxFeatures), 16);
   options.window = std::max(args.number("window", options.window), 1);
   options.threads = std::max(args.number("threads", 0), 0);
   const std::string matcher = args.get("matcher", "auto");

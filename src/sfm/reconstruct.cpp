@@ -45,9 +45,7 @@ constexpr double kPairThresholdPixels = 3.0;
 constexpr double kPoseThresholdPixels = 4.0;
 constexpr double kPointThresholdPixels = 4.0;
 constexpr double kFinalThresholdPixels = 1.5; // Once the model has settled
-constexpr double kGuidedThresholdPixels = 2.0; // Distance from an epipolar line for guided matching
 constexpr double kMinTriangulationAngleDeg = 1.5;
-constexpr int kMinSharedForGuided = 10; // Points two posed images must share to be matched again
 constexpr std::size_t kExhaustiveLimit = 150;    // Photos matched every-against-every on the CPU
 constexpr std::size_t kGpuExhaustiveLimit = 500; // ... and on the GPU, where a pair costs about a millisecond
 
@@ -182,39 +180,6 @@ public:
     }
   }
 
-  // Replaces the tracks, keeping the poses, and gives each new track the point
-  // most of its posed views agree on. finish() should follow.
-  void retriangulate(std::vector<Track> tracks) {
-    tracks_ = std::move(tracks);
-    for (std::vector<int> &list : tracksOfImage_) list.clear();
-    for (std::size_t t = 0; t < tracks_.size(); ++t) {
-      for (const Observation &o : tracks_[t].observations) tracksOfImage_[static_cast<std::size_t>(o.image)].push_back(static_cast<int>(t));
-    }
-    parallel_for(tracks_.size(), threads_, [&](std::size_t t) { triangulate_track(tracks_[t]); });
-  }
-
-  // Images that share at least minShared points, as pairs (a < b).
-  [[nodiscard]] std::vector<std::pair<int, int>> covisible_pairs(int minShared) const {
-    std::map<std::pair<int, int>, int> shared;
-    std::vector<int> images;
-    for (const Track &track : tracks_) {
-      if (!track.hasPoint) continue;
-      images.clear();
-      for (const Observation &o : track.observations) {
-        if (o.active) images.push_back(o.image);
-      }
-      std::sort(images.begin(), images.end());
-      for (std::size_t i = 0; i < images.size(); ++i) {
-        for (std::size_t j = i + 1; j < images.size(); ++j) ++shared[{images[i], images[j]}];
-      }
-    }
-    std::vector<std::pair<int, int>> pairs;
-    for (const auto &[pair, count] : shared) {
-      if (count >= minShared) pairs.push_back(pair);
-    }
-    return pairs;
-  }
-
   [[nodiscard]] std::size_t registered_count() const {
     return static_cast<std::size_t>(std::count_if(poses_.begin(), poses_.end(), [](const auto &p) { return p.has_value(); }));
   }
@@ -345,61 +310,6 @@ private:
       track.point = point;
       track.hasPoint = true;
     }
-  }
-
-  // The point the most posed views of a track agree on: each pair of them with
-  // enough angle proposes one (up to a limit), the best is refined over the
-  // views it fits, and those become the active observations.
-  void triangulate_track(Track &track) const {
-    constexpr int kMaxProposals = 64;
-    track.hasPoint = false;
-    std::vector<Observation *> posed;
-    for (Observation &o : track.observations) {
-      o.active = false;
-      if (poses_[static_cast<std::size_t>(o.image)]) posed.push_back(&o);
-    }
-    if (posed.size() < 2) return;
-    std::vector<Eigen::Vector3d> bearings, rays;
-    for (const Observation *o : posed) {
-      bearings.push_back(unproject_pixel(lens_of(o->image), pixel_of(*o)));
-      rays.push_back(poses_[static_cast<std::size_t>(o->image)]->R.transpose() * bearings.back());
-    }
-    const auto agreeing = [&](const Eigen::Vector3d &point) {
-      int count = 0;
-      for (const Observation *o : posed) count += error_pixels(*o, point) < kPointThresholdPixels ? 1 : 0;
-      return count;
-    };
-    int bestCount = 1, proposals = 0;
-    Eigen::Vector3d best = Eigen::Vector3d::Zero();
-    for (std::size_t p = 0; p < posed.size() && proposals < kMaxProposals; ++p) {
-      for (std::size_t q = p + 1; q < posed.size() && proposals < kMaxProposals; ++q) {
-        if (degrees_between(rays[p], rays[q]) < kMinTriangulationAngleDeg) continue;
-        ++proposals;
-        const Eigen::Vector3d point = triangulate({*poses_[static_cast<std::size_t>(posed[p]->image)], *poses_[static_cast<std::size_t>(posed[q]->image)]},
-                                                  {bearings[p], bearings[q]});
-        if (!point.allFinite()) continue;
-        const int count = agreeing(point);
-        if (count > bestCount) {
-          bestCount = count;
-          best = point;
-        }
-      }
-    }
-    if (bestCount < 2) return;
-    if (bestCount > 2) {
-      std::vector<Pose> poses;
-      std::vector<Eigen::Vector3d> fitting;
-      for (std::size_t k = 0; k < posed.size(); ++k) {
-        if (error_pixels(*posed[k], best) >= kPointThresholdPixels) continue;
-        poses.push_back(*poses_[static_cast<std::size_t>(posed[k]->image)]);
-        fitting.push_back(bearings[k]);
-      }
-      const Eigen::Vector3d refined = triangulate(poses, fitting);
-      if (refined.allFinite() && agreeing(refined) >= bestCount) best = refined;
-    }
-    for (Observation *o : posed) o->active = error_pixels(*o, best) < kPointThresholdPixels;
-    track.point = best;
-    track.hasPoint = true;
   }
 
   // Drops observations that no longer fit, and points that lost their support.
@@ -584,15 +494,6 @@ std::size_t seed_support(const VerifiedPair &pair, const TrackSet &set) {
   return support;
 }
 
-// 8192 features for an image up to kReferenceSize across, as many as COLMAP
-// keeps, and more for larger ones: they show more detail, and a subject that
-// fills little of a busy photo needs some of it.
-int default_feature_count(int width, int height) {
-  constexpr int kBase = 8192, kMax = 16384;
-  const double scale = std::max(width, height) / kReferenceSize;
-  return std::clamp(static_cast<int>(std::lround(kBase * scale)), kBase, kMax);
-}
-
 std::vector<std::uint8_t> read_all(const fs::path &path) {
   std::ifstream in(path, std::ios::binary);
   if (!in) throw std::runtime_error(std::format("cannot open {}", path.string()));
@@ -671,8 +572,7 @@ SfmReport run_sfm(const SfmOptions &options) {
   Progress featureBar("Features", count);
   parallel_for(count, options.threads, [&](std::size_t i) {
     try {
-      const RgbImage image = decode_image(read_all(options.project / manifest.images[i].file));
-      features[i] = extract_features(image, options.maxFeatures > 0 ? options.maxFeatures : default_feature_count(image.width, image.height));
+      features[i] = extract_features(decode_image(read_all(options.project / manifest.images[i].file)), options.maxFeatures);
     } catch (const std::exception &e) {
       const std::lock_guard lock(errorMutex);
       if (firstError.empty()) firstError = std::format("{}: {}", manifest.images[i].file, e.what());
@@ -808,77 +708,6 @@ SfmReport run_sfm(const SfmOptions &options) {
   mapper.grow();
   mapper.finish();
   stage_done("registration and bundle adjustment");
-
-  // With the poses known, match every pair of posed images that share points
-  // again, now only along epipolar lines, and rebuild the tracks from that.
-  // The first matching had to find features against the whole image, which
-  // repeated patterns and weak texture (frets, strings, wood, cloth) rarely
-  // survive; next to a busy background, the subject would end up with hardly
-  // any points.
-  {
-    const std::vector<std::pair<int, int>> covisible = mapper.covisible_pairs(kMinSharedForGuided);
-    std::println("Matching {} posed image pairs along epipolar lines...", covisible.size());
-    const auto &poses = mapper.poses();
-    const auto &finalLenses = mapper.lenses();
-    const auto lens_of = [&](int image) -> const Lens & { return finalLenses[static_cast<std::size_t>(lensOfImage[static_cast<std::size_t>(image)])]; };
-    const auto scale_of = [&](int image) { return lensScales[static_cast<std::size_t>(lensOfImage[static_cast<std::size_t>(image)])]; };
-    std::vector<std::vector<Eigen::Vector2d>> normalised(count);
-    parallel_for(count, options.threads, [&](std::size_t i) {
-      if (!poses[i]) return;
-      for (const Keypoint &k : features[i].keypoints) normalised[i].push_back(unproject_pixel(lens_of(static_cast<int>(i)), {k.x, k.y}).head<2>());
-    });
-    const auto essential = [&](int a, int b) {
-      const Pose &pa = *poses[static_cast<std::size_t>(a)], &pb = *poses[static_cast<std::size_t>(b)];
-      const Eigen::Matrix3d R = pb.R * pa.R.transpose();
-      const Eigen::Vector3d t = pb.t - R * pa.t;
-      Eigen::Matrix3d tx;
-      tx << 0.0, -t.z(), t.y(), t.z(), 0.0, -t.x(), -t.y(), t.x(), 0.0;
-      return Eigen::Matrix3d(tx * R);
-    };
-
-    std::vector<VerifiedPair> guided(covisible.size());
-    std::atomic<std::size_t> guidedMatches{0};
-    Progress guidedBar("Guided", covisible.size());
-    parallel_for(covisible.size(), options.threads, [&](std::size_t p) {
-      const auto [a, b] = covisible[p];
-      guided[p].a = a;
-      guided[p].b = b;
-      guided[p].inliers = match_features_guided(features[static_cast<std::size_t>(a)], features[static_cast<std::size_t>(b)],
-                                                normalised[static_cast<std::size_t>(a)], normalised[static_cast<std::size_t>(b)], essential(a, b),
-                                                kGuidedThresholdPixels * scale_of(a) / lens_of(a).f,
-                                                kGuidedThresholdPixels * scale_of(b) / lens_of(b).f);
-      guidedMatches += guided[p].inliers.size();
-      guidedBar.advance(1, std::format("{} matches", guidedMatches.load()));
-    });
-    guidedBar.finish();
-
-    // The first matches stay where they fit the final poses: pairs that share
-    // too few points to be matched again still link their images.
-    for (VerifiedPair &pair : goodPairs) {
-      if (!poses[static_cast<std::size_t>(pair.a)] || !poses[static_cast<std::size_t>(pair.b)]) {
-        pair.inliers.clear();
-        continue;
-      }
-      const Eigen::Matrix3d E = essential(pair.a, pair.b);
-      const double ta = kPointThresholdPixels * scale_of(pair.a) / lens_of(pair.a).f;
-      const double tb = kPointThresholdPixels * scale_of(pair.b) / lens_of(pair.b).f;
-      std::erase_if(pair.inliers, [&](const std::pair<int, int> &m) {
-        const Eigen::Vector2d &xa = normalised[static_cast<std::size_t>(pair.a)][static_cast<std::size_t>(m.first)];
-        const Eigen::Vector2d &xb = normalised[static_cast<std::size_t>(pair.b)][static_cast<std::size_t>(m.second)];
-        const Eigen::Vector3d ha(xa.x(), xa.y(), 1.0), hb(xb.x(), xb.y(), 1.0);
-        const Eigen::Vector3d inB = E * ha, inA = E.transpose() * hb;
-        const double residual = std::abs(hb.dot(inB));
-        return residual > tb * inB.head<2>().norm() || residual > ta * inA.head<2>().norm();
-      });
-    }
-    guided.insert(guided.end(), std::make_move_iterator(goodPairs.begin()), std::make_move_iterator(goodPairs.end()));
-    TrackSet rebuilt = build_tracks(features, guided);
-    mapper.retriangulate(std::move(rebuilt.tracks));
-    std::println("  {} matches, {} points before bundle adjustment", guidedMatches.load(), mapper.point_count());
-    stage_done("guided matching");
-    mapper.finish();
-    stage_done("bundle adjustment");
-  }
 
   // Store the result in COLMAP's format.
   ColmapModel model;
