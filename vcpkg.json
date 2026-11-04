@@ -43,5 +43,10 @@
       ]
     },
     "catch2"
-  ]
+  ],
+  "vcpkg-configuration": {
+    "overlay-ports": [
+      "./cmake/vcpkg-overlays"
+    ]
+  }
 }
