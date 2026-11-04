@@ -68,7 +68,8 @@ struct TrainOptions {
   bool adaptiveSchedule = false;
   // The Gaussian count may grow to this multiple of the starting points (with
   // the adaptive schedule, raised by what the scene asks for); 0: no such cap.
-  double maxGrowth = 4.0;
+  // Below 0: 4 for every 7000 iterations (see growth_factor()).
+  double maxGrowth = -1.0;
   // 3DGS-MCMC's penalties on the loss, reg * mean(sigmoid(opacity)) and
   // reg * mean(exp(scale)) over the Gaussians, so that unneeded ones fade and
   // shrink. 0 is off.
@@ -92,6 +93,7 @@ struct TrainOptions {
   // Refine each training view's camera along with the Gaussians, for poses that are a little off.
   bool refinePoses = false;
   std::size_t densePoints = 50000;  // Start from up to this many more points, by patch matching
+  std::size_t sparsePoints = 0;     // Start from a random sample of at most this many sparse points; 0: all
   // After densification, steps from the curvature instead of Adam's second moment (3DGS^2-TR).
   bool secondOrder = false;
   bool pointExtent = false;       // The scene's extent from the sparse points, not the cameras
@@ -152,6 +154,12 @@ struct TrainData {
 // Loads project/sparse/0 and its images, on all cores, then finds the dense
 // starting points. `progress` is called after each image with how many are
 // done and how many there are, from the loading threads but never two at once.
+// The multiple of the starting points the Gaussians may grow to: maxGrowth when
+// set (0: no cap), else 4 for every 7000 iterations, at least 4. The cap keeps
+// short runs fast, where more Gaussians add little; a long run held to it hit
+// the cap within 2000 of 30000 iterations and then gained no detail.
+[[nodiscard]] double growth_factor(const TrainOptions &options) noexcept;
+
 [[nodiscard]] TrainData load_train_data(const TrainOptions &options,
                                         const std::function<void(std::size_t, std::size_t)> &progress = {});
 

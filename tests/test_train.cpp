@@ -5,7 +5,10 @@
 #include "test_support.hpp"
 #include "train/evaluate.hpp"
 #include "train/reference.hpp"
+#include "train/train.hpp"
 #include "train/trainer.hpp"
+#include "ingest/image.hpp"
+#include "sfm/colmap_model.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <glm/gtc/constants.hpp>
@@ -14,6 +17,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
+#include <format>
 #include <print>
 #include <random>
 #include <string>
@@ -791,4 +796,73 @@ TEST_CASE("A prefetched image of a smaller size does not spoil a larger one afte
   // A prefetch is used, by the step after the one that started it.
   (void)trainer.step(large, largeTarget, still, largeTarget);
   CHECK_THAT(trainer.step(large, largeTarget, still).loss, WithinAbs(expected, 1e-4));
+}
+
+TEST_CASE("Training holds out views in file name order and samples the sparse points", "[train]") {
+  namespace fs = std::filesystem;
+  const fs::path project = fs::temp_directory_path() / "splat_train_order";
+  fs::remove_all(project);
+  fs::create_directories(project / "images");
+  const auto views = make_test_views(9, 64, 48, 60.0);
+  ColmapModel model;
+  ColmapCamera camera;
+  camera.id = 1;
+  camera.model = 1; // PINHOLE
+  camera.width = 64;
+  camera.height = 48;
+  camera.params = {60.0, 60.0, 32.0, 24.0};
+  model.cameras[camera.id] = camera;
+  for (std::size_t i = 0; i < views.size(); ++i) {
+    const std::string name = std::format("images/view_{}.png", i);
+    write_image(views[i].image, project / name, 95);
+    ColmapImage image;
+    image.id = static_cast<std::uint32_t>(views.size() - i); // Numbered against name order, as COLMAP may do
+    const Eigen::Quaterniond q(views[i].pose.R);
+    image.rotation = {q.w(), q.x(), q.y(), q.z()};
+    image.translation = {views[i].pose.t.x(), views[i].pose.t.y(), views[i].pose.t.z()};
+    image.cameraId = camera.id;
+    image.name = name;
+    model.images[image.id] = image;
+  }
+  std::mt19937 rng(3);
+  std::uniform_real_distribution<double> coordinate(-1.0, 1.0);
+  for (std::uint64_t p = 0; p < 500; ++p) {
+    ColmapPoint point;
+    point.id = p + 1;
+    point.position = {coordinate(rng), coordinate(rng), coordinate(rng)};
+    point.color = {100, 150, 200};
+    model.points.push_back(point);
+  }
+  save_colmap_model(model, project / "sparse" / "0");
+
+  TrainOptions options;
+  options.project = project;
+  options.holdout = 4;
+  options.densePoints = 0;
+  options.sparsePoints = 100;
+  const TrainData data = load_train_data(options);
+  REQUIRE(data.holdoutViews.size() == 3);
+  CHECK(data.holdoutViews[0].name == "images/view_0.png");
+  CHECK(data.holdoutViews[1].name == "images/view_4.png");
+  CHECK(data.holdoutViews[2].name == "images/view_8.png");
+  CHECK(data.trainViews.size() == 6);
+  CHECK(data.startingPoints.size() == 100);
+
+  options.sparsePoints = 0;
+  CHECK(load_train_data(options).startingPoints.size() == 500);
+  fs::remove_all(project);
+}
+
+TEST_CASE("The growth cap scales with the length of training", "[train]") {
+  TrainOptions options;
+  options.iterations = 7000;
+  CHECK(growth_factor(options) == 4.0);
+  options.iterations = 3000;
+  CHECK(growth_factor(options) == 4.0);
+  options.iterations = 35000;
+  CHECK(growth_factor(options) == 20.0);
+  options.maxGrowth = 6.0;
+  CHECK(growth_factor(options) == 6.0);
+  options.maxGrowth = 0.0;
+  CHECK(growth_factor(options) == 0.0);
 }

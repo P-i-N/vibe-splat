@@ -105,7 +105,8 @@ the later stages to read. Rerun it with `--force` to replace them.
 scratch, needing only Eigen and, for matching, Vulkan:
 
 1. **Features.** SIFT: extrema of a difference-of-Gaussians pyramid, described
-   by gradient histograms (RootSIFT).
+   by gradient histograms (RootSIFT), the 8192 with the most contrast per
+   image.
 2. **Matching.** Brute-force mutual nearest neighbours with Lowe's ratio test.
    On the GPU, descriptors are quantised to 8 bits and compared with packed
    integer dot products in a compute shader (`--cpu` keeps it on the CPU,
@@ -114,7 +115,9 @@ scratch, needing only Eigen and, for matching, Vulkan:
    few at growing distances (`--matcher` overrides this).
 3. **Verification.** RANSAC around the five-point essential matrix solver,
    using ingest's intrinsics. Pairs that do not fit a rigid camera motion go.
-4. **Tracks.** Matches are chained into tracks that follow one 3D point.
+4. **Tracks.** Matches are chained into tracks that follow one 3D point. A
+   match that would give a track two features of one image, which a repeated
+   pattern causes, is left out; the best-matched pairs go first.
 5. **Start.** The best-matched pair with a wide enough baseline is triangulated.
 6. **Growth.** The image seeing the most known points is registered with P3P
    RANSAC, what it newly sees is triangulated, and the model is bundle adjusted
@@ -123,6 +126,11 @@ scratch, needing only Eigen and, for matching, Vulkan:
 7. **Finish.** A final bundle adjustment refines focal length and radial
    distortion (a focal length given by hand stays fixed), and points missing by
    more than 1.5 pixels are dropped.
+
+The pixel thresholds above are for images 1600 pixels across, ingest's default,
+and grow in proportion for larger ones, whose features are located less
+precisely in pixels. Held fixed, they had rejected most correct matches in
+3840 pixel photos and left most of those photos without a pose.
 
 The result goes to `project/sparse/0` in COLMAP's binary format, with a
 `SIMPLE_RADIAL` camera, so other tools can read it. `preview.ply` next to it
@@ -173,9 +181,12 @@ does automatic differentiation: each pass has a hand-derived counterpart.
 - **Coarse to fine.** Training starts on images at a quarter of their size
   until 15% of the way through, then half until 35%, made by averaging 2x2
   pixels, as the early iterations only need the broad shapes. The Gaussians may
-  grow to `--max-growth` times the starting points (4 by default), which keeps
-  7000 iterations on the bicycle scene above 100 it/s on a laptop; more adds
-  little (24.1 dB held out at 400k, 24.2 at 600k). `--adaptive-schedule`
+  grow to `--max-growth` times the starting points, by default 4 for every 7000
+  iterations: at 7000 that keeps the bicycle scene above 100 it/s on a laptop,
+  where more adds little (24.1 dB held out at 400k, 24.2 at 600k). Held to 4
+  over 30000 iterations, a guitar scene hit the cap after 2000 and gained no
+  detail after that; with room to grow it reached 408k Gaussians and 2 dB more
+  on its training views. `--adaptive-schedule`
   instead switches sizes where the photos' spectra fall off and lets the count
   grow with the size, as in DashGaussian: faster, but 0.7 dB worse on that
   scene at 7000 iterations (23.4 dB), and the default until now.

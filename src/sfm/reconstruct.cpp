@@ -13,6 +13,7 @@
 #include <cmath>
 #include <format>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <numbers>
@@ -33,6 +34,13 @@ namespace {
 constexpr int kMinPairInliers = 15;
 constexpr int kMinInitialPoints = 20;
 constexpr int kMinRegistrationInliers = 12;
+constexpr int kMaxRetryRounds = 3; // Fresh attempts for images that failed to register, once growth stalls
+// Thresholds in pixels of an image kReferenceSize across, the default size of
+// ingest. Features in larger images are found and located at proportionally
+// larger scales, so their errors in pixels grow with the size: the thresholds
+// scale up with it (never down). Held at these values, 3840 pixel photos lost
+// most of their correct matches and points, and most images failed to register.
+constexpr double kReferenceSize = 1600.0;
 constexpr double kPairThresholdPixels = 3.0;
 constexpr double kPoseThresholdPixels = 4.0;
 constexpr double kPointThresholdPixels = 4.0;
@@ -84,9 +92,9 @@ private:
 // Holds a growing reconstruction: which images have poses and which tracks have points.
 class Mapper {
 public:
-  Mapper(std::vector<Lens> lenses, std::vector<int> lensOfImage, const std::vector<ImageFeatures> &features, std::vector<Track> tracks,
-         int threads)
-      : initialLenses_(lenses), lenses_(std::move(lenses)), lensOfImage_(std::move(lensOfImage)), features_(features),
+  Mapper(std::vector<Lens> lenses, std::vector<double> lensScales, std::vector<int> lensOfImage, const std::vector<ImageFeatures> &features,
+         std::vector<Track> tracks, int threads)
+      : initialLenses_(lenses), lenses_(std::move(lenses)), lensScales_(std::move(lensScales)), lensOfImage_(std::move(lensOfImage)), features_(features),
         tracks_(std::move(tracks)), poses_(features.size()), tracksOfImage_(features.size()), attempts_(features.size(), 0),
         threads_(threads) {
     for (std::size_t t = 0; t < tracks_.size(); ++t) {
@@ -123,8 +131,24 @@ public:
     std::size_t lastGlobal = registered_count();
     Progress bar("Register", poses_.size());
     bar.set(lastGlobal, std::format("{} points", point_count()));
-    for (;;) {
-      const auto image = next_image();
+    std::size_t registeredAtRetry = 0;
+    for (int retries = 0;;) {
+      auto image = next_image();
+      // An image tried twice while the model was small and rough is given up
+      // on, however well it would fit later. Once nothing else registers, they
+      // get another chance against the grown model, after it has settled.
+      if (!image && retries < kMaxRetryRounds && registered_count() > registeredAtRetry && registered_count() < poses_.size()) {
+        ++retries;
+        registeredAtRetry = registered_count();
+        bundle(true, 8);
+        filter();
+        for (std::size_t i = 0; i < poses_.size(); ++i) {
+          if (poses_[i]) continue;
+          attempts_[i] = 0;
+          attemptedAt_.erase(i);
+        }
+        image = next_image();
+      }
       if (!image) {
         const std::size_t left = poses_.size() - registered_count();
         if (left > 0) bar.message(std::format("  {} images see too few known points to register", left));
@@ -175,11 +199,14 @@ private:
     return {k.x, k.y};
   }
 
+  [[nodiscard]] double scale_of(int image) const { return lensScales_[static_cast<std::size_t>(lensOfImage_[static_cast<std::size_t>(image)])]; }
+
+  // Reprojection error in reference pixels (see kReferenceSize).
   [[nodiscard]] double error_pixels(const Observation &o, const Eigen::Vector3d &point) const {
     const Pose &pose = *poses_[static_cast<std::size_t>(o.image)];
     Eigen::Vector2d pixel;
     if (!project_point(lens_of(o.image), pose.R * point + pose.t, pixel)) return std::numeric_limits<double>::infinity();
-    return (pixel - pixel_of(o)).norm();
+    return (pixel - pixel_of(o)).norm() / scale_of(o.image);
   }
 
   // The unregistered image seeing the most known points and not tried too often.
@@ -216,7 +243,7 @@ private:
     ++attempts_[static_cast<std::size_t>(image)];
 
     std::mt19937 rng(static_cast<std::uint32_t>(image) * 7919u + 13u);
-    const auto result = estimate_absolute_pose(bearings, points, kPoseThresholdPixels / lens_of(image).f, rng);
+    const auto result = estimate_absolute_pose(bearings, points, kPoseThresholdPixels * scale_of(image) / lens_of(image).f, rng);
     if (!result || result->inliers.size() < kMinRegistrationInliers ||
         result->inliers.size() * 4 < points.size()) {
       return false;
@@ -342,6 +369,7 @@ private:
     options.refineLenses = refineLenses;
     options.relativeTolerance = relativeTolerance;
     options.threads = threads_;
+    options.huberPixels *= *std::max_element(lensScales_.begin(), lensScales_.end());
     const BundleResult result = bundle_adjust(lenses_, views, points, observations, options);
     for (std::size_t v = 0; v < views.size(); ++v) poses_[static_cast<std::size_t>(viewImages[v])] = views[v].pose;
     for (std::size_t p = 0; p < points.size(); ++p) tracks_[static_cast<std::size_t>(pointTracks[p])].point = points[p];
@@ -350,6 +378,7 @@ private:
 
   std::vector<Lens> initialLenses_;
   std::vector<Lens> lenses_;
+  std::vector<double> lensScales_; // Pixels per reference pixel, for the thresholds
   std::vector<int> lensOfImage_;
   const std::vector<ImageFeatures> &features_;
   std::vector<Track> tracks_;
@@ -396,10 +425,38 @@ TrackSet build_tracks(const std::vector<ImageFeatures> &features, const std::vec
 
   DisjointSets sets(static_cast<std::size_t>(offsets.back()));
   std::vector<char> used(static_cast<std::size_t>(offsets.back()), 0);
-  for (const VerifiedPair &pair : pairs) {
-    for (const auto &[fa, fb] : pair.inliers) {
-      const int a = offsets[static_cast<std::size_t>(pair.a)] + fa, b = offsets[static_cast<std::size_t>(pair.b)] + fb;
-      sets.join(a, b);
+  // A match that would give a track two features of one image joins two
+  // different points, typically through a repeated pattern; joining them
+  // anyway spoils every observation of both, so such matches are left out. The
+  // best-supported pairs go first, so the match that loses is the less
+  // trustworthy one. Each set's images are kept sorted at its root once it has
+  // more than one; until then it is just the feature's own image (imageOf).
+  std::vector<std::vector<int>> imagesOf(static_cast<std::size_t>(offsets.back()));
+  std::vector<int> imageOf(static_cast<std::size_t>(offsets.back()));
+  for (std::size_t image = 0; image < features.size(); ++image) {
+    std::fill(imageOf.begin() + offsets[image], imageOf.begin() + offsets[image + 1], static_cast<int>(image));
+  }
+  const auto images_of = [&](int root) -> std::span<const int> {
+    const std::vector<int> &list = imagesOf[static_cast<std::size_t>(root)];
+    return list.empty() ? std::span<const int>(&imageOf[static_cast<std::size_t>(root)], 1) : std::span<const int>(list);
+  };
+  std::vector<const VerifiedPair *> order;
+  for (const VerifiedPair &pair : pairs) order.push_back(&pair);
+  std::stable_sort(order.begin(), order.end(), [](const VerifiedPair *a, const VerifiedPair *b) { return a->inliers.size() > b->inliers.size(); });
+  std::vector<int> merged;
+  for (const VerifiedPair *pair : order) {
+    for (const auto &[fa, fb] : pair->inliers) {
+      const int a = offsets[static_cast<std::size_t>(pair->a)] + fa, b = offsets[static_cast<std::size_t>(pair->b)] + fb;
+      const int ra = sets.find(a), rb = sets.find(b);
+      if (ra == rb) continue;
+      const std::span<const int> ia = images_of(ra), ib = images_of(rb);
+      merged.clear();
+      std::set_union(ia.begin(), ia.end(), ib.begin(), ib.end(), std::back_inserter(merged));
+      if (merged.size() < ia.size() + ib.size()) continue;
+      sets.join(ra, rb);
+      imagesOf[static_cast<std::size_t>(ra)].clear();
+      imagesOf[static_cast<std::size_t>(rb)].clear();
+      imagesOf[static_cast<std::size_t>(sets.find(ra))] = merged;
       used[static_cast<std::size_t>(a)] = used[static_cast<std::size_t>(b)] = 1;
     }
   }
@@ -408,11 +465,7 @@ TrackSet build_tracks(const std::vector<ImageFeatures> &features, const std::vec
   for (std::size_t image = 0; image < features.size(); ++image) {
     for (int f = offsets[image]; f < offsets[image + 1]; ++f) {
       if (!used[static_cast<std::size_t>(f)]) continue;
-      Track &track = byRoot[sets.find(f)];
-      // Two features of one image in a track means a mismatch somewhere. Keep
-      // the first; the reprojection check sorts out the rest.
-      if (!track.observations.empty() && track.observations.back().image == static_cast<int>(image)) continue;
-      track.observations.push_back({static_cast<int>(image), f - offsets[image], false});
+      byRoot[sets.find(f)].observations.push_back({static_cast<int>(image), f - offsets[image], false});
     }
   }
   TrackSet set;
@@ -486,6 +539,7 @@ SfmReport run_sfm(const SfmOptions &options) {
 
   std::map<int, int> lensOfCamera;
   std::vector<Lens> lenses;
+  std::vector<double> lensScales;
   for (const IngestCamera &camera : manifest.cameras) {
     Lens lens;
     lens.f = lens.fPrior = 0.5 * (camera.fx + camera.fy);
@@ -495,6 +549,7 @@ SfmReport run_sfm(const SfmOptions &options) {
     lens.fPriorSigma = lens.f * (camera.focalSource == FocalSource::Default ? 0.3 : 0.1);
     lensOfCamera[camera.id] = static_cast<int>(lenses.size());
     lenses.push_back(lens);
+    lensScales.push_back(std::max(1.0, std::max(camera.width, camera.height) / kReferenceSize));
   }
   std::vector<int> lensOfImage;
   for (const IngestImage &image : manifest.images) lensOfImage.push_back(lensOfCamera.at(image.cameraId));
@@ -557,7 +612,9 @@ SfmReport run_sfm(const SfmOptions &options) {
       x2.push_back(unproject_pixel(lensB, {kb.x, kb.y}));
     }
     std::mt19937 rng(static_cast<std::uint32_t>(p) * 2654435761u + 1u);
-    const auto result = estimate_relative_pose(x1, x2, kPairThresholdPixels / (0.5 * (lensA.f + lensB.f)), rng, kMinPairInliers);
+    const double scale = 0.5 * (lensScales[static_cast<std::size_t>(lensOfImage[static_cast<std::size_t>(a)])] +
+                                lensScales[static_cast<std::size_t>(lensOfImage[static_cast<std::size_t>(b)])]);
+    const auto result = estimate_relative_pose(x1, x2, kPairThresholdPixels * scale / (0.5 * (lensA.f + lensB.f)), rng, kMinPairInliers);
     if (!result || result->inliers.size() < kMinPairInliers) return;
     VerifiedPair pair;
     pair.a = a;
@@ -625,7 +682,7 @@ SfmReport run_sfm(const SfmOptions &options) {
   std::sort(bySupport.begin(), bySupport.end(), [](const auto &a, const auto &b) {
     return a.first != b.first ? a.first > b.first : a.second->inliers.size() > b.second->inliers.size();
   });
-  Mapper mapper(lenses, lensOfImage, features, std::move(trackSet.tracks), options.threads);
+  Mapper mapper(lenses, lensScales, lensOfImage, features, std::move(trackSet.tracks), options.threads);
 
   bool started = false;
   for (const double minAngle : {8.0, 4.0, 2.0}) {

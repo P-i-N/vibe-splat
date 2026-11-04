@@ -114,7 +114,7 @@ it here for a better start; sizes are for the input after rotation):
 sfm options (writes project/sparse/0 in COLMAP's format, plus preview.ply):
   --matcher <m>           auto (default), exhaustive or sequential
   --window <n>            Neighbours per image when sequential (default 8)
-  --max-features <n>      Per image (default 4000)
+  --max-features <n>      Per image (default 8192)
   --threads <n>           0 uses all cores (default 0)
   --cpu                   Match features on the CPU even when a GPU is available
   --import <dir>          Instead of estimating, import a COLMAP sparse model
@@ -178,11 +178,12 @@ train options (writes project/splat.ply and project/preview_*.png):
                           Gaussians growing with the image size (DashGaussian),
                           rather than at 15% and 35% of training
   --max-growth <x>        Let the Gaussians grow to this multiple of the starting
-                          points (default 4, 0 no cap)
+                          points (default 4 per 7000 iterations, 0 no cap)
   --refine-poses          Refine the training cameras along with the Gaussians
   --second-order          After densification, step by estimated curvature, not Adam
   --dense-init <n>        Start from up to n more points than the sparse model has,
                           found by matching patches between the photos (default 50000)
+  --sparse-init <n>       Start from a random sample of at most n sparse points (0: all)
   --point-extent          Take the scene's extent from the sparse points, not the cameras
   --no-align              Save in the cameras' frame, rather than with the floor
                           level at y = 0 (-y up) under the scene's centre
@@ -528,7 +529,7 @@ int cmd_train(const GlobalOptions &opts) {
   args.allow_only({"out", "iterations", "lambda-ssim", "sh-degree", "max-size", "max-views", "holdout", "seed", "report-every", "save-every",
                    "no-densify", "densify", "gradient-threshold", "vram-budget", "max-gaussians", "prune", "full-resolution", "exposure", "full-adam",
                    "threshold-rise", "split-threshold", "dense-fraction", "densify-interval", "score-views", "score-min-pixels", "explore",
-                   "significance-prune", "point-extent", "adaptive-schedule", "max-growth", "opacity-reg", "scale-reg", "position-noise", "mip-filter", "mip-filter-2d", "mip-filter-3d", "edge-split", "recovery-prune", "sh-dropout", "refine-poses", "second-order", "dense-init", "no-align", "view"});
+                   "significance-prune", "point-extent", "adaptive-schedule", "max-growth", "opacity-reg", "scale-reg", "position-noise", "mip-filter", "mip-filter-2d", "mip-filter-3d", "edge-split", "recovery-prune", "sh-dropout", "refine-poses", "second-order", "dense-init", "sparse-init", "no-align", "view"});
   if (args.positionals().size() != 1) {
     std::println(stderr, "Usage: splat train <project> [options]  (see splat --help)");
     return 2;
@@ -569,7 +570,7 @@ int cmd_train(const GlobalOptions &opts) {
   options.significancePrune = args.has("significance-prune");
   options.pointExtent = args.has("point-extent");
   options.adaptiveSchedule = args.has("adaptive-schedule");
-  options.maxGrowth = std::max(args.number("max-growth", options.maxGrowth), 0.0);
+  if (args.has("max-growth")) options.maxGrowth = std::max(args.number("max-growth", 0.0), 0.0);
   options.opacityReg = std::max(args.number("opacity-reg", options.opacityReg), 0.f);
   options.scaleReg = std::max(args.number("scale-reg", options.scaleReg), 0.f);
   options.positionNoise = std::max(args.number("position-noise", options.positionNoise), 0.f);
@@ -581,6 +582,7 @@ int cmd_train(const GlobalOptions &opts) {
   options.refinePoses = args.has("refine-poses");
   options.secondOrder = args.has("second-order");
   options.densePoints = args.number<std::size_t>("dense-init", options.densePoints);
+  options.sparsePoints = args.number<std::size_t>("sparse-init", options.sparsePoints);
   options.alignFloor = !args.has("no-align");
   if (args.has("view")) {
 #ifdef SPLAT_WITH_VIEWER

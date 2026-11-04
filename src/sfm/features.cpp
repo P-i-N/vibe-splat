@@ -14,7 +14,11 @@ namespace {
 
 constexpr int kScalesPerOctave = 3;
 constexpr float kBaseSigma = 1.6f;
-constexpr float kContrastThreshold = 0.04f / kScalesPerOctave;
+// A sixth of Lowe's 0.03 (per scale step, on a [0, 1] image). Only the
+// strongest extrema are kept, so on a busy image this changes nothing; it
+// matters where there is little contrast to begin with, such as a close-up of a
+// smooth, glossy object against a blurred background.
+constexpr float kContrastThreshold = 0.005f / kScalesPerOctave;
 constexpr float kEdgeRatio = 10.f;
 constexpr int kBorder = 5;
 constexpr int kOrientationBins = 36;
