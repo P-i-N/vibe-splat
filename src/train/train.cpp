@@ -326,11 +326,13 @@ TrainData load_train_data(const TrainOptions &options, const std::function<void(
   const ColmapModel &model = data.model;
   if (model.points.empty() || model.images.empty()) throw std::runtime_error("the sparse model has no points or no images");
 
+  // In file name order, as 3DGS and gsplat sort them, not by image id: COLMAP
+  // numbers images in the order it read them, so an imported model would
+  // otherwise hold out different photos than one from `splat sfm`.
   std::vector<const ColmapImage *> chosen;
-  for (const auto &[id, image] : model.images) {
-    if (options.maxViews > 0 && chosen.size() >= static_cast<std::size_t>(options.maxViews)) break;
-    chosen.push_back(&image);
-  }
+  for (const auto &[id, image] : model.images) chosen.push_back(&image);
+  std::stable_sort(chosen.begin(), chosen.end(), [](const ColmapImage *a, const ColmapImage *b) { return a->name < b->name; });
+  if (options.maxViews > 0 && chosen.size() > static_cast<std::size_t>(options.maxViews)) chosen.resize(static_cast<std::size_t>(options.maxViews));
 
   // Decoding and undistorting is most of the time: one image per thread.
   std::vector<TrainView> views(chosen.size());
@@ -407,6 +409,11 @@ TrainData load_train_data(const TrainOptions &options, const std::function<void(
 
   // Besides the sparse points, more from matching patches between the photos.
   data.startingPoints = model.points;
+  if (options.sparsePoints > 0 && data.startingPoints.size() > options.sparsePoints) {
+    std::mt19937 rng(options.seed);
+    std::shuffle(data.startingPoints.begin(), data.startingPoints.end(), rng);
+    data.startingPoints.resize(options.sparsePoints);
+  }
   if (options.densePoints > 0) {
     const auto started = std::chrono::steady_clock::now();
     std::vector<DensePointsView> densePointsViews;

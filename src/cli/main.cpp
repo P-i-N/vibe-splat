@@ -183,6 +183,7 @@ train options (writes project/splat.ply and project/preview_*.png):
   --second-order          After densification, step by estimated curvature, not Adam
   --dense-init <n>        Start from up to n more points than the sparse model has,
                           found by matching patches between the photos (default 50000)
+  --sparse-init <n>       Start from a random sample of at most n sparse points (0: all)
   --point-extent          Take the scene's extent from the sparse points, not the cameras
   --no-align              Save in the cameras' frame, rather than with the floor
                           level at y = 0 (-y up) under the scene's centre
@@ -528,7 +529,7 @@ int cmd_train(const GlobalOptions &opts) {
   args.allow_only({"out", "iterations", "lambda-ssim", "sh-degree", "max-size", "max-views", "holdout", "seed", "report-every", "save-every",
                    "no-densify", "densify", "gradient-threshold", "vram-budget", "max-gaussians", "prune", "full-resolution", "exposure", "full-adam",
                    "threshold-rise", "split-threshold", "dense-fraction", "densify-interval", "score-views", "score-min-pixels", "explore",
-                   "significance-prune", "point-extent", "adaptive-schedule", "max-growth", "opacity-reg", "scale-reg", "position-noise", "mip-filter", "mip-filter-2d", "mip-filter-3d", "edge-split", "recovery-prune", "sh-dropout", "refine-poses", "second-order", "dense-init", "no-align", "view"});
+                   "significance-prune", "point-extent", "adaptive-schedule", "max-growth", "opacity-reg", "scale-reg", "position-noise", "mip-filter", "mip-filter-2d", "mip-filter-3d", "edge-split", "recovery-prune", "sh-dropout", "refine-poses", "second-order", "dense-init", "sparse-init", "no-align", "view"});
   if (args.positionals().size() != 1) {
     std::println(stderr, "Usage: splat train <project> [options]  (see splat --help)");
     return 2;
@@ -581,6 +582,7 @@ int cmd_train(const GlobalOptions &opts) {
   options.refinePoses = args.has("refine-poses");
   options.secondOrder = args.has("second-order");
   options.densePoints = args.number<std::size_t>("dense-init", options.densePoints);
+  options.sparsePoints = args.number<std::size_t>("sparse-init", options.sparsePoints);
   options.alignFloor = !args.has("no-align");
   if (args.has("view")) {
 #ifdef SPLAT_WITH_VIEWER
