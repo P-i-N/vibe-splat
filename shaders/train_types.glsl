@@ -20,19 +20,29 @@ struct DensifyStat {
   vec4 more; // x: sum of the gradient without cancelling, y: marked pixels, z: those by loss, w: edge score
 };
 
+// A projected splat, 48 bytes, all of it used: the forward and backward passes
+// stage these in shared memory, so its size limits how many tiles run at once.
+// The covered tiles follow from the centre and the extent, see splat_tiles().
 struct TrainSplat {
-  vec4 centerRadius; // xy pixel centre, z radius in pixels, w view depth
   vec4 conicOpacity; // xyz inverse 2D covariance (xx, xy, yy), w opacity
-  vec4 color;        // rgb, a unused
-  vec4 extent;       // xy: half size of the area it can reach, in pixels
-  uvec4 tiles;       // Covered tiles, inclusive: x0, y0, x1, y1
+  vec4 colorRadius;  // rgb, w radius in pixels
+  vec2 center;       // Pixels
+  vec2 extent;       // Half size of the area it can reach, in pixels
 };
+
+// Covered tiles, inclusive, as x0, y0, x1, y1, on a grid of `grid` tiles.
+uvec4 splat_tiles(TrainSplat s, uvec2 grid) {
+  const vec2 last = vec2(grid) - 1.0;
+  const vec2 low = clamp(floor((s.center - s.extent - 1.0) / float(TILE_SIZE)), vec2(0.0), last);
+  const vec2 high = clamp(floor((s.center + s.extent + 1.0) / float(TILE_SIZE)), vec2(0.0), last);
+  return uvec4(uvec2(low), uvec2(high));
+}
 
 // The pixels of a tile that a splat can reach, as x0, y0, x1, y1 with the upper
 // bounds exclusive.
 uvec4 splat_pixels(TrainSplat s, uvec4 tilePixels) {
-  const vec2 low = max(s.centerRadius.xy - s.extent.xy - 0.5, vec2(0.0));
-  const vec2 high = max(s.centerRadius.xy + s.extent.xy + 0.5, vec2(0.0));
+  const vec2 low = max(s.center - s.extent - 0.5, vec2(0.0));
+  const vec2 high = max(s.center + s.extent + 0.5, vec2(0.0));
   return uvec4(max(uint(low.x), tilePixels.x), max(uint(low.y), tilePixels.y),
                min(uint(high.x) + 1u, tilePixels.z), min(uint(high.y) + 1u, tilePixels.w));
 }
@@ -46,7 +56,7 @@ uvec4 splat_pixels(TrainSplat s, uvec4 tilePixels) {
 bool splat_reaches_tile(TrainSplat s, uint tx, uint ty) {
   const vec3 q = s.conicOpacity.xyz;
   const float reach = 2.0 * log(255.0 * s.conicOpacity.w);
-  const vec2 low = vec2(tx, ty) * float(TILE_SIZE) + 0.5 - s.centerRadius.xy;
+  const vec2 low = vec2(tx, ty) * float(TILE_SIZE) + 0.5 - s.center;
   const vec2 high = low + float(TILE_SIZE - 1u);
   if (all(lessThanEqual(low, vec2(0.0))) && all(greaterThanEqual(high, vec2(0.0)))) {
     return true;
@@ -69,8 +79,8 @@ bool splat_reaches_tile(TrainSplat s, uint tx, uint ty) {
 // Evaluates a splat at a pixel. False if the pixel gets nothing from it. The
 // rules match the graphics path in splat.vert and splat.frag.
 bool splat_at(TrainSplat s, uint x, uint y, out vec2 d, out float power, out float alpha) {
-  d = vec2(float(x) + 0.5, float(y) + 0.5) - s.centerRadius.xy;
-  const float r = s.centerRadius.z;
+  d = vec2(float(x) + 0.5, float(y) + 0.5) - s.center;
+  const float r = s.colorRadius.w;
   if (abs(d.x) > r || abs(d.y) > r) {
     return false;
   }

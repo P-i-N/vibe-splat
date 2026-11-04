@@ -17,10 +17,12 @@ void main() {
   const Splat2D s = splats[order[gl_InstanceIndex]];
   // Triangle strip corners: (-1,-1), (1,-1), (-1,1), (1,1).
   const vec2 corner = vec2(float(gl_VertexIndex & 1) * 2.0 - 1.0, float(gl_VertexIndex >> 1) * 2.0 - 1.0);
-  const vec2 offset = corner * s.centerRadius.z;
-  const vec2 pixel = s.centerRadius.xy + offset;
+  const vec2 radiusConicA = unpackHalf2x16(s.shape.x);
+  const vec2 offset = corner * radiusConicA.x;
+  const vec2 pixel = s.center + offset;
   gl_Position = vec4(pixel / pc.viewport * 2.0 - 1.0, 0.0, 1.0);
   outOffset = offset;
-  outConicOpacity = s.conicOpacity;
-  outColor = s.color.rgb;
+  const vec2 blueOpacity = unpackHalf2x16(s.color.y);
+  outConicOpacity = vec4(radiusConicA.y, unpackHalf2x16(s.shape.y), blueOpacity.y);
+  outColor = vec3(unpackHalf2x16(s.color.x), blueOpacity.x);
 }

@@ -82,7 +82,7 @@ void main() {
   // Per half the image rather than per pixel, so that one threshold suits any resolution.
   densifyStats[i].main.x += length(gCentre * 0.5 * cam.viewport.xy);
   densifyStats[i].main.y += 1.0;
-  densifyStats[i].main.z = max(densifyStats[i].main.z, splats[i].centerRadius.z);
+  densifyStats[i].main.z = max(densifyStats[i].main.z, splats[i].colorRadius.w);
   densifyStats[i].main.w += raw[at + 9u] * 3.0 * cam.viewport.x * cam.viewport.y; // In pixels
   densifyStats[i].more.x += length(vec2(raw[at + 10u], raw[at + 11u]) * 0.5 * cam.viewport.xy);
   mat2 G = mat2(raw[at + 3u], raw[at + 4u], raw[at + 4u], raw[at + 5u]);

@@ -34,15 +34,17 @@ shared float h[3][3][ROWS * 16];
 float target_luminance(int x, int y) {
   x = clamp(x, 0, int(pc.width) - 1);
   y = clamp(y, 0, int(pc.height) - 1);
-  return dot(unpackUnorm4x8(target[uint(y) * pc.width + uint(x)]).rgb, vec3(0.299, 0.587, 0.114));
+  precise const float luminance = dot(unpackUnorm4x8(target[uint(y) * pc.width + uint(x)]).rgb, vec3(0.299, 0.587, 0.114));
+  return luminance;
 }
 
 // A Laplacian of the target's luminance, in [0, 1): the edge weight of the
 // edge-aware score (Improving Densification in 3DGS, CVPR 2026).
 float target_edge(int x, int y) {
-  // As differences, so that a flat patch gives exactly zero in float.
-  const float centre = target_luminance(x, y);
-  const float laplacian = (target_luminance(x - 1, y) - centre) + (target_luminance(x + 1, y) - centre) +
+  // As differences, so that a flat patch gives exactly zero in float. precise
+  // keeps the compiler from regrouping them, which Mesa's RADV otherwise does.
+  precise const float centre = target_luminance(x, y);
+  precise const float laplacian =(target_luminance(x - 1, y) - centre) + (target_luminance(x + 1, y) - centre) +
                           (target_luminance(x, y - 1) - centre) + (target_luminance(x, y + 1) - centre);
   return clamp(abs(laplacian) / 4.0, 0.0, 0.999);
 }

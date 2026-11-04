@@ -88,7 +88,7 @@ void main() {
         atomicAdd(doneCount, 1u);
         break;
       }
-      rgb += transmittance * alpha * s.color.rgb;
+      rgb += transmittance * alpha * s.colorRadius.rgb;
       transmittance *= 1.0 - alpha;
       logTransmittance += logRest;
     }

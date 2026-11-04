@@ -1,0 +1,29 @@
+{
+  "name": "imgui",
+  "version": "1.93.0",
+  "$comment": "Overlay of external/vcpkg/ports/imgui: keep version in sync with it. Only sdl3-binding is offered, and it depends on sdl3 without default features.",
+  "description": "Bloat-free Immediate Mode Graphical User interface for C++ with minimal dependencies.",
+  "homepage": "https://github.com/ocornut/imgui",
+  "license": "MIT",
+  "dependencies": [
+    {
+      "name": "vcpkg-cmake",
+      "host": true
+    },
+    {
+      "name": "vcpkg-cmake-config",
+      "host": true
+    }
+  ],
+  "features": {
+    "sdl3-binding": {
+      "description": "Make available SDL3 binding",
+      "dependencies": [
+        {
+          "name": "sdl3",
+          "default-features": false
+        }
+      ]
+    }
+  }
+}

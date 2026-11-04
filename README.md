@@ -235,8 +235,8 @@ does automatic differentiation: each pass has a hand-derived counterpart.
 - **Memory.** A hard budget, by default 90% of the GPU's free memory
   (`--vram-budget` overrides it). At the limit, the Gaussians with the highest
   gradients densify first, and a view that still does not fit gives up the
-  largest ones. At SH degree 3 a Gaussian takes about 1.1 KiB, plus 16 bytes per
-  tile it covers.
+  largest ones. At SH degree 3 a Gaussian takes about 870 bytes, plus 16 bytes
+  per tile it covers: values and gradients are floats, Adam's moments bfloat16.
 
 Images are undistorted when loaded, since the renderer is a pinhole camera.
 `src/train/reference.cpp` has every kernel again on the CPU: the tests check it

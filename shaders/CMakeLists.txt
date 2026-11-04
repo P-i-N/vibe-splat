@@ -9,6 +9,7 @@ splat_add_shader_library(splat_shaders
     splat.vert
     splat.frag
     pack_gaussians.comp
+    pack_sh.comp
     debug_line.vert
     debug_line.frag
     imgui.vert
