@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <random>
 
 using namespace splat;
 
@@ -131,6 +132,18 @@ TEST_CASE("Gaussians packed on the GPU render like those uploaded from the CPU",
   GaussianCloud cloud = make_test_scene(20'000);
   // Unnormalised rotations: the shader must normalise them as set_scene() does.
   for (float &q : cloud.rotations) q *= 1.7f;
+  // Degree 3 with view-dependent colour of about the size 3DGS trains, which
+  // the CPU path packs to bytes and the GPU path reads as floats.
+  std::mt19937 rng(5);
+  std::normal_distribution<float> rest(0.f, 0.1f);
+  std::vector<float> degree3;
+  for (std::size_t i = 0; i < cloud.size(); ++i) {
+    degree3.insert(degree3.end(), cloud.sh.begin() + static_cast<std::ptrdiff_t>(i * 3 * cloud.shCoeffs()),
+              cloud.sh.begin() + static_cast<std::ptrdiff_t>(i * 3 * cloud.shCoeffs() + 3));
+    for (int k = 0; k < 45; ++k) degree3.push_back(rest(rng));
+  }
+  cloud.shDegree = 3;
+  cloud.sh = std::move(degree3);
   const Camera cam = default_orbit(cloud).camera(160, 90);
 
   SplatRenderer fromCpu(*ctx, VK_FORMAT_R8G8B8A8_UNORM);
@@ -154,7 +167,10 @@ TEST_CASE("Gaussians packed on the GPU render like those uploaded from the CPU",
   REQUIRE(actual.rgba.size() == expected.rgba.size());
   int worst = 0;
   for (std::size_t i = 0; i < actual.rgba.size(); ++i) worst = std::max(worst, std::abs(actual.rgba[i] - expected.rgba[i]));
-  CHECK(worst <= 2); // exp() and sigmoid on the GPU differ in the last bits
+  const double value = test::psnr(actual, expected);
+  INFO("PSNR " << value << " dB, worst " << worst);
+  CHECK(value > 50.0);
+  CHECK(worst <= 8);
 }
 
 TEST_CASE("Point mode draws every Gaussian as an opaque dot", "[vulkan][render]") {

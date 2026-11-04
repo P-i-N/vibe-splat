@@ -15,17 +15,17 @@ namespace {
 using vk::Buffer;
 using vk::MemoryUsage;
 
-// Must match shaders/splat_types.glsl (std430).
+// Must match shaders/splat_types.glsl (std430). Only their sizes matter here:
+// the shaders write both.
 struct GpuGaussian {
-  float posOpacity[4];
-  float rotation[4];
-  float scale[4];
+  std::uint32_t data[6];
 };
-static_assert(sizeof(GpuGaussian) == 48);
+static_assert(sizeof(GpuGaussian) == 24);
 
 struct GpuSplat2D {
-  float data[12];
+  std::uint32_t data[6];
 };
+static_assert(sizeof(GpuSplat2D) == 24);
 
 struct GpuCamera {
   float view[16];
@@ -42,11 +42,20 @@ struct PreprocessPush {
   std::uint32_t maxShDegree;
   std::uint32_t pointMode;
   float pointRadius;
+  std::uint32_t packedSh;
 };
 
 struct PackPush {
   std::uint32_t count;
 };
+
+// Must match the push constants of shaders/pack_sh.comp.
+struct PackShPush {
+  std::uint32_t count, coefficients;
+};
+
+// As packed_sh_words() in shaders/splat_types.glsl.
+std::uint32_t packed_sh_words(std::uint32_t coefficients) { return 2 + (3 * (coefficients - 1) + 3) / 4; }
 
 struct DrawArgs {
   std::uint32_t vertexCount, instanceCount, firstVertex, firstInstance;
@@ -54,13 +63,12 @@ struct DrawArgs {
 
 constexpr VkBufferUsageFlags kStorage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
 
-float sigmoid(float x) { return 1.f / (1.f + std::exp(-x)); }
-
 } // namespace
 
 SplatRenderer::SplatRenderer(vk::Context &ctx, VkFormat colorFormat)
     : ctx_(ctx), preprocess_(ctx, shaders::preprocess_comp, 7, sizeof(PreprocessPush)),
-      pack_(ctx, shaders::pack_gaussians_comp, 5, sizeof(PackPush)), sorter_(ctx) {
+      pack_(ctx, shaders::pack_gaussians_comp, 5, sizeof(PackPush)), packSh_(ctx, shaders::pack_sh_comp, 2, sizeof(PackShPush)),
+      sorter_(ctx) {
   camera_ = std::make_unique<Buffer>(ctx_, sizeof(GpuCamera), kStorage, MemoryUsage::Upload);
   drawArgs_ = std::make_unique<Buffer>(ctx_, sizeof(DrawArgs),
                                        kStorage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, MemoryUsage::GpuOnly);
@@ -155,38 +163,33 @@ void SplatRenderer::set_scene(const GaussianCloud &cloud) {
   vkDeviceWaitIdle(ctx_.device());
   count_ = cloud.size();
   shDegree_ = cloud.shDegree;
-  shFloats_ = static_cast<std::uint32_t>(3 * cloud.shCoeffs());
+  const auto coefficients = static_cast<std::uint32_t>(cloud.shCoeffs());
+  shStride_ = packed_sh_words(coefficients);
+  shExternal_ = nullptr;
+  sh_.reset();
   if (count_ == 0) {
     return;
   }
 
-  std::vector<GpuGaussian> gpu(count_);
-  for (std::size_t i = 0; i < count_; ++i) {
-    GpuGaussian &g = gpu[i];
-    for (int a = 0; a < 3; ++a) {
-      g.posOpacity[a] = cloud.positions[i * 3 + a];
-      g.scale[a] = std::exp(cloud.scales[i * 3 + a]);
-    }
-    g.posOpacity[3] = sigmoid(cloud.opacities[i]);
-    g.scale[3] = 0.f;
-    float q[4];
-    float len = 0.f;
-    for (int a = 0; a < 4; ++a) {
-      q[a] = cloud.rotations[i * 4 + a];
-      len += q[a] * q[a];
-    }
-    len = std::sqrt(len);
-    for (int a = 0; a < 4; ++a) {
-      g.rotation[a] = len > 0.f ? q[a] / len : (a == 0 ? 1.f : 0.f);
-    }
-  }
-
+  // Packed on the GPU, by the shaders that pack a training scene, from raw
+  // values held only until then.
+  const auto upload = [&](const std::vector<float> &values) {
+    auto b = std::make_unique<Buffer>(ctx_, values.size() * sizeof(float), kStorage, MemoryUsage::GpuOnly);
+    b->upload(ctx_, std::span<const float>(values));
+    return b;
+  };
+  const auto positions = upload(cloud.positions), scales = upload(cloud.scales), rotations = upload(cloud.rotations),
+             opacities = upload(cloud.opacities), sh = upload(cloud.sh);
   capacity_ = 0;
   allocate(count_);
-  gaussians_->upload(ctx_, std::span<const GpuGaussian>(gpu));
-  sh_ = std::make_unique<Buffer>(ctx_, cloud.sh.size() * sizeof(float), kStorage, MemoryUsage::GpuOnly);
-  sh_->upload(ctx_, std::span<const float>(cloud.sh));
-  shExternal_ = nullptr;
+  sh_ = std::make_unique<Buffer>(ctx_, VkDeviceSize{count_} * shStride_ * sizeof(std::uint32_t), kStorage, MemoryUsage::GpuOnly);
+  const auto count = static_cast<std::uint32_t>(count_);
+  ctx_.submit_and_wait([&](VkCommandBuffer cmd) {
+    pack_.dispatch(cmd, {positions.get(), scales.get(), rotations.get(), opacities.get(), gaussians_.get()}, PackPush{count},
+                   vk::div_up(count, 256));
+    packSh_.dispatch(cmd, {sh.get(), sh_.get()}, PackShPush{count, coefficients}, vk::div_up(count, 256));
+    vk::compute_barrier(cmd);
+  });
 }
 
 void SplatRenderer::allocate(std::size_t count) {
@@ -207,7 +210,7 @@ void SplatRenderer::allocate(std::size_t count) {
 void SplatRenderer::set_scene(VkCommandBuffer cmd, const GpuCloud &cloud) {
   count_ = cloud.count;
   shDegree_ = std::min(cloud.activeDegree, cloud.shDegree);
-  shFloats_ = static_cast<std::uint32_t>(3 * (cloud.shDegree + 1) * (cloud.shDegree + 1));
+  shStride_ = static_cast<std::uint32_t>(3 * (cloud.shDegree + 1) * (cloud.shDegree + 1));
   sh_.reset();
   shExternal_ = cloud.sh;
   if (count_ == 0) return;
@@ -239,7 +242,7 @@ void SplatRenderer::record(VkCommandBuffer cmd, const Camera &camera, VkImageVie
     gc.viewport[3] = 0.5f * static_cast<float>(extent.height) / camera.fy;
     gc.counts[0] = count;
     gc.counts[1] = static_cast<std::uint32_t>(std::max(std::min(shDegree_, settings.maxShDegree), 0));
-    gc.counts[2] = shFloats_;
+    gc.counts[2] = shStride_;
     std::memcpy(camera_->mapped().data(), &gc, sizeof(gc));
     camera_->flush();
 
@@ -248,7 +251,7 @@ void SplatRenderer::record(VkCommandBuffer cmd, const Camera &camera, VkImageVie
     vk::compute_barrier(cmd);
 
     const PreprocessPush push{settings.splatScale, static_cast<std::uint32_t>(std::max(settings.maxShDegree, 0)),
-                              settings.points ? 1u : 0u, settings.pointRadius};
+                              settings.points ? 1u : 0u, settings.pointRadius, sh_ ? 1u : 0u};
     const Buffer *sh = sh_ ? sh_.get() : shExternal_;
     preprocess_.dispatch(cmd, {gaussians_.get(), sh, camera_.get(), splats2d_.get(), keys_.get(), values_.get(), drawArgs_.get()},
                          push, vk::div_up(count, 256));

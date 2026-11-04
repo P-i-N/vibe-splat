@@ -1,0 +1,44 @@
+#version 460
+// Packs SH coefficients, laid out as in GaussianCloud, for the renderer: per
+// Gaussian the DC term and the largest magnitude of the rest as half floats,
+// then the rest as signed bytes relative to that magnitude (see
+// packed_sh_words()).
+#extension GL_GOOGLE_include_directive : require
+#include "splat_types.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer SH { float sh[]; };
+layout(std430, binding = 1) writeonly buffer Packed { uint packed[]; };
+
+layout(push_constant) uniform Push {
+  uint count;
+  uint coefficients; // Per colour channel
+} pc;
+
+void main() {
+  const uint i = gl_GlobalInvocationID.x;
+  if (i >= pc.count) {
+    return;
+  }
+  const uint in0 = i * 3u * pc.coefficients;
+  const uint rest = 3u * (pc.coefficients - 1u);
+  const uint out0 = i * packed_sh_words(pc.coefficients);
+  float largest = 0.0;
+  for (uint j = 0u; j < rest; ++j) {
+    largest = max(largest, abs(sh[in0 + 3u + j]));
+  }
+  packed[out0] = packHalf2x16(vec2(sh[in0], sh[in0 + 1u]));
+  packed[out0 + 1u] = packHalf2x16(vec2(sh[in0 + 2u], largest));
+  // Against the scale as the renderer reads it. Where rounding made it smaller,
+  // packSnorm4x8() clamps the largest to it, an error of under 0.05 %.
+  const float scale = unpackHalf2x16(packHalf2x16(vec2(largest))).x;
+  const float inverse = scale > 0.0 ? 1.0 / scale : 0.0;
+  for (uint j = 0u; j < rest; j += 4u) {
+    vec4 v = vec4(0.0);
+    for (uint k = 0u; k < 4u && j + k < rest; ++k) {
+      v[k] = sh[in0 + 3u + j + k] * inverse;
+    }
+    packed[out0 + 2u + j / 4u] = packSnorm4x8(v);
+  }
+}

@@ -47,8 +47,9 @@ public:
   SplatRenderer(const SplatRenderer &) = delete;
   SplatRenderer &operator=(const SplatRenderer &) = delete;
 
-  // Uploads a scene (activating opacity, scale and rotation). Waits for the
-  // GPU. Must not be called while a frame using this renderer is in flight.
+  // Uploads a scene, activating opacity, scale and rotation and packing them
+  // and the SH coefficients (see shaders/splat_types.glsl). Waits for the GPU.
+  // Must not be called while a frame using this renderer is in flight.
   void set_scene(const GaussianCloud &cloud);
   // Records the conversion of Gaussians already on the GPU. Waits for nothing:
   // no frame using this renderer may be in flight.
@@ -75,6 +76,7 @@ private:
   vk::Context &ctx_;
   vk::ComputePipeline preprocess_;
   vk::ComputePipeline pack_;
+  vk::ComputePipeline packSh_;
   vk::RadixSorter sorter_;
 
   VkDescriptorSetLayout drawSetLayout_ = VK_NULL_HANDLE;
@@ -83,9 +85,9 @@ private:
 
   std::size_t count_ = 0;
   std::size_t capacity_ = 0;
-  const vk::Buffer *shExternal_ = nullptr; // From set_scene(cmd, GpuCloud), instead of sh_
+  const vk::Buffer *shExternal_ = nullptr; // From set_scene(cmd, GpuCloud), as floats, instead of the packed sh_
   int shDegree_ = 0;
-  std::uint32_t shFloats_ = 3;
+  std::uint32_t shStride_ = 3; // Words of sh_, or floats of shExternal_, per Gaussian
   std::unique_ptr<vk::Buffer> gaussians_;
   std::unique_ptr<vk::Buffer> sh_;
   std::unique_ptr<vk::Buffer> splats2d_;

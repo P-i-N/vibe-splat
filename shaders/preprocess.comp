@@ -9,7 +9,7 @@
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer Gaussians { Gaussian gaussians[]; };
-layout(std430, binding = 1) readonly buffer SH { float sh[]; };
+layout(std430, binding = 1) readonly buffer SH { uint sh[]; }; // Packed by pack_sh.comp, or floats
 layout(std430, binding = 2) readonly buffer Camera { CameraParams cam; };
 layout(std430, binding = 3) writeonly buffer Splats { Splat2D splats[]; };
 layout(std430, binding = 4) writeonly buffer Keys { uint keys[]; };
@@ -28,6 +28,7 @@ layout(push_constant) uniform Settings {
   uint maxShDegree;
   uint pointMode;
   float pointRadius;
+  uint packedSh; // Whether sh[] is packed rather than GaussianCloud's floats
 } settings;
 
 const float SH_C0 = 0.28209479177387814;
@@ -38,9 +39,21 @@ const float SH_C3[7] = float[](-0.5900435899266435, 2.890611442640554, -0.457045
                                0.3731763325901154, -0.4570457994644658, 1.445305721320277,
                                -0.5900435899266435);
 
+float sh_rest(uint base, uint j, float scale) {
+  return unpackSnorm4x8(sh[base + 2u + j / 4u])[j % 4u] * scale;
+}
+
 vec3 sh_coeff(uint base, uint k) {
-  const uint o = base + k * 3u;
-  return vec3(sh[o], sh[o + 1u], sh[o + 2u]);
+  if (settings.packedSh == 0u) {
+    const uint o = base + k * 3u;
+    return uintBitsToFloat(uvec3(sh[o], sh[o + 1u], sh[o + 2u]));
+  }
+  const vec2 high = unpackHalf2x16(sh[base + 1u]);
+  if (k == 0u) {
+    return vec3(unpackHalf2x16(sh[base]), high.x);
+  }
+  const uint j = (k - 1u) * 3u;
+  return vec3(sh_rest(base, j, high.y), sh_rest(base, j + 1u, high.y), sh_rest(base, j + 2u, high.y));
 }
 
 vec3 eval_sh(uint index, vec3 dir) {
@@ -78,6 +91,14 @@ mat3 quat_to_mat(vec4 q) {
               2.0 * (x * z + w * y), 2.0 * (y * z - w * x), 1.0 - 2.0 * (x * x + y * y));
 }
 
+void write_splat(uint i, vec2 center, float radius, vec3 conic, vec3 color, float opacity) {
+  Splat2D s;
+  s.center = center;
+  s.shape = uvec2(packHalf2x16(vec2(radius, conic.x)), packHalf2x16(conic.yz));
+  s.color = uvec2(packHalf2x16(color.rg), packHalf2x16(vec2(color.b, opacity)));
+  splats[i] = s;
+}
+
 void main() {
   const uint i = gl_GlobalInvocationID.x;
   if (i >= cam.counts.x) {
@@ -88,17 +109,19 @@ void main() {
   values[i] = i;
 
   const Gaussian g = gaussians[i];
-  const vec3 t = (cam.view * vec4(g.posOpacity.xyz, 1.0)).xyz;
+  const vec3 position = vec3(g.position[0], g.position[1], g.position[2]);
+  const vec2 scaleZOpacity = unpackHalf2x16(g.scaleZOpacity);
+  const vec3 t = (cam.view * vec4(position, 1.0)).xyz;
   if (t.z < 0.2) {
     return;
   }
-  const float opacity = settings.pointMode != 0u ? 1.0 : g.posOpacity.w;
-  if (g.posOpacity.w < 1.0 / 255.0) {
+  const float opacity = settings.pointMode != 0u ? 1.0 : scaleZOpacity.y;
+  if (scaleZOpacity.y < 1.0 / 255.0) {
     return;
   }
   const float fx = cam.intrinsics.x, fy = cam.intrinsics.y;
   const vec2 center = vec2(fx * t.x / t.z + cam.intrinsics.z, fy * t.y / t.z + cam.intrinsics.w);
-  const vec3 dir = normalize(g.posOpacity.xyz - cam.position.xyz);
+  const vec3 dir = normalize(position - cam.position.xyz);
 
   if (settings.pointMode != 0u) {
     const float r = settings.pointRadius;
@@ -107,17 +130,15 @@ void main() {
     }
     // A Gaussian with sigma r / 2: solid in the middle, soft at the rim.
     const float inv = 4.0 / (r * r);
-    splats[i].centerRadius = vec4(center, r, t.z);
-    splats[i].conicOpacity = vec4(inv, 0.0, inv, 1.0);
-    splats[i].color = vec4(eval_sh(i, dir), 1.0);
+    write_splat(i, center, r, vec3(inv, 0.0, inv), eval_sh(i, dir), 1.0);
     keys[i] = 0xFFFFFFFFu - floatBitsToUint(t.z);
     atomicAdd(draw.instanceCount, 1u);
     return;
   }
 
   // 3D covariance: R S S^T R^T.
-  const mat3 R = quat_to_mat(g.rotation);
-  const vec3 scale = g.scale.xyz * settings.splatScale;
+  const mat3 R = quat_to_mat(unpack_rotation(g.rotation));
+  const vec3 scale = vec3(unpackHalf2x16(g.scaleXY), scaleZOpacity.x) * settings.splatScale;
   const mat3 S = mat3(scale.x, 0.0, 0.0, 0.0, scale.y, 0.0, 0.0, 0.0, scale.z);
   const mat3 M = R * S;
   const mat3 sigma = M * transpose(M);
@@ -151,9 +172,7 @@ void main() {
     return;
   }
 
-  splats[i].centerRadius = vec4(center, radius, t.z);
-  splats[i].conicOpacity = vec4(conic, opacity);
-  splats[i].color = vec4(eval_sh(i, dir), 1.0);
+  write_splat(i, center, radius, conic, eval_sh(i, dir), opacity);
 
   // Back-to-front order: larger depth must sort first, so invert the
   // (monotonic, positive) float bits.

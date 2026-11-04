@@ -402,23 +402,6 @@ TEST_CASE("Loading a malformed CGC file throws", "[cgc]") {
   std::filesystem::remove(path);
 }
 
-namespace {
-
-double psnr(const RenderedImage &a, const RenderedImage &b) {
-  double sum = 0.0;
-  std::size_t n = 0;
-  for (std::size_t i = 0; i < a.rgba.size(); ++i) {
-    if (i % 4 == 3) continue;
-    const double d = static_cast<double>(a.rgba[i]) - static_cast<double>(b.rgba[i]);
-    sum += d * d;
-    ++n;
-  }
-  const double mse = sum / static_cast<double>(n);
-  return mse == 0.0 ? 99.0 : 10.0 * std::log10(255.0 * 255.0 / mse);
-}
-
-} // namespace
-
 TEST_CASE("A CGC scene renders like the original", "[vulkan][cgc]") {
   vk::Context *ctx = test::context();
   if (ctx == nullptr) {
@@ -435,7 +418,7 @@ TEST_CASE("A CGC scene renders like the original", "[vulkan][cgc]") {
   b.set_scene(loaded);
   const RenderedImage imageB = render_offscreen(*ctx, b, camera);
 
-  const double value = psnr(imageA, imageB);
+  const double value = test::psnr(imageA, imageB);
   INFO("PSNR " << value << " dB");
   CHECK(value > 35.0);
 }

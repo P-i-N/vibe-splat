@@ -1,7 +1,8 @@
 #version 460
 // Turns raw parameters, laid out as in GaussianCloud (and the trainer's
-// buffers), into the activated Gaussians the renderer reads. Lets the viewer
-// show training as it happens without a trip through the CPU.
+// buffers), into the activated, packed Gaussians the renderer reads. Lets the
+// viewer show training as it happens without a trip through the CPU, and is
+// the one encoder of that layout: set_scene() runs it on uploaded scenes too.
 #extension GL_GOOGLE_include_directive : require
 #include "splat_types.glsl"
 
@@ -25,8 +26,9 @@ void main() {
   const vec4 q = rotations[i];
   const float len = length(q);
   Gaussian g;
-  g.posOpacity = vec4(position, 1.0 / (1.0 + exp(-opacities[i])));
-  g.rotation = len > 0.0 ? q / len : vec4(1.0, 0.0, 0.0, 0.0);
-  g.scale = vec4(scale, 0.0);
+  g.position = float[3](position.x, position.y, position.z);
+  g.rotation = pack_rotation(len > 0.0 ? q / len : vec4(1.0, 0.0, 0.0, 0.0));
+  g.scaleXY = packHalf2x16(scale.xy);
+  g.scaleZOpacity = packHalf2x16(vec2(scale.z, 1.0 / (1.0 + exp(-opacities[i]))));
   gaussians[i] = g;
 }
