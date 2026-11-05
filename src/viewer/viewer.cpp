@@ -454,6 +454,7 @@ private:
   bool showCameras_ = true, showPoints_ = false, showGrid_ = false, showAxes_ = false;
   bool pointMode_ = false, autoRotate_ = false, vsync_ = true;
   float splatScale_ = 1.f, pointRadius_ = 2.f, frustumScale_ = 1.f;
+  float moveSpeed_ = 1.f; // WASD/stick multiplier on kMoveSpeed
   int shDegree_ = 3;
   float background_[3] = {0.f, 0.f, 0.f};
 
@@ -1025,7 +1026,9 @@ void Viewer::update_input(float dt) {
     right = static_cast<float>(keys[SDL_SCANCODE_D]) - static_cast<float>(keys[SDL_SCANCODE_A]);
     upward = static_cast<float>(keys[SDL_SCANCODE_E]) - static_cast<float>(keys[SDL_SCANCODE_Q]);
   }
-  const float speed = (SDL_GetModState() & SDL_KMOD_SHIFT ? 2.4f : 0.6f) * dt;
+  // A fraction of the orbit distance per second; Shift moves 4x faster.
+  constexpr float kMoveSpeed = 0.2f;
+  const float speed = kMoveSpeed * moveSpeed_ * (SDL_GetModState() & SDL_KMOD_SHIFT ? 4.f : 1.f) * dt;
   if (pad_ != nullptr) {
     fwd -= stick(pad_, SDL_GAMEPAD_AXIS_LEFTY);
     right += stick(pad_, SDL_GAMEPAD_AXIS_LEFTX);
@@ -1650,6 +1653,7 @@ void Viewer::panel_view() {
     unsnap();
     orbit_.fovDeg = fov;
   }
+  ImGui::SliderFloat("move speed", &moveSpeed_, 0.1f, 10.f, "%.2fx", ImGuiSliderFlags_Logarithmic);
   ImGui::ColorEdit3("background", background_, ImGuiColorEditFlags_NoInputs);
   ImGui::Checkbox("cameras", &showCameras_);
   ImGui::SameLine();

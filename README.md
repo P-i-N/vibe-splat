@@ -60,13 +60,14 @@ on) and can overlay the sparse points. Everything else sits in the corners:
   GPU buffers, so live preview costs no copies; a slider sets how much of each
   frame goes to training.
 - **Bottom right**: view settings: splats or their centres, splat scale, SH
-  degree, field of view, background, grid, axes, cameras and points.
+  degree, field of view, move speed, background, grid, axes, cameras and
+  points.
 
 | Input | Does |
 | --- | --- |
 | left drag / Ctrl+left drag | look around / orbit the target |
 | right or middle drag / wheel | pan / zoom (Ctrl+wheel: field of view) |
-| W A S D, Q E | move (Shift: faster) |
+| W A S D, Q E | move (Shift: 4x faster; "move speed" slider scales both) |
 | F, R, T | frame the scene, reset the view, turntable |
 | 1, 2 | splats, Gaussian centres as dots |
 | C, P, G | cameras, sparse points, grid |
