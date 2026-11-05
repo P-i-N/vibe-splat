@@ -63,3 +63,8 @@ set_tests_properties(cli_sfm PROPERTIES DEPENDS cli_sfm_ingest)
 set_tests_properties(cli_sfm_render PROPERTIES DEPENDS cli_sfm)
 add_test(NAME cli_train COMMAND splat train "${SFM_DIR}/project" --iterations 30)
 set_tests_properties(cli_train PROPERTIES DEPENDS cli_sfm)
+if(NODE_EXECUTABLE)
+  # train also writes the scene into a browser viewer page, which must decode.
+  add_test(NAME web_train_html COMMAND "${NODE_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/web_html_check.mjs" "${SFM_DIR}/project/splat.html")
+  set_tests_properties(web_train_html PROPERTIES DEPENDS cli_train)
+endif()

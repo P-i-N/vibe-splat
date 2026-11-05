@@ -106,6 +106,9 @@ struct TrainOptions {
   // Turn and move the saved Gaussians so the floor is level at y = 0, -y up,
   // by scene_alignment(). Training itself stays in the cameras' frame.
   bool alignFloor = true;
+  // Next to the final output, also write <out>.html: the browser viewer with
+  // the scene built in, as CGC.
+  bool html = true;
 };
 
 // The two files training writes: TrainOptions::out as a .ply and as a .cgc.

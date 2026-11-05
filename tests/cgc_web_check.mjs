@@ -38,4 +38,11 @@ for (let i = 0; i < count; ++i) {
   }
 }
 if (worst > 1e-3) throw new Error(`largest relative difference ${worst}`);
+
+// web/viewer.html carries its own copy of the decoder, since pages opened from
+// file:// cannot import modules. It must stay identical.
+const unix = (path) => readFileSync(new URL(path, import.meta.url), 'utf8').replaceAll('\r\n', '\n');
+if (!unix('../web/viewer.html').includes(unix('../web/cgc.js').trimEnd())) {
+  throw new Error('web/viewer.html does not contain web/cgc.js verbatim; paste it in again');
+}
 console.log(`${count} splats decoded in ${milliseconds.toFixed(0)} ms, largest relative difference ${worst.toExponential(2)}`);

@@ -8,6 +8,7 @@
 #include "splat/align.hpp"
 #include "splat/cgc.hpp"
 #include "splat/gaussian_cloud.hpp"
+#include "splat/web_viewer.hpp"
 #include "train/dense_points.hpp"
 #include "train/densify.hpp"
 #include "train/evaluate.hpp"
@@ -768,13 +769,19 @@ std::function<void()> TrainSession::save_outputs(bool quick) {
   }
   // Quick settings for checkpoints, so that they don't hold up training. At
   // full quality a million Gaussians take about a minute.
-  return [cloud, cgc, quick, log = log_] {
+  // The final save also puts that .cgc into the browser viewer, as <out>.html.
+  const fs::path page = quick || !options_.html ? fs::path() : fs::path(options_.out).replace_extension(".html");
+  return [cloud, cgc, page, quick, log = log_] {
     const auto start = std::chrono::steady_clock::now();
     if (!quick) log(std::format("Compressing {} Gaussians into {}", cloud->size(), cgc.filename().string()));
     save_through_temporary(*cloud, cgc, CloudFormat::Cgc, CgcOptions{.fast = quick});
     if (!quick) {
       log(std::format("Wrote {} in {:.1f} s ({:.1f} MB)", cgc.string(),
                       std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), static_cast<double>(fs::file_size(cgc)) / 1e6));
+    }
+    if (!page.empty()) {
+      save_scene_html(page, read_file(cgc), cgc.filename().string());
+      log(std::format("Wrote {}, the scene in a browser viewer ({:.1f} MB)", page.string(), static_cast<double>(fs::file_size(page)) / 1e6));
     }
   };
 }
