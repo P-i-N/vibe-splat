@@ -23,9 +23,15 @@ struct GpuGaussian {
 static_assert(sizeof(GpuGaussian) == 24);
 
 struct GpuSplat2D {
-  std::uint32_t data[6];
+  std::uint32_t data[5];
 };
-static_assert(sizeof(GpuSplat2D) == 24);
+static_assert(sizeof(GpuSplat2D) == 20);
+
+// Must match the push constants of shaders/splat.vert.
+struct DrawPush {
+  float viewport[2];
+  float pointRadius;
+};
 
 struct GpuCamera {
   float view[16];
@@ -55,7 +61,10 @@ struct PackShPush {
 };
 
 // As packed_sh_words() in shaders/splat_types.glsl.
-std::uint32_t packed_sh_words(std::uint32_t coefficients) { return 2 + (3 * (coefficients - 1) + 3) / 4; }
+std::uint32_t packed_sh_words(std::uint32_t coefficients) {
+  const std::uint32_t bits = coefficients > 1 ? 72 + 12 * (coefficients - 4) : 0;
+  return (coefficients >= 9 ? 3 : 2) + (bits + 31) / 32;
+}
 
 struct DrawArgs {
   std::uint32_t vertexCount, instanceCount, firstVertex, firstInstance;
@@ -86,7 +95,7 @@ SplatRenderer::~SplatRenderer() {
 void SplatRenderer::create_graphics_pipeline(VkFormat colorFormat) {
   VkDevice dev = ctx_.device();
   drawSetLayout_ = vk::create_storage_set_layout(dev, 2, VK_SHADER_STAGE_VERTEX_BIT);
-  VkPushConstantRange range{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(float) * 2};
+  VkPushConstantRange range{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(DrawPush)};
   VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
   plci.setLayoutCount = 1;
   plci.pSetLayouts = &drawSetLayout_;
@@ -243,6 +252,7 @@ void SplatRenderer::record(VkCommandBuffer cmd, const Camera &camera, VkImageVie
     gc.counts[0] = count;
     gc.counts[1] = static_cast<std::uint32_t>(std::max(std::min(shDegree_, settings.maxShDegree), 0));
     gc.counts[2] = shStride_;
+    gc.counts[3] = static_cast<std::uint32_t>((shDegree_ + 1) * (shDegree_ + 1));
     std::memcpy(camera_->mapped().data(), &gc, sizeof(gc));
     camera_->flush();
 
@@ -279,8 +289,8 @@ void SplatRenderer::record(VkCommandBuffer cmd, const Camera &camera, VkImageVie
     vkCmdSetScissor(cmd, 0, 1, &scissor);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, drawPipeline_);
     vk::push_storage_buffers(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, drawLayout_, {splats2d_.get(), values_.get()});
-    const float viewportSize[2] = {static_cast<float>(extent.width), static_cast<float>(extent.height)};
-    vkCmdPushConstants(cmd, drawLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(viewportSize), viewportSize);
+    const DrawPush push{{static_cast<float>(extent.width), static_cast<float>(extent.height)}, settings.points ? settings.pointRadius : 0.f};
+    vkCmdPushConstants(cmd, drawLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), &push);
     vkCmdDrawIndirect(cmd, drawArgs_->handle(), 0, 1, sizeof(DrawArgs));
   }
   vkCmdEndRendering(cmd);

@@ -11,12 +11,44 @@ struct Gaussian {
   uint scaleZOpacity; // Half floats: z standard deviation, opacity in [0,1] (already activated)
 };
 
-// 24 bytes. The centre stays a full float: halves are 2 px apart beyond 2048.
+// 20 bytes. The centre stays a full float: halves are 2 px apart beyond 2048.
+// The quad's radius follows from the conic, see splat_radius().
 struct Splat2D {
-  vec2 center; // Pixels
-  uvec2 shape; // Half floats: radius in pixels, inverse 2D covariance (a, b, c)
-  uvec2 color; // Half floats: rgb, opacity
+  float center[2];    // Pixels
+  uint conicAB;       // Half floats: inverse 2D covariance a, b
+  uint conicCOpacity; // Half floats: its c, and the opacity
+  uint color;         // See pack_color()
 };
+
+// Colour as Vulkan's E5B9G9R9 format: 9-bit mantissas that share a 5-bit
+// exponent, so that colours over 1, which blending sees before the target
+// clamps, keep their size. Trained scenes have some up to 4 and more.
+uint pack_color(vec3 c) {
+  c = clamp(c, 0.0, 65408.0);
+  const float largest = max(c.r, max(c.g, c.b));
+  if (!(largest > 0.0)) {
+    return 0u;
+  }
+  int exponent = max(-16, int(floor(log2(largest)))) + 16;
+  float step = exp2(float(exponent - 24));
+  if (floor(largest / step + 0.5) >= 512.0) {
+    ++exponent;
+    step *= 2.0;
+  }
+  const uvec3 v = uvec3(floor(c / step + 0.5));
+  return v.r | (v.g << 9) | (v.b << 18) | (uint(exponent) << 27);
+}
+vec3 unpack_color(uint bits) {
+  return vec3(uvec3(bits, bits >> 9, bits >> 18) & 511u) * exp2(float(int(bits >> 27) - 24));
+}
+
+// 3 standard deviations along the major axis of the 2D covariance (a, b, c)
+// = (xx, xy, yy), in whole pixels: the half size of the quad.
+float splat_radius(float a, float b, float c) {
+  const float mid = 0.5 * (a + c);
+  const float lambda = mid + sqrt(max(0.1, mid * mid - (a * c - b * b)));
+  return ceil(3.0 * sqrt(lambda));
+}
 
 // Smallest three: which component is largest in the top 2 bits, then the
 // other three in [-sqrt(1/2), sqrt(1/2)] at 10 bits each. q and -q are the
@@ -57,10 +89,29 @@ vec4 unpack_rotation(uint bits) {
   return q;
 }
 
-// Words per Gaussian of SH packed by pack_sh.comp: the DC term and a scale as
-// half floats, then the other coefficients as signed bytes times that scale.
+// SH packed by pack_sh.comp, per Gaussian: the DC term and each band's
+// largest magnitude as half floats, then the coefficients relative to that,
+// band 1 as signed bytes and bands 2 and 3 as signed 4 bits, which their
+// smaller part of the colour allows. Words:
+//   0     DC r, g
+//   1     DC b, band 1's scale
+//   2     band 2's scale, band 3's (from degree 2)
+//   then  band 1's 9 bytes, then the 4-bit values, which never cross a word
+uint packed_sh_header(uint coefficients) {
+  return coefficients >= 9u ? 3u : 2u;
+}
 uint packed_sh_words(uint coefficients) {
-  return 2u + (3u * (coefficients - 1u) + 3u) / 4u;
+  const uint bits = coefficients > 1u ? 72u + 12u * (coefficients - 4u) : 0u;
+  return packed_sh_header(coefficients) + (bits + 31u) / 32u;
+}
+// The band of coefficient k > 0, and the bit at which its channel c starts
+// after the header, with its width.
+uint sh_band(uint k) {
+  return k < 4u ? 1u : k < 9u ? 2u : 3u;
+}
+uvec2 packed_sh_bits(uint k, uint c) {
+  const uint j = (k - 1u) * 3u + c;
+  return k < 4u ? uvec2(8u * j, 8u) : uvec2(72u + 4u * (j - 9u), 4u);
 }
 
 // SH as the trainer keeps it, per Gaussian: the DC term's 3 floats, then the
@@ -85,7 +136,7 @@ struct CameraParams {
   vec4 position;   // camera centre in world space
   vec4 intrinsics; // fx, fy, cx, cy (pixels)
   vec4 viewport;   // width, height, tan(half fov x), tan(half fov y)
-  uvec4 counts;    // gaussian count, SH degree, SH words per gaussian, SH coefficients in use (training only)
+  uvec4 counts;    // gaussian count, SH degree, SH words per gaussian, SH coefficients (in use, when training)
 };
 
 #endif
