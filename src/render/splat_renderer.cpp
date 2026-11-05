@@ -75,8 +75,8 @@ constexpr VkBufferUsageFlags kStorage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
 } // namespace
 
 SplatRenderer::SplatRenderer(vk::Context &ctx, VkFormat colorFormat)
-    : ctx_(ctx), preprocess_(ctx, shaders::preprocess_comp, 7, sizeof(PreprocessPush)),
-      pack_(ctx, shaders::pack_gaussians_comp, 5, sizeof(PackPush)), packSh_(ctx, shaders::pack_sh_comp, 2, sizeof(PackShPush)),
+    : ctx_(ctx), preprocess_(ctx, shaders::preprocess_comp(), 7, sizeof(PreprocessPush)),
+      pack_(ctx, shaders::pack_gaussians_comp(), 5, sizeof(PackPush)), packSh_(ctx, shaders::pack_sh_comp(), 2, sizeof(PackShPush)),
       sorter_(ctx) {
   camera_ = std::make_unique<Buffer>(ctx_, sizeof(GpuCamera), kStorage, MemoryUsage::Upload);
   drawArgs_ = std::make_unique<Buffer>(ctx_, sizeof(DrawArgs),
@@ -103,8 +103,8 @@ void SplatRenderer::create_graphics_pipeline(VkFormat colorFormat) {
   plci.pPushConstantRanges = &range;
   vk::check(vkCreatePipelineLayout(dev, &plci, nullptr, &drawLayout_), "vkCreatePipelineLayout");
 
-  VkShaderModule vert = vk::create_shader_module(dev, shaders::splat_vert);
-  VkShaderModule frag = vk::create_shader_module(dev, shaders::splat_frag);
+  VkShaderModule vert = vk::create_shader_module(dev, shaders::splat_vert());
+  VkShaderModule frag = vk::create_shader_module(dev, shaders::splat_frag());
   VkPipelineShaderStageCreateInfo stages[2]{};
   stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
   stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;

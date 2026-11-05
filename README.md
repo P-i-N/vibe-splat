@@ -26,8 +26,9 @@ All milestones, M1 (viewer) to M6 (polish), are done:
   below).
 - `splat make-test-views dir/` renders images with known poses to try it on.
 - `splat train project/` trains Gaussians from those poses and writes
-  `project/splat.ply` (see below), plus `project/splat.html`: the scene in a
-  single-page browser viewer, to open from disk or send to anyone.
+  `project/splat.ply` and `project/splat.cgc` (see below), plus
+  `project/splat.html`: the scene in a single-page browser viewer, to open
+  from disk or send to anyone.
 
 Any `.ply` in the standard 3DGS layout should work, with SH degree 0 to 3.
 That is the layout written by the original implementation and most trainers.
@@ -53,19 +54,22 @@ on) and can overlay the sparse points. Everything else sits in the corners:
 - **Top left**: the scene, splat counts, frame rate and GPU. When looking
   through a photo, its name and a thumbnail.
 - **Top right**: keys and mouse (H hides them).
-- **Bottom left**: training. Set the iterations, image size, holdout, SH
-  degree and whether to save `.ply` or compressed `.cgc`, then watch progress, loss, PSNR, Gaussians and VRAM, with pause,
-  save and finish buttons. The Gaussians are drawn straight from the trainer's
+- **Bottom left**: training. Set the iterations, image size, holdout and SH
+  degree, then watch progress, loss, PSNR, Gaussians and VRAM, with pause,
+  save and finish buttons. It saves both `splat.ply` and compressed `splat.cgc`;
+  at the end the `.cgc` is compressed on another thread, as that takes about a
+  minute per million Gaussians. The Gaussians are drawn straight from the trainer's
   GPU buffers, so live preview costs no copies; a slider sets how much of each
   frame goes to training.
 - **Bottom right**: view settings: splats or their centres, splat scale, SH
-  degree, field of view, background, grid, axes, cameras and points.
+  degree, field of view, move speed, background, grid, axes, cameras and
+  points.
 
 | Input | Does |
 | --- | --- |
 | left drag / Ctrl+left drag | look around / orbit the target |
 | right or middle drag / wheel | pan / zoom (Ctrl+wheel: field of view) |
-| W A S D, Q E | move (Shift: faster) |
+| W A S D, Q E | move (Shift: 4x faster; "move speed" slider scales both) |
 | F, R, T | frame the scene, reset the view, turntable |
 | 1, 2 | splats, Gaussian centres as dots |
 | C, P, G | cameras, sparse points, grid |
@@ -243,11 +247,14 @@ does automatic differentiation: each pass has a hand-derived counterpart.
   Gaussians. It helps when poses are a little off and costs a little when they
   are good, so it is off by default.
 - **View dependence.** SH starts at degree 0 and gains a degree every 1000
-  iterations, up to `--sh-degree`.
+  iterations, up to `--sh-degree`, 2 by default. Degree 3, as in 3DGS, adds
+  finer view-dependent colour; on bicycle at 15000 iterations it trained 8%
+  slower and its final `.cgc` took 3x longer to compress.
 - **Memory.** A hard budget, by default 90% of the GPU's free memory
   (`--vram-budget` overrides it). At the limit, the Gaussians with the highest
   gradients densify first, and a view that still does not fit gives up the
-  largest ones. At SH degree 3 a Gaussian takes about 540 bytes, plus 16 bytes
+  largest ones. At SH degree 2 a Gaussian takes about 420 bytes (540 at
+  degree 3), plus 16 bytes
   per tile it covers: values are floats, but SH above degree 0 half floats,
   Adam's moments are bfloat16, and gradients are never stored, as each step is
   taken where they are found.
@@ -282,8 +289,8 @@ supports all of these, and so does Mesa (RADV, ANV, lavapipe).
 
 Wherever `splat` writes or reads a scene, a `.cgc` extension selects CGC
 (Compressed Gaussian Cloud) instead of `.ply`. It is meant for sending scenes
-over the network, for example to a browser viewer. `splat train -o scene.cgc`
-and `splat make-test-scene scene.cgc` write it directly, and `splat convert
+over the network, for example to a browser viewer. `splat train` writes one
+next to its `.ply`, `splat make-test-scene scene.cgc` writes it directly, and `splat convert
 scene.ply scene.cgc` converts an existing file. `view` and `render` open it
 like a `.ply`.
 
@@ -309,9 +316,8 @@ viewer with the scene embedded in it (base64), which opens anywhere as one
 standalone file. Embed a `.cgc` rather than a `.ply`: it is about 28x smaller,
 and browsers cannot hold a page of several hundred megabytes.
 
-`splat train` writes such a page next to its output, `<out>.html`, always
-with CGC inside. For a `.ply` output that means one more CGC encode at the
-end of training; `--no-html` skips the page. The program carries
+`splat train` writes such a page next to its output, `<out>.html`, with
+the final `.cgc` inside; `--no-html` skips it. The program carries
 `web/viewer.html` built in, so the page always matches the build.
 
 Controls follow the native viewer: drag to look around, Ctrl+drag to orbit the
@@ -367,10 +373,16 @@ appears upside down, pass `--up +y` (or `+z`/`-z`).
 y = 0 under the scene's centre, -y up. Training itself stays in the cameras'
 frame; only the saved copy is turned (positions, orientations and the
 view-dependent colour). Up comes from the cameras, whose x axes lie level when
-held by people, and the floor is the plane holding the most opaque Gaussians,
+held by people, and the floor is the plane holding the most sparse points,
 by RANSAC, within 20 degrees of that, favouring level ones and with the
 cameras above it. If no such plane stands out, the scene is only levelled by
 the cameras' up. Pass `--no-align` to save in the cameras' frame.
+
+The floor is found once, before training, from the camera poses and sparse
+points alone, so every checkpoint is saved the same way and the viewer can
+use it too: it shows a project's cameras, points and the Gaussians being
+trained turned the same way, with the grid on the floor, so the view while
+training matches the saved file.
 
 ## Building
 

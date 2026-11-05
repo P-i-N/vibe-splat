@@ -27,10 +27,10 @@ void copy_buffer(VkCommandBuffer cmd, const Buffer &src, const Buffer &dst, VkDe
 } // namespace
 
 RadixSorter::RadixSorter(Context &ctx)
-    : ctx_(ctx), histogram_(ctx, shaders::radix_histogram_comp, 2, sizeof(RadixPush)),
-      scatter_(ctx, shaders::radix_scatter_comp, 5, sizeof(RadixPush)),
-      scanBlocks_(ctx, shaders::scan_blocks_comp, 2, sizeof(ScanPush)),
-      scanAdd_(ctx, shaders::scan_add_comp, 2, sizeof(ScanPush)) {}
+    : ctx_(ctx), histogram_(ctx, shaders::radix_histogram_comp(), 2, sizeof(RadixPush)),
+      scatter_(ctx, shaders::radix_scatter_comp(), 5, sizeof(RadixPush)),
+      scanBlocks_(ctx, shaders::scan_blocks_comp(), 2, sizeof(ScanPush)),
+      scanAdd_(ctx, shaders::scan_add_comp(), 2, sizeof(ScanPush)) {}
 
 const Buffer &RadixSorter::scan_level(std::size_t level, std::uint32_t blocks) {
   if (scanSums_.size() <= level) {
