@@ -81,7 +81,9 @@ jobs:
 
       - name: Package the zip
         run: |
-          cmake -DINSTALLED=build/windows-release/vcpkg_installed/x64-windows-static -DOUT=build/windows-release/THIRD_PARTY_NOTICES.txt `
+          # Quoted: PowerShell splits an unquoted -D argument at its first dot,
+          # which left OUT without its .txt.
+          cmake "-DINSTALLED=build/windows-release/vcpkg_installed/x64-windows-static" "-DOUT=build/windows-release/THIRD_PARTY_NOTICES.txt" `
             -P packaging/collect-notices.cmake
           New-Item -ItemType Directory -Force package/splat | Out-Null
           Copy-Item build/windows-release/src/splat.exe, README.md, LICENSE, build/windows-release/THIRD_PARTY_NOTICES.txt package/splat/
