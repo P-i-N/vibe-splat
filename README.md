@@ -26,7 +26,8 @@ All milestones, M1 (viewer) to M6 (polish), are done:
   below).
 - `splat make-test-views dir/` renders images with known poses to try it on.
 - `splat train project/` trains Gaussians from those poses and writes
-  `project/splat.ply` (see below).
+  `project/splat.ply` (see below), plus `project/splat.html`: the scene in a
+  single-page browser viewer, to open from disk or send to anyone.
 
 Any `.ply` in the standard 3DGS layout should work, with SH degree 0 to 3.
 That is the layout written by the original implementation and most trainers.
@@ -298,6 +299,27 @@ view-dependent colour lose more. Older `.cgc` files still load.
 [web/cgc.js](web/cgc.js) is a dependency-free decoder for browsers, LZMA included.
 The byte layout and the measurements behind it are in
 `docs/superpowers/specs/2026-11-02-cgc-v2-format.md`.
+
+### Web viewer
+
+[web/viewer.html](web/viewer.html) is a single-file WebGL 2 viewer for `.cgc`
+and `.ply` scenes. Open it straight from disk, no web server needed, then use
+**Open** or drop a file on the page. **Save as HTML** writes a copy of the
+viewer with the scene embedded in it (base64), which opens anywhere as one
+standalone file. Embed a `.cgc` rather than a `.ply`: it is about 28x smaller,
+and browsers cannot hold a page of several hundred megabytes.
+
+`splat train` writes such a page next to its output, `<out>.html`, always
+with CGC inside. For a `.ply` output that means one more CGC encode at the
+end of training; `--no-html` skips the page. The program carries
+`web/viewer.html` built in, so the page always matches the build.
+
+Controls follow the native viewer: drag to look around, Ctrl+drag to orbit the
+target, right drag (or Shift+drag) to pan, wheel to zoom, WASD/QE to move
+(Shift: faster), R to reset the view, U to change the up axis (`-y` by
+default). Two-finger touch pans and zooms. The page carries its own copy of
+`cgc.js`, because pages opened from `file://` cannot import modules;
+`tests/cgc_web_check.mjs` fails if the two copies drift apart.
 
 ### Pruning floaters
 

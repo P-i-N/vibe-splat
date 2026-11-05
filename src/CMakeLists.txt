@@ -35,7 +35,18 @@ add_library(splat_core STATIC
   train/schedule.cpp
   train/trainer.cpp
   train/train.cpp
+  splat/web_viewer.cpp
+  "${CMAKE_CURRENT_BINARY_DIR}/web_viewer_html.cpp"
 )
+# The browser viewer is built into the program, for the pages `train` writes.
+add_custom_command(
+  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/web_viewer_html.cpp"
+  COMMAND "${CMAKE_COMMAND}" -DINPUT=${PROJECT_SOURCE_DIR}/web/viewer.html
+          -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/web_viewer_html.cpp -DSYMBOL=viewer_html
+          -P "${PROJECT_SOURCE_DIR}/cmake/EmbedFile.cmake"
+  DEPENDS "${PROJECT_SOURCE_DIR}/web/viewer.html" "${PROJECT_SOURCE_DIR}/cmake/EmbedFile.cmake"
+  COMMENT "Embedding web/viewer.html"
+  VERBATIM)
 target_include_directories(splat_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_include_directories(splat_core PRIVATE "${STB_INCLUDE_DIR}")
 target_link_libraries(splat_core

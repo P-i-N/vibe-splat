@@ -100,6 +100,9 @@ struct TrainOptions {
   // Turn and move the saved Gaussians so the floor is level at y = 0, -y up.
   // Training itself stays in the cameras' frame.
   bool alignFloor = true;
+  // Next to the final output, also write <out>.html: the browser viewer with
+  // the scene built in, as CGC.
+  bool html = true;
 };
 
 struct TrainReport {
@@ -208,7 +211,9 @@ private:
   // Mip-Splatting's 3D smoothing filter from the cameras of the current size.
   void refresh_filter(int iteration);
   // Saves, and returns how the floor was found, or nothing if it was not looked for.
-  std::string save_output(const std::filesystem::path &path, const CgcOptions &cgcOptions);
+  // With `html`, also writes options_.out as a viewer page (see TrainOptions::html).
+  std::string save_output(const std::filesystem::path &path, const CgcOptions &cgcOptions, bool html = false);
+  void save_html(GaussianCloud &cloud, const std::filesystem::path &written);
 
   vk::Context &ctx_;
   TrainOptions options_;

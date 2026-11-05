@@ -2,6 +2,7 @@
 #include "render/splat_renderer.hpp"
 #include "splat/cgc.hpp"
 #include "splat/lzma.hpp"
+#include "splat/web_viewer.hpp"
 #include "test_support.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -17,6 +18,7 @@
 #include <fstream>
 #include <random>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 using namespace splat;
@@ -676,4 +678,19 @@ TEST_CASE("CGC file bytes follow the spec layout", "[cgc]") {
   CHECK(value(10) == 20);  // gap of 1 at step 0.05
   CHECK(value(11) == 10);  // gap of 1 at step 0.1
   CHECK(value(15) == 64);  // alpha 0.5 at 7 bits
+}
+
+TEST_CASE("Viewer pages carry the scene in base64", "[cgc]") {
+  const auto page = [](std::string_view bytes, std::string_view name) {
+    return scene_html({reinterpret_cast<const std::uint8_t *>(bytes.data()), bytes.size()}, name);
+  };
+  const std::string html = page("Man", "a&b\"<c.cgc");
+  CHECK(html.find(R"(<script id="scene" type="application/octet-stream" data-name="a&#38;b&#34;&#60;c.cgc">TWFu</script>)") !=
+        std::string::npos);
+  CHECK(html.find(R"(<script id="scene" type="application/octet-stream"></script>)") == std::string::npos);
+  CHECK(html.starts_with("<!doctype html>"));
+  CHECK(html.find("</html>") != std::string::npos);
+  CHECK(page("Ma", "x").find(">TWE=</script>") != std::string::npos);
+  CHECK(page("M", "x").find(">TQ==</script>") != std::string::npos);
+  CHECK(page("", "x").find(R"(data-name="x"></script>)") != std::string::npos);
 }

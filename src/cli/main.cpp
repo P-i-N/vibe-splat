@@ -119,7 +119,7 @@ sfm options (writes project/sparse/0 in COLMAP's format, plus preview.ply):
   --cpu                   Match features on the CPU even when a GPU is available
   --import <dir>          Instead of estimating, import a COLMAP sparse model
 
-train options (writes project/splat.ply and project/preview_*.png):
+train options (writes project/splat.ply, splat.html and preview_*.png):
   -o, --out <file>        Output file, .ply or compressed .cgc
   --iterations <n>        Default 30000
   --lambda-ssim <x>       Weight of D-SSIM against L1 (default 0.2)
@@ -187,6 +187,7 @@ train options (writes project/splat.ply and project/preview_*.png):
   --point-extent          Take the scene's extent from the sparse points, not the cameras
   --no-align              Save in the cameras' frame, rather than with the floor
                           level at y = 0 (-y up) under the scene's centre
+  --no-html               Skip <out>.html, the scene built into the browser viewer
   --view                  Train in the viewer window, watching it as it goes
 
 make-test-views options:
@@ -525,11 +526,11 @@ int cmd_train(const GlobalOptions &opts) {
   for (auto &a : rest) {
     if (a == "-o") a = "--out";
   }
-  const splat::cli::Args args(rest, {"--no-densify", "--full-resolution", "--exposure", "--full-adam", "--significance-prune", "--point-extent", "--adaptive-schedule", "--mip-filter", "--mip-filter-2d", "--mip-filter-3d", "--edge-split", "--refine-poses", "--second-order", "--no-align", "--view"});
+  const splat::cli::Args args(rest, {"--no-densify", "--full-resolution", "--exposure", "--full-adam", "--significance-prune", "--point-extent", "--adaptive-schedule", "--mip-filter", "--mip-filter-2d", "--mip-filter-3d", "--edge-split", "--refine-poses", "--second-order", "--no-align", "--no-html", "--view"});
   args.allow_only({"out", "iterations", "lambda-ssim", "sh-degree", "max-size", "max-views", "holdout", "seed", "report-every", "save-every",
                    "no-densify", "densify", "gradient-threshold", "vram-budget", "max-gaussians", "prune", "full-resolution", "exposure", "full-adam",
                    "threshold-rise", "split-threshold", "dense-fraction", "densify-interval", "score-views", "score-min-pixels", "explore",
-                   "significance-prune", "point-extent", "adaptive-schedule", "max-growth", "opacity-reg", "scale-reg", "position-noise", "mip-filter", "mip-filter-2d", "mip-filter-3d", "edge-split", "recovery-prune", "sh-dropout", "refine-poses", "second-order", "dense-init", "sparse-init", "no-align", "view"});
+                   "significance-prune", "point-extent", "adaptive-schedule", "max-growth", "opacity-reg", "scale-reg", "position-noise", "mip-filter", "mip-filter-2d", "mip-filter-3d", "edge-split", "recovery-prune", "sh-dropout", "refine-poses", "second-order", "dense-init", "sparse-init", "no-align", "no-html", "view"});
   if (args.positionals().size() != 1) {
     std::println(stderr, "Usage: splat train <project> [options]  (see splat --help)");
     return 2;
@@ -584,6 +585,7 @@ int cmd_train(const GlobalOptions &opts) {
   options.densePoints = args.number<std::size_t>("dense-init", options.densePoints);
   options.sparsePoints = args.number<std::size_t>("sparse-init", options.sparsePoints);
   options.alignFloor = !args.has("no-align");
+  options.html = !args.has("no-html");
   if (args.has("view")) {
 #ifdef SPLAT_WITH_VIEWER
     splat::ViewerOptions vo;

@@ -8,6 +8,7 @@
 #include "splat/align.hpp"
 #include "splat/cgc.hpp"
 #include "splat/gaussian_cloud.hpp"
+#include "splat/web_viewer.hpp"
 #include "train/dense_points.hpp"
 #include "train/densify.hpp"
 #include "train/evaluate.hpp"
@@ -710,7 +711,7 @@ StepStats TrainSession::step() {
   return stats;
 }
 
-std::string TrainSession::save_output(const fs::path &path, const CgcOptions &cgcOptions) {
+std::string TrainSession::save_output(const fs::path &path, const CgcOptions &cgcOptions, bool html) {
   if (options_.mipFilter3d && (filterLevel_ == ~std::size_t{0} || filter3d_.size() != trainer_->gaussian_count())) {
     refresh_filter(std::max(iteration_, 1));
   }
@@ -735,7 +736,26 @@ std::string TrainSession::save_output(const fs::path &path, const CgcOptions &cg
                              : "no floor plane found, levelled by the cameras' up";
   }
   save_cloud(cloud, path, format, cgcOptions);
+  if (html) save_html(cloud, path);
   return floorNote;
+}
+
+void TrainSession::save_html(GaussianCloud &cloud, const fs::path &written) {
+  const fs::path page = fs::path(options_.out).replace_extension(".html");
+  const std::string name = fs::path(options_.out.filename()).replace_extension(".cgc").string();
+  std::vector<std::uint8_t> cgc;
+  if (cloud_format(written) == CloudFormat::Cgc) {
+    cgc = read_file(written);
+  } else {
+    // The page always carries CGC, about 28x smaller than PLY.
+    remove_non_finite(cloud);
+    const fs::path temporary = fs::path(page).concat(".cgc.tmp");
+    save_cgc(cloud, temporary);
+    cgc = read_file(temporary);
+    fs::remove(temporary);
+  }
+  save_scene_html(page, cgc, name);
+  log_(std::format("Wrote {}, the scene in a browser viewer ({:.1f} MB)", page.string(), static_cast<double>(fs::file_size(page)) / 1e6));
 }
 
 void TrainSession::save(const fs::path &path) {
@@ -772,7 +792,7 @@ TrainReport TrainSession::finish() {
   }
 
   report_.gaussians = trainer.gaussian_count();
-  if (const std::string floorNote = save_output(options_.out, CgcOptions{}); !floorNote.empty()) {
+  if (const std::string floorNote = save_output(options_.out, CgcOptions{}, options_.html); !floorNote.empty()) {
     log_(std::format("Aligned to the floor: {}", floorNote));
   }
   write_preview(trainer.render(data_.trainViews[0].camera), data_.trainViews[0], options_.project / "preview_train.png");

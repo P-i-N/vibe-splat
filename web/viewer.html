@@ -1,0 +1,909 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Splat viewer</title>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#000;color:#ccc;font:13px system-ui,sans-serif}
+canvas{display:block;width:100%;height:100%;touch-action:none}
+#ui{position:fixed;left:8px;top:8px;display:flex;flex-wrap:wrap;gap:8px;align-items:center;text-shadow:0 0 3px #000}
+#ui button,#ui label{font:inherit;color:#ddd;background:#222c;border:1px solid #555;border-radius:4px;padding:3px 8px;cursor:pointer}
+#help{position:fixed;left:8px;bottom:6px;opacity:.6;text-shadow:0 0 3px #000}
+</style>
+<!-- An exported page carries its scene here, base64 encoded. -->
+<script id="scene" type="application/octet-stream"></script>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="ui"><label>Open<input id="file" type="file" accept=".cgc,.ply" hidden></label><button id="save" hidden>Save as HTML</button><span id="info">Open or drop a .cgc or .ply file</span></div>
+<div id="help">drag: look · Ctrl+drag: orbit · right drag: pan · wheel: zoom · WASD QE: move · R: reset · U: up axis</div>
+<script type="module">
+// ---- web/cgc.js, verbatim (file:// pages cannot import modules) ----
+// A dependency-free CGC version 2 decoder for browsers and Node, including its
+// own LZMA decoder. decodeCgc(arrayBuffer) returns flat typed arrays:
+//   count, shDegree,
+//   positions (3 per splat), scales (3, log), rotations (4, w x y z),
+//   opacities (1, logit), sh (3 * (shDegree + 1)^2, [coefficient][rgb]).
+// The byte layout is in docs/superpowers/specs/2026-11-02-cgc-v2-format.md.
+
+const SH_C0 = 0.28209479177387814;
+const ROTATION_RANGE = 0.70710678;
+
+// Decodes a .lzma ("alone") stream with an end marker into `size` bytes.
+export function lzmaDecode(input, size) {
+  const props = input[0];
+  if (props >= 225) throw new Error('bad LZMA properties');
+  const pb = Math.floor(props / 45);
+  const lp = Math.floor((props % 45) / 9);
+  const lc = props % 9;
+  const out = new Uint8Array(size);
+  const init = 1024;
+  const fill = (n) => new Uint16Array(n).fill(init);
+
+  const isMatch = fill(192);
+  const isRep = fill(12);
+  const isRep0 = fill(12);
+  const isRep1 = fill(12);
+  const isRep2 = fill(12);
+  const isRep0Long = fill(192);
+  const literal = fill(0x300 << (lc + lp));
+  const posSlot = fill(4 * 64);
+  const posSpecial = fill(115);
+  const align = fill(16);
+  const newLength = () => ({ choice: fill(2), low: fill(16 * 8), mid: fill(16 * 8), high: fill(256) });
+  const matchLength = newLength();
+  const repLength = newLength();
+
+  let pos = 18; // 13-byte header, then the range coder's zero byte and 4 code bytes
+  if (input.length < 18) throw new Error('truncated LZMA stream');
+  let range = 0xffffffff;
+  let code = ((input[14] << 24) | (input[15] << 16) | (input[16] << 8) | input[17]) >>> 0;
+
+  const normalize = () => {
+    if (range < 0x1000000) {
+      range = (range << 8) >>> 0;
+      code = ((code << 8) | input[pos++]) >>> 0;
+    }
+  };
+  const bit = (probs, i) => {
+    normalize();
+    const p = probs[i];
+    const bound = (range >>> 11) * p;
+    if (code < bound) {
+      range = bound;
+      probs[i] = p + ((2048 - p) >> 5);
+      return 0;
+    }
+    range = (range - bound) >>> 0;
+    code = (code - bound) >>> 0;
+    probs[i] = p - (p >> 5);
+    return 1;
+  };
+  const tree = (probs, offset, bits) => {
+    let m = 1;
+    for (let i = 0; i < bits; ++i) m = (m << 1) | bit(probs, offset + m);
+    return m - (1 << bits);
+  };
+  const reverseTree = (probs, offset, bits) => {
+    let m = 1;
+    let sym = 0;
+    for (let i = 0; i < bits; ++i) {
+      const b = bit(probs, offset + m);
+      m = (m << 1) | b;
+      sym |= b << i;
+    }
+    return sym;
+  };
+  const length = (l, posState) => {
+    if (bit(l.choice, 0) === 0) return tree(l.low, posState * 8, 3);
+    if (bit(l.choice, 1) === 0) return 8 + tree(l.mid, posState * 8, 3);
+    return 16 + tree(l.high, 0, 8);
+  };
+
+  const pbMask = (1 << pb) - 1;
+  const lpMask = (1 << lp) - 1;
+  let state = 0;
+  let rep0 = 0;
+  let rep1 = 0;
+  let rep2 = 0;
+  let rep3 = 0;
+  let n = 0;
+  for (;;) {
+    const posState = n & pbMask;
+    if (bit(isMatch, (state << 4) + posState) === 0) {
+      if (n >= size) throw new Error('LZMA data is larger than expected');
+      const prev = n > 0 ? out[n - 1] : 0;
+      const base = 0x300 * (((n & lpMask) << lc) + (prev >> (8 - lc)));
+      let sym = 1;
+      if (state >= 7) {
+        let match = out[n - rep0 - 1];
+        do {
+          const matchBit = (match >> 7) & 1;
+          match <<= 1;
+          const b = bit(literal, base + ((1 + matchBit) << 8) + sym);
+          sym = (sym << 1) | b;
+          if (matchBit !== b) break;
+        } while (sym < 0x100);
+      }
+      while (sym < 0x100) sym = (sym << 1) | bit(literal, base + sym);
+      out[n++] = sym & 0xff;
+      state = state < 4 ? 0 : state < 10 ? state - 3 : state - 6;
+      continue;
+    }
+    let len;
+    if (bit(isRep, state) !== 0) {
+      if (n === 0) throw new Error('corrupt LZMA data');
+      if (bit(isRep0, state) === 0) {
+        if (bit(isRep0Long, (state << 4) + posState) === 0) {
+          state = state < 7 ? 9 : 11;
+          if (n >= size) throw new Error('LZMA data is larger than expected');
+          out[n] = out[n - rep0 - 1];
+          ++n;
+          continue;
+        }
+      } else {
+        let dist;
+        if (bit(isRep1, state) === 0) {
+          dist = rep1;
+        } else {
+          if (bit(isRep2, state) === 0) {
+            dist = rep2;
+          } else {
+            dist = rep3;
+            rep3 = rep2;
+          }
+          rep2 = rep1;
+        }
+        rep1 = rep0;
+        rep0 = dist;
+      }
+      len = length(repLength, posState);
+      state = state < 7 ? 8 : 11;
+    } else {
+      rep3 = rep2;
+      rep2 = rep1;
+      rep1 = rep0;
+      len = length(matchLength, posState);
+      state = state < 7 ? 7 : 10;
+      const slot = tree(posSlot, Math.min(len, 3) * 64, 6);
+      if (slot < 4) {
+        rep0 = slot;
+      } else {
+        const direct = (slot >> 1) - 1;
+        let dist = ((2 | (slot & 1)) * 2 ** direct);
+        if (slot < 14) {
+          dist += reverseTree(posSpecial, dist - slot, direct);
+        } else {
+          let high = 0;
+          for (let i = direct - 4; i > 0; --i) {
+            normalize();
+            range >>>= 1;
+            const b = code >= range ? 1 : 0;
+            if (b) code = (code - range) >>> 0;
+            high = high * 2 + b;
+          }
+          dist += high * 16 + reverseTree(align, 0, 4);
+        }
+        rep0 = dist;
+        if (rep0 === 0xffffffff) break; // end marker
+      }
+    }
+    if (rep0 >= n) throw new Error('corrupt LZMA data');
+    len += 2;
+    if (len > size - n) throw new Error('LZMA data is larger than expected');
+    const from = n - rep0 - 1;
+    for (let i = 0; i < len; ++i) out[n + i] = out[from + i];
+    n += len;
+  }
+  if (n !== size) throw new Error(`LZMA data has ${n} bytes, expected ${size}`);
+  return out;
+}
+
+const unzigzag = (z) => (z & 1 ? -((z + 1) / 2) : z / 2);
+
+export function decodeCgc(buffer) {
+  const view = new DataView(buffer);
+  const u32 = (at) => view.getUint32(at, true);
+  const f32 = (at) => view.getFloat32(at, true);
+  if (buffer.byteLength < 36 || u32(0) !== 0x00434743) throw new Error('not a CGC file');
+  if (u32(4) !== 2) throw new Error(`unsupported CGC version ${u32(4)}`);
+  const count = u32(8);
+  const shDegree = u32(12);
+  const layerCount = u32(16);
+  const center = [f32(20), f32(24), f32(28)];
+  const radius = f32(32);
+  const coeffs = (shDegree + 1) * (shDegree + 1);
+  const dims = (coeffs - 1) * 3;
+
+  const positions = new Float32Array(count * 3);
+  const scales = new Float32Array(count * 3);
+  const rotations = new Float32Array(count * 4);
+  const opacities = new Float32Array(count);
+  const sh = new Float32Array(count * coeffs * 3);
+
+  let at = 36 + layerCount * 92;
+  const column = (size) => {
+    const length = u32(at);
+    const stream = new Uint8Array(buffer, at + 4, length);
+    at += 4 + length;
+    return lzmaDecode(stream, size);
+  };
+
+  let first = 0;
+  for (let l = 0; l < layerCount; ++l) {
+    const h = 36 + l * 92;
+    const n = u32(h);
+    if (n === 0) continue;
+    const posBits = u32(h + 4);
+    const rotBits = u32(h + 8);
+    const alphaBits = u32(h + 12);
+    const bookSize = u32(h + 28);
+    const posLo = [f32(h + 32), f32(h + 36), f32(h + 40)];
+    const posStep = f32(h + 44);
+    const scaleLo = f32(h + 48);
+    const scaleStep = f32(h + 52);
+    const gap1Step = f32(h + 56);
+    const gap2Step = f32(h + 60);
+    const colorLo = [f32(h + 64), f32(h + 68), f32(h + 72)];
+    const colorStep = [f32(h + 76), f32(h + 80), f32(h + 84)];
+    const bookStep = f32(h + 88);
+
+    // Positions: Morton gaps. Codes reach 63 bits, so they are summed and
+    // split in 24-bit limbs that never leave a 32-bit integer.
+    const planes = [];
+    const planeCount = Math.ceil((posBits * 3) / 8);
+    for (let p = 0; p < planeCount; ++p) planes.push(column(n));
+    const limbs = [0, 0, 0];
+    for (let j = 0; j < n; ++j) {
+      let g0 = 0;
+      let g1 = 0;
+      let g2 = 0;
+      for (let p = 0; p < planeCount; ++p) {
+        const shifted = planes[p][j] << (8 * (p % 3));
+        if (p < 3) g0 |= shifted;
+        else if (p < 6) g1 |= shifted;
+        else g2 |= shifted;
+      }
+      limbs[0] += g0;
+      limbs[1] += g1 + (limbs[0] >>> 24);
+      limbs[0] &= 0xffffff;
+      limbs[2] += g2 + (limbs[1] >>> 24);
+      limbs[1] &= 0xffffff;
+      const q = [0, 0, 0];
+      for (let b = 0; b < posBits; ++b) {
+        for (let a = 0; a < 3; ++a) {
+          const index = b * 3 + a;
+          q[a] += ((limbs[Math.floor(index / 24)] >>> (index % 24)) & 1) * 2 ** b;
+        }
+      }
+      for (let a = 0; a < 3; ++a) {
+        const y = posLo[a] + q[a] * posStep;
+        positions[(first + j) * 3 + a] = Math.sign(y) * Math.expm1(Math.abs(y)) * radius + center[a];
+      }
+    }
+
+    const rot = [column(n), column(n), column(n)];
+    const scale = [column(n), column(n), column(n)];
+    const color = [column(n), column(n), column(n)];
+    const alpha = column(n);
+    const rotationStep = ROTATION_RANGE / ((1 << (rotBits - 1)) - 1);
+    const levels = 2 ** alphaBits;
+    for (let j = 0; j < n; ++j) {
+      const out = first + j;
+      const x = unzigzag(rot[0][j]) * rotationStep;
+      const y = unzigzag(rot[1][j]) * rotationStep;
+      const z = unzigzag(rot[2][j]) * rotationStep;
+      rotations[out * 4] = Math.sqrt(Math.max(0, 1 - x * x - y * y - z * z));
+      rotations[out * 4 + 1] = x;
+      rotations[out * 4 + 2] = y;
+      rotations[out * 4 + 3] = z;
+      const s0 = scaleLo + scale[0][j] * scaleStep;
+      const s1 = s0 - scale[1][j] * gap1Step;
+      scales[out * 3] = s0;
+      scales[out * 3 + 1] = s1;
+      scales[out * 3 + 2] = s1 - scale[2][j] * gap2Step;
+      const Y = colorLo[0] + color[0][j] * colorStep[0];
+      const Co = colorLo[1] + color[1][j] * colorStep[1];
+      const Cg = colorLo[2] + color[2][j] * colorStep[2];
+      const t = Y - 0.5 * Cg;
+      sh[out * coeffs * 3] = (t + 0.5 * Co - 0.5) / SH_C0;
+      sh[out * coeffs * 3 + 1] = (Y + 0.5 * Cg - 0.5) / SH_C0;
+      sh[out * coeffs * 3 + 2] = (t - 0.5 * Co - 0.5) / SH_C0;
+      const a = (alpha[j] + 0.5) / levels;
+      opacities[out] = Math.log(a / (1 - a));
+    }
+
+    if (dims > 0) {
+      const labelLow = column(n);
+      const labelHigh = column(n);
+      const bookLow = column(bookSize * dims);
+      const bookHigh = column(bookSize * dims);
+      const book = new Float32Array(bookSize * dims);
+      for (let t = 0; t < bookSize; ++t) {
+        const value = (a) => unzigzag(bookLow[a * bookSize + t] | (bookHigh[a * bookSize + t] << 8)) * bookStep;
+        for (let a = 0; a < dims; a += 3) {
+          const Y = value(a);
+          const Co = value(a + 1);
+          const Cg = value(a + 2);
+          const u = Y - 0.5 * Cg;
+          book[t * dims + a] = u + 0.5 * Co;
+          book[t * dims + a + 1] = Y + 0.5 * Cg;
+          book[t * dims + a + 2] = u - 0.5 * Co;
+        }
+      }
+      for (let j = 0; j < n; ++j) {
+        const label = labelLow[j] | (labelHigh[j] << 8);
+        if (label >= bookSize) throw new Error('SH label outside the codebook');
+        sh.set(book.subarray(label * dims, (label + 1) * dims), ((first + j) * coeffs + 1) * 3);
+      }
+    }
+    first += n;
+  }
+  if (first !== count) throw new Error('layer sizes do not add up');
+  if (at !== buffer.byteLength) throw new Error('file has unexpected trailing data');
+  return { count, shDegree, positions, scales, rotations, opacities, sh };
+}
+// ---- end of web/cgc.js ----
+
+const $ = (id) => document.getElementById(id);
+const canvas = $('canvas');
+const info = $('info');
+const gl = canvas.getContext('webgl2', { antialias: false, alpha: false });
+if (!gl) info.textContent = 'WebGL 2 is not available';
+
+// The page without its scene, the template for "Save as HTML".
+const sceneTag = $('scene');
+const embedded = sceneTag.textContent.trim();
+const embeddedName = sceneTag.dataset.name || 'scene';
+sceneTag.textContent = '';
+delete sceneTag.dataset.name;
+const page = '<!doctype html>\n' + document.documentElement.outerHTML;
+const emptyScene = '<script id="scene" type="application/octet-stream"><\/script>';
+
+// ---- Reading PLY and packing splats for the GPU ----
+
+// Every splat is read into one scratch row: position, log scale, rotation
+// (w x y z), opacity logit, then SH as [coefficient][rgb].
+function plyReader(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const end = new TextDecoder().decode(bytes.subarray(0, 65536)).indexOf('end_header\n');
+  if (end < 0) throw new Error('not a PLY file');
+  const header = new TextDecoder().decode(bytes.subarray(0, end));
+  if (!header.includes('format binary_little_endian')) throw new Error('only binary little-endian PLY is supported');
+  const sizes = { char: 1, uchar: 1, int8: 1, uint8: 1, short: 2, ushort: 2, int16: 2, uint16: 2, int: 4, uint: 4, int32: 4, uint32: 4, float: 4, float32: 4, double: 8, float64: 8 };
+  const getters = { 1: 'getUint8', 2: 'getUint16', 4: 'getUint32' };
+  const props = {};
+  let stride = 0;
+  let count = 0;
+  let element = '';
+  for (const line of header.split('\n')) {
+    const w = line.trim().split(/\s+/);
+    if (w[0] === 'element') {
+      if (element === 'vertex') break; // later elements follow the vertices
+      element = w[1];
+      count = +w[2];
+      if (element !== 'vertex' && count > 0) throw new Error(`unexpected PLY element "${element}" before the vertices`);
+    } else if (w[0] === 'property' && element === 'vertex') {
+      const type = w[1];
+      if (!sizes[type]) throw new Error(`unsupported PLY property "${line.trim()}"`);
+      const get = type.startsWith('float') ? (sizes[type] === 4 ? 'getFloat32' : 'getFloat64') : type.startsWith('double') ? 'getFloat64' : getters[sizes[type]];
+      props[w[2]] = { offset: stride, get };
+      stride += sizes[type];
+    }
+  }
+  const rest = Object.keys(props).filter((n) => n.startsWith('f_rest_')).length;
+  const shDegree = Math.round(Math.sqrt(rest / 3 + 1)) - 1;
+  const coeffs = (shDegree + 1) ** 2;
+  const names = ['x', 'y', 'z', 'scale_0', 'scale_1', 'scale_2', 'rot_0', 'rot_1', 'rot_2', 'rot_3', 'opacity'];
+  for (let k = 0; k < coeffs; ++k) {
+    for (let c = 0; c < 3; ++c) names.push(k === 0 ? `f_dc_${c}` : `f_rest_${c * (coeffs - 1) + k - 1}`);
+  }
+  const fields = names.map((n) => {
+    if (!props[n]) throw new Error(`PLY has no "${n}" property`);
+    return props[n];
+  });
+  const view = new DataView(buffer, end + 11);
+  if (view.byteLength < count * stride) throw new Error('PLY file is truncated');
+  return {
+    count, shDegree,
+    read(i, row) {
+      const base = i * stride;
+      for (let f = 0; f < fields.length; ++f) row[f] = view[fields[f].get](base + fields[f].offset, true);
+    },
+  };
+}
+
+function cgcReader(buffer) {
+  const c = decodeCgc(buffer);
+  const coeffs = (c.shDegree + 1) ** 2;
+  return {
+    count: c.count, shDegree: c.shDegree,
+    read(i, row) {
+      row.set(c.positions.subarray(i * 3, i * 3 + 3), 0);
+      row.set(c.scales.subarray(i * 3, i * 3 + 3), 3);
+      row.set(c.rotations.subarray(i * 4, i * 4 + 4), 6);
+      row[10] = c.opacities[i];
+      row.set(c.sh.subarray(i * coeffs * 3, (i + 1) * coeffs * 3), 11);
+    },
+  };
+}
+
+const f32 = new Float32Array(1);
+const u32 = new Uint32Array(f32.buffer);
+function half(v) {
+  f32[0] = v;
+  const x = u32[0];
+  const sign = (x >>> 16) & 0x8000;
+  const e = ((x >>> 23) & 0xff) - 112;
+  if (e <= 0) return e < -10 ? sign : sign | (((x & 0x7fffff) | 0x800000) >>> (14 - e));
+  if (e >= 31) return sign | 0x7c00;
+  return sign | (e << 10) | ((x >>> 13) & 0x3ff);
+}
+const half2 = (a, b) => (half(a) | (half(b) << 16)) >>> 0;
+
+// One splat is `stride` RGBA32UI texels:
+//   0: position xyz (float bits), half2(dc r, dc g)
+//   1: half2(log scale x, y), half2(log scale z, dc b), half2(qx, qy), half2(qz, opacity)
+//   2+: higher SH as halves, [coefficient][rgb]
+const WIDTH = 4096;
+function pack(reader) {
+  const { count, shDegree } = reader;
+  const restHalves = ((shDegree + 1) ** 2 - 1) * 3;
+  const stride = 2 + Math.ceil(restHalves / 8);
+  const rows = Math.ceil((count * stride) / WIDTH);
+  if (rows > gl.getParameter(gl.MAX_TEXTURE_SIZE)) throw new Error(`${count} splats do not fit in a texture`);
+  const data = new Uint32Array(rows * WIDTH * 4);
+  const asFloat = new Float32Array(data.buffer);
+  const positions = new Float32Array(count * 3);
+  const row = new Float64Array(11 + (restHalves + 3));
+  for (let i = 0; i < count; ++i) {
+    reader.read(i, row);
+    const o = i * stride * 4;
+    asFloat[o] = positions[i * 3] = row[0];
+    asFloat[o + 1] = positions[i * 3 + 1] = row[1];
+    asFloat[o + 2] = positions[i * 3 + 2] = row[2];
+    let [w, x, y, z] = [row[6], row[7], row[8], row[9]];
+    const q = (w < 0 ? -1 : 1) / (Math.hypot(w, x, y, z) || 1);
+    [x, y, z] = [x * q, y * q, z * q];
+    data[o + 3] = half2(row[11], row[12]);
+    data[o + 4] = half2(row[3], row[4]);
+    data[o + 5] = half2(row[5], row[13]);
+    data[o + 6] = half2(x, y);
+    data[o + 7] = half2(z, 1 / (1 + Math.exp(-row[10])));
+    for (let h = 0; h < restHalves; h += 2) data[o + 8 + h / 2] = half2(row[14 + h], h + 1 < restHalves ? row[15 + h] : 0);
+  }
+  return { count, shDegree, stride, rows, data, positions };
+}
+
+// Centre is the per-axis median and radius holds 90% of the splats, as in
+// the C++ viewer; a sample of the splats is enough.
+function bounds(positions) {
+  const n = positions.length / 3;
+  const step = Math.max(1, Math.floor(n / 100000));
+  const axis = [[], [], []];
+  for (let i = 0; i < n; i += step) for (let a = 0; a < 3; ++a) axis[a].push(positions[i * 3 + a]);
+  const median = (v) => [...v].sort((p, q) => p - q)[v.length >> 1] ?? 0;
+  const center = axis.map(median);
+  const dist = axis[0].map((_, j) => Math.hypot(axis[0][j] - center[0], axis[1][j] - center[1], axis[2][j] - center[2]));
+  const radius = Math.max(dist.sort((p, q) => p - q)[Math.floor(dist.length * 0.9)] ?? 1, 1e-3);
+  return { center, radius };
+}
+
+// ---- Depth sorting, in a worker when the page may start one ----
+
+// Back to front along the view axis: depth = f . p + f[3]. 16-bit counting sort.
+function sortSplats(positions, f, near) {
+  const n = positions.length / 3;
+  const depth = new Float32Array(n);
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (let i = 0; i < n; ++i) {
+    const d = f[0] * positions[i * 3] + f[1] * positions[i * 3 + 1] + f[2] * positions[i * 3 + 2] + f[3];
+    depth[i] = d;
+    if (d > near) {
+      if (d < lo) lo = d;
+      if (d > hi) hi = d;
+    }
+  }
+  const scale = 65535 / (hi - lo || 1);
+  const counts = new Uint32Array(65537);
+  const keys = new Uint16Array(n);
+  for (let i = 0; i < n; ++i) {
+    if (depth[i] <= near) continue;
+    keys[i] = (hi - depth[i]) * scale;
+    ++counts[keys[i] + 1];
+  }
+  for (let k = 1; k <= 65536; ++k) counts[k] += counts[k - 1];
+  const order = new Uint32Array(counts[65536]);
+  for (let i = 0; i < n; ++i) if (depth[i] > near) order[counts[keys[i]]++] = i;
+  return order;
+}
+
+let worker = null;
+try {
+  const source = `${sortSplats}\nlet p; onmessage = (e) => { if (e.data.positions) { p = e.data.positions; return; }` +
+    ` const o = sortSplats(p, e.data.f, e.data.near); postMessage(o, [o.buffer]); };`;
+  worker = new Worker(URL.createObjectURL(new Blob([source], { type: 'text/javascript' })));
+  worker.onmessage = (e) => sorted(e.data);
+  worker.onerror = () => { worker = null; sorting = false; sortedFor = ''; dirty = true; };
+} catch {
+  worker = null;
+}
+
+// ---- WebGL ----
+
+const vertexShader = `#version 300 es
+precision highp float;
+precision highp int;
+precision highp usampler2D;
+uniform usampler2D u_data;
+uniform mat4 u_view;
+uniform vec2 u_size;
+uniform vec3 u_eye;
+uniform float u_focal, u_near;
+uniform int u_stride, u_degree;
+in uint a_index;
+out vec4 v_color;
+out vec2 v_pos;
+uint w[24];
+uvec4 texel(int t) {
+  int i = int(a_index) * u_stride + t;
+  return texelFetch(u_data, ivec2(i & 4095, i >> 12), 0);
+}
+float h(int i) { vec2 p = unpackHalf2x16(w[i >> 1]); return (i & 1) == 0 ? p.x : p.y; }
+vec3 c(int k) { int i = k * 3 - 3; return vec3(h(i), h(i + 1), h(i + 2)); }
+void main() {
+  gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+  uvec4 t0 = texel(0), t1 = texel(1);
+  vec3 p = uintBitsToFloat(t0.xyz);
+  vec3 t = (u_view * vec4(p, 1.0)).xyz;
+  vec2 qz = unpackHalf2x16(t1.w);
+  if (t.z < u_near || qz.y < 1.0 / 255.0) return;
+  vec2 s2 = unpackHalf2x16(t1.y), qxy = unpackHalf2x16(t1.z);
+  vec3 s = exp(vec3(unpackHalf2x16(t1.x), s2.x));
+  float x = qxy.x, y = qxy.y, z = qz.x, r = sqrt(max(0.0, 1.0 - x * x - y * y - z * z));
+  mat3 R = mat3(1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y + r * z), 2.0 * (x * z - r * y),
+                2.0 * (x * y - r * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z + r * x),
+                2.0 * (x * z + r * y), 2.0 * (y * z - r * x), 1.0 - 2.0 * (x * x + y * y));
+  mat3 M = R * mat3(s.x, 0.0, 0.0, 0.0, s.y, 0.0, 0.0, 0.0, s.z);
+  // EWA projection with the reference renderer's 0.3 px^2 low-pass.
+  vec2 lim = 0.65 * u_size / u_focal;
+  vec2 txy = clamp(t.xy / t.z, -lim, lim) * t.z;
+  float f = u_focal / t.z;
+  mat3 J = mat3(f, 0.0, 0.0, 0.0, f, 0.0, -f * txy.x / t.z, -f * txy.y / t.z, 0.0);
+  mat3 T = J * mat3(u_view);
+  mat3 cov = T * M * transpose(M) * transpose(T);
+  float a = cov[0][0] + 0.3, b = cov[0][1], d = cov[1][1] + 0.3;
+  float mid = 0.5 * (a + d), rad = length(vec2(0.5 * (a - d), b));
+  float l1 = mid + rad, l2 = max(mid - rad, 0.01);
+  vec2 v = vec2(b, l1 - a);
+  vec2 axis = dot(v, v) > 0.0 ? normalize(v) : vec2(1.0, 0.0);
+  // The quad covers 3 sigma. Splats wider than twice the screen are left out:
+  // faint blurs right at the eye, which the native renderer drops as well.
+  vec2 sigma = sqrt(vec2(l1, l2));
+  if (sigma.x > 2.0 * max(u_size.x, u_size.y)) return;
+  vec2 extent = 3.0 * sigma;
+  vec2 major = extent.x * axis;
+  vec2 minor = extent.y * vec2(axis.y, -axis.x);
+  vec2 center = u_focal * t.xy / t.z;
+  if (any(greaterThan(abs(center) - extent.x, 0.5 * u_size))) return;
+  vec2 corner = vec2(gl_VertexID & 1, gl_VertexID >> 1) * 2.0 - 1.0;
+  vec2 px = center + corner.x * major + corner.y * minor;
+  gl_Position = vec4(px / (0.5 * u_size) * vec2(1.0, -1.0), 0.0, 1.0);
+  v_pos = 3.0 * corner;
+
+  vec3 color = 0.28209479177387814 * vec3(unpackHalf2x16(t0.w), s2.y);
+  if (u_degree > 0) {
+    for (int k = 0; k < 6; ++k) {
+      if (k + 2 >= u_stride) break;
+      uvec4 e = texel(k + 2);
+      w[k * 4] = e.x; w[k * 4 + 1] = e.y; w[k * 4 + 2] = e.z; w[k * 4 + 3] = e.w;
+    }
+    vec3 n = normalize(p - u_eye);
+    x = n.x; y = n.y; z = n.z;
+    color += 0.4886025119029199 * (-y * c(1) + z * c(2) - x * c(3));
+    if (u_degree > 1) {
+      float xx = x * x, yy = y * y, zz = z * z;
+      color += 1.0925484305920792 * x * y * c(4) - 1.0925484305920792 * y * z * c(5) +
+               0.31539156525252005 * (2.0 * zz - xx - yy) * c(6) - 1.0925484305920792 * x * z * c(7) +
+               0.5462742152960396 * (xx - yy) * c(8);
+      if (u_degree > 2) {
+        color += -0.5900435899266435 * y * (3.0 * xx - yy) * c(9) + 2.890611442640554 * x * y * z * c(10) -
+                 0.4570457994644658 * y * (4.0 * zz - xx - yy) * c(11) +
+                 0.3731763325901154 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy) * c(12) -
+                 0.4570457994644658 * x * (4.0 * zz - xx - yy) * c(13) + 1.445305721320277 * z * (xx - yy) * c(14) -
+                 0.5900435899266435 * x * (xx - 3.0 * yy) * c(15);
+      }
+    }
+  }
+  v_color = vec4(max(color + 0.5, 0.0), qz.y);
+}`;
+
+const fragmentShader = `#version 300 es
+precision highp float;
+in vec4 v_color;
+in vec2 v_pos;
+out vec4 o;
+void main() {
+  float d = dot(v_pos, v_pos);
+  float a = min(0.99, v_color.a * exp(-0.5 * d));
+  if (d > 9.0 || a < 1.0 / 255.0) discard;
+  o = vec4(v_color.rgb * a, a);
+}`;
+
+function program() {
+  const p = gl.createProgram();
+  for (const [type, source] of [[gl.VERTEX_SHADER, vertexShader], [gl.FRAGMENT_SHADER, fragmentShader]]) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, source);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    gl.attachShader(p, s);
+  }
+  gl.bindAttribLocation(p, 0, 'a_index');
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+
+const prog = gl && program();
+const uniform = (name) => gl.getUniformLocation(prog, name);
+const indexBuffer = gl?.createBuffer();
+const texture = gl?.createTexture();
+if (gl) {
+  gl.bindVertexArray(gl.createVertexArray());
+  gl.bindBuffer(gl.ARRAY_BUFFER, indexBuffer);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribIPointer(0, 1, gl.UNSIGNED_INT, 0, 0);
+  gl.vertexAttribDivisor(0, 1);
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+}
+
+// ---- Camera: an orbit around `target`, as in the C++ viewer ----
+
+const ups = [[0, -1, 0], [0, 0, 1], [0, 1, 0], [0, 0, -1]];
+const cam = { target: [0, 0, 0], yaw: 0, pitch: 25, distance: 1, up: 0, fov: 60, radius: 1 };
+const sub = (a, b) => a.map((v, i) => v - b[i]);
+const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const norm = (a) => a.map((v) => v / (Math.hypot(...a) || 1));
+
+function basis() {
+  const u = ups[cam.up];
+  const ref = Math.abs(u[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0];
+  const a = norm(sub(ref, u.map((v) => v * dot(ref, u))));
+  const b = cross(u, a);
+  const yaw = (cam.yaw * Math.PI) / 180;
+  const pitch = (cam.pitch * Math.PI) / 180;
+  const dir = [0, 1, 2].map((i) => Math.cos(pitch) * (Math.cos(yaw) * a[i] + Math.sin(yaw) * b[i]) + Math.sin(pitch) * u[i]);
+  const eye = cam.target.map((v, i) => v + dir[i] * cam.distance);
+  const forward = dir.map((v) => -v);
+  let right = cross(u.map((v) => -v), forward);
+  right = dot(right, right) < 1e-12 ? [1, 0, 0] : norm(right);
+  return { eye, forward, right, down: cross(forward, right) };
+}
+
+function home(b) {
+  cam.target = b.center;
+  cam.radius = b.radius;
+  cam.yaw = 0;
+  cam.pitch = 25;
+  cam.distance = (b.radius / Math.sin((cam.fov * Math.PI) / 360)) * 1.1;
+}
+
+// ---- Scene state and the frame loop ----
+
+let scene = null; // { count, shDegree, stride, near }
+let source = null; // { bytes, name } for "Save as HTML"
+let positions = null;
+let sceneBounds = null;
+let drawn = 0;
+let dirty = true;
+let sorting = false;
+let sortedFor = '';
+
+function requestSort(key, f, near) {
+  if (sorting) return;
+  sorting = true;
+  sortedFor = key;
+  if (worker) worker.postMessage({ f, near });
+  else setTimeout(() => sorted(sortSplats(positions, f, near)));
+}
+
+function sorted(order) {
+  sorting = false;
+  gl.bindBuffer(gl.ARRAY_BUFFER, indexBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, order, gl.DYNAMIC_DRAW);
+  drawn = order.length;
+  dirty = true;
+}
+
+const keys = new Set();
+let last = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(0.1, (now - last) / 1000);
+  last = now;
+  if (!gl) return;
+  const dpr = Math.min(devicePixelRatio, 2);
+  const width = Math.round(canvas.clientWidth * dpr);
+  const height = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+    dirty = true;
+  }
+  let { forward, right, down } = basis();
+  const move = [['w', forward, 1], ['s', forward, -1], ['d', right, 1], ['a', right, -1], ['e', down, -1], ['q', down, 1]];
+  for (const [key, axis, sign] of move) {
+    if (!keys.has(key)) continue;
+    cam.target = cam.target.map((v, i) => v + axis[i] * sign * cam.distance * dt * (keys.has('shift') ? 2.4 : 0.6));
+    dirty = true;
+  }
+  if (!scene || !dirty) return;
+  dirty = false;
+  const b = basis();
+  ({ forward, right, down } = b);
+  const eye = b.eye;
+  const near = scene.near;
+  const f = [...forward, -dot(forward, eye)];
+  const key = f.join();
+  if (key !== sortedFor) requestSort(key, f, near);
+  const view = new Float32Array([
+    right[0], down[0], forward[0], 0, right[1], down[1], forward[1], 0, right[2], down[2], forward[2], 0,
+    -dot(right, eye), -dot(down, eye), -dot(forward, eye), 1,
+  ]);
+  gl.viewport(0, 0, width, height);
+  gl.clearColor(0, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.useProgram(prog);
+  gl.uniformMatrix4fv(uniform('u_view'), false, view);
+  gl.uniform2f(uniform('u_size'), width, height);
+  gl.uniform3fv(uniform('u_eye'), eye);
+  gl.uniform1f(uniform('u_focal'), (0.5 * height) / Math.tan((cam.fov * Math.PI) / 360));
+  gl.uniform1f(uniform('u_near'), near);
+  gl.uniform1i(uniform('u_stride'), scene.stride);
+  gl.uniform1i(uniform('u_degree'), scene.shDegree);
+  gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, drawn);
+}
+requestAnimationFrame(frame);
+
+// ---- Loading and saving ----
+
+async function load(bytes, name) {
+  info.textContent = `Loading ${name}…`;
+  await new Promise((r) => setTimeout(r, 20));
+  try {
+    const whole = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength;
+    const buffer = whole ? bytes.buffer : bytes.slice().buffer;
+    const magic = new TextDecoder().decode(bytes.subarray(0, 4));
+    const packed = pack(magic === 'CGC\0' ? cgcReader(buffer) : plyReader(buffer));
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32UI, WIDTH, packed.rows, 0, gl.RGBA_INTEGER, gl.UNSIGNED_INT, packed.data);
+    positions = packed.positions;
+    const b = (sceneBounds = bounds(positions));
+    home(b);
+    scene = { count: packed.count, shDegree: packed.shDegree, stride: packed.stride, near: b.radius * 0.01 };
+    source = { bytes, name };
+    drawn = 0;
+    sortedFor = '';
+    dirty = true;
+    if (worker) worker.postMessage({ positions: positions.slice() });
+    document.title = name;
+    info.textContent = `${name} · ${packed.count.toLocaleString()} splats · SH ${packed.shDegree}`;
+    $('save').hidden = false;
+  } catch (e) {
+    info.textContent = `Could not open ${name}: ${e.message}`;
+    console.error(e);
+  }
+}
+
+async function open(file) {
+  if (file) load(new Uint8Array(await file.arrayBuffer()), file.name);
+}
+
+function save() {
+  const { bytes, name } = source;
+  // Base64 in chunks (a multiple of 3 bytes): one string would hit the engine's length limit.
+  const parts = [];
+  for (let i = 0; i < bytes.length; i += 0x6000) {
+    const chunk = bytes.subarray(i, i + 0x6000);
+    parts.push(chunk.toBase64 ? chunk.toBase64() : btoa(String.fromCharCode(...chunk)));
+  }
+  const [before, after] = page.split(emptyScene);
+  const tag = `<script id="scene" type="application/octet-stream" data-name="${name.replace(/[&"<]/g, (c) => `&#${c.charCodeAt(0)};`)}">`;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([before, tag, ...parts, '<\/script>', after], { type: 'text/html' }));
+  a.download = name.replace(/\.[^.]*$/, '') + '.html';
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+$('file').onchange = (e) => open(e.target.files[0]);
+$('save').onclick = save;
+addEventListener('dragover', (e) => e.preventDefault());
+addEventListener('drop', (e) => {
+  e.preventDefault();
+  open(e.dataTransfer.files[0]);
+});
+
+// ---- Input ----
+
+const pointers = new Map();
+let pinch = 0;
+canvas.oncontextmenu = (e) => e.preventDefault();
+canvas.onpointerdown = (e) => {
+  canvas.setPointerCapture(e.pointerId);
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, button: e.button, shift: e.shiftKey });
+};
+canvas.onpointerup = canvas.onpointercancel = (e) => {
+  pointers.delete(e.pointerId);
+  pinch = 0;
+};
+canvas.onpointermove = (e) => {
+  const p = pointers.get(e.pointerId);
+  if (!p) return;
+  const dx = e.clientX - p.x;
+  const dy = e.clientY - p.y;
+  p.x = e.clientX;
+  p.y = e.clientY;
+  const pan = (x, y) => {
+    const { right, down } = basis();
+    const k = (cam.distance * 2 * Math.tan((cam.fov * Math.PI) / 360)) / canvas.clientHeight;
+    cam.target = cam.target.map((v, i) => v - (right[i] * x + down[i] * y) * k);
+  };
+  if (pointers.size === 2) {
+    const [a, b] = [...pointers.values()];
+    const d = Math.hypot(a.x - b.x, a.y - b.y);
+    if (pinch) cam.distance *= pinch / d;
+    pinch = d;
+    pan(dx / 2, dy / 2);
+  } else if (p.button === 2 || p.button === 1 || p.shift) {
+    pan(dx, dy);
+  } else if (e.ctrlKey) {
+    turn(dx * 0.3, dy * 0.3, false);
+  } else {
+    turn(-dx * 0.2, dy * 0.2, true);
+  }
+  dirty = true;
+};
+// As in the C++ viewer: orbit swings the eye around the target, look turns it
+// in place (the target swings around the eye instead).
+function turn(dYaw, dPitch, inPlace) {
+  const before = basis().eye;
+  cam.yaw = (cam.yaw + dYaw) % 360;
+  cam.pitch = Math.max(-89, Math.min(89, cam.pitch + dPitch));
+  const after = basis().eye;
+  if (inPlace) cam.target = cam.target.map((v, i) => v + before[i] - after[i]);
+}
+canvas.onwheel = (e) => {
+  e.preventDefault();
+  const notches = -e.deltaY / (e.deltaMode ? 3 : 100);
+  cam.distance = Math.max(1e-3, Math.min(1e6, cam.distance * 0.88 ** notches));
+  dirty = true;
+};
+addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT') return;
+  const k = e.key.toLowerCase();
+  if (k === 'u') cam.up = (cam.up + 1) % ups.length;
+  if (k === 'r' && sceneBounds) home(sceneBounds);
+  dirty = true;
+  keys.add(k);
+});
+addEventListener('keyup', (e) => {
+  keys.delete(e.key.toLowerCase());
+});
+addEventListener('blur', () => keys.clear());
+
+if (embedded) {
+  const bytes = Uint8Array.fromBase64 ? Uint8Array.fromBase64(embedded) : Uint8Array.from(atob(embedded), (c) => c.charCodeAt(0));
+  load(bytes, embeddedName);
+}
+</script>
+</body>
+</html>
