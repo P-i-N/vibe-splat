@@ -2,6 +2,7 @@
 
 #include "splat_shaders/shaders.hpp"
 
+#include <algorithm>
 #include <utility>
 
 namespace splat::vk {
@@ -32,15 +33,26 @@ RadixSorter::RadixSorter(Context &ctx)
       scanBlocks_(ctx, shaders::scan_blocks_comp(), 2, sizeof(ScanPush)),
       scanAdd_(ctx, shaders::scan_add_comp(), 2, sizeof(ScanPush)) {}
 
+const Buffer &RadixSorter::scratch(std::unique_ptr<Buffer> &buffer, VkDeviceSize bytes) {
+  if (!buffer || buffer->size() < bytes) {
+    // Commands recorded earlier into the same command buffer may still use
+    // the old one (the trainer sorts and then scans in one submission), so it
+    // is kept rather than destroyed. Doubling keeps all retired buffers
+    // together smaller than the one in use.
+    if (buffer) {
+      bytes = std::max(bytes, buffer->size() * 2);
+      retired_.push_back(std::move(buffer));
+    }
+    buffer = std::make_unique<Buffer>(ctx_, bytes, kStorage, MemoryUsage::GpuOnly);
+  }
+  return *buffer;
+}
+
 const Buffer &RadixSorter::scan_level(std::size_t level, std::uint32_t blocks) {
   if (scanSums_.size() <= level) {
     scanSums_.resize(level + 1);
   }
-  const VkDeviceSize bytes = VkDeviceSize{blocks} * sizeof(std::uint32_t);
-  if (!scanSums_[level] || scanSums_[level]->size() < bytes) {
-    scanSums_[level] = std::make_unique<Buffer>(ctx_, bytes, kStorage, MemoryUsage::GpuOnly);
-  }
-  return *scanSums_[level];
+  return scratch(scanSums_[level], VkDeviceSize{blocks} * sizeof(std::uint32_t));
 }
 
 void RadixSorter::record_scan(VkCommandBuffer cmd, const Buffer &data, std::uint32_t count, std::size_t level) {
@@ -61,19 +73,16 @@ void RadixSorter::record(VkCommandBuffer cmd, const Buffer &keys, const Buffer &
     return;
   }
   const std::uint32_t numTiles = div_up(count, kTile);
-  const VkDeviceSize histBytes = VkDeviceSize{numTiles} * 256 * sizeof(std::uint32_t);
-  if (!hist_ || hist_->size() < histBytes) {
-    hist_ = std::make_unique<Buffer>(ctx_, histBytes, kStorage, MemoryUsage::GpuOnly);
-  }
+  const Buffer &hist = scratch(hist_, VkDeviceSize{numTiles} * 256 * sizeof(std::uint32_t));
 
   const Buffer *srcK = &keys, *srcV = &values, *dstK = &tmpKeys, *dstV = &tmpValues;
   const std::uint32_t passes = div_up(std::min(keyBits, 32u), 8u);
   for (std::uint32_t pass = 0; pass < passes; ++pass) {
     const RadixPush push{count, pass * 8, numTiles};
-    histogram_.dispatch(cmd, {srcK, hist_.get()}, push, numTiles);
+    histogram_.dispatch(cmd, {srcK, &hist}, push, numTiles);
     compute_barrier(cmd);
-    record_scan(cmd, *hist_, numTiles * 256, 0);
-    scatter_.dispatch(cmd, {srcK, srcV, dstK, dstV, hist_.get()}, push, numTiles);
+    record_scan(cmd, hist, numTiles * 256, 0);
+    scatter_.dispatch(cmd, {srcK, srcV, dstK, dstV, &hist}, push, numTiles);
     compute_barrier(cmd);
     std::swap(srcK, dstK);
     std::swap(srcV, dstV);

@@ -19,8 +19,9 @@ public:
   // Records the sort. On return `keys`/`values` hold the sorted data;
   // `tmpKeys`/`tmpValues` are scratch buffers at least as large. Only the low
   // `keyBits` bits of each key are compared (rounded up to a multiple of 8).
-  // Scratch memory is (re)allocated here, so do not record while a previous
-  // submission using this sorter is still in flight.
+  // Scratch memory grows here, so do not record while a previous submission
+  // using this sorter is still in flight. Several sorts and scans may go into
+  // one command buffer: scratch that grows is kept, not destroyed.
   void record(VkCommandBuffer cmd, const Buffer &keys, const Buffer &values, const Buffer &tmpKeys,
               const Buffer &tmpValues, std::uint32_t count, std::uint32_t keyBits = 32);
 
@@ -34,6 +35,8 @@ private:
   // Records an exclusive scan of `data[0..count)` using scratch level `level`.
   void record_scan(VkCommandBuffer cmd, const Buffer &data, std::uint32_t count, std::size_t level);
   const Buffer &scan_level(std::size_t level, std::uint32_t blocks);
+  // `buffer`, grown to at least `bytes` if smaller.
+  const Buffer &scratch(std::unique_ptr<Buffer> &buffer, VkDeviceSize bytes);
 
   Context &ctx_;
   ComputePipeline histogram_;
@@ -42,6 +45,7 @@ private:
   ComputePipeline scanAdd_;
   std::unique_ptr<Buffer> hist_;
   std::vector<std::unique_ptr<Buffer>> scanSums_;
+  std::vector<std::unique_ptr<Buffer>> retired_; // Outgrown scratch, see scratch()
 };
 
 } // namespace splat::vk
