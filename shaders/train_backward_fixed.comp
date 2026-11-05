@@ -12,8 +12,12 @@ layout(std430, binding = 6) buffer Gradients { int gradients[]; };
 layout(std430, binding = 7) readonly buffer FixedScale { float fixedScale; };
 layout(std430, binding = 8) readonly buffer Edge { float edge[]; }; // From train_loss.comp, when scoring
 
+// Rounded to nearest: int() alone truncates towards zero, and over the many
+// small contributions to each sum that shrank every gradient, by up to a
+// fifth on GPUs with small subgroups (lavapipe), which reduce fewer pixels
+// into each contribution.
 void add_gradient(uint at, float value) {
-  atomicAdd(gradients[at], int(clamp(value * fixedScale, -1.0e9, 1.0e9)));
+  atomicAdd(gradients[at], int(round(clamp(value * fixedScale, -1.0e9, 1.0e9))));
 }
 
 #include "train_backward.glsl"
