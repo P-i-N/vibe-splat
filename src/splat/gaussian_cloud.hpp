@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <span>
 #include <vector>
 
 namespace splat {
@@ -35,6 +36,17 @@ struct GaussianCloud {
   // Throws std::runtime_error if array sizes are inconsistent.
   void validate() const;
 };
+
+// SH as the trainer keeps it on the GPU, per Gaussian: the DC term's 3
+// floats, then the other coefficients as half floats, two to a word, the last
+// word half empty when they are odd in number. As trainer_sh_words() and
+// trainer_sh_word() in shaders/splat_types.glsl.
+[[nodiscard]] constexpr std::uint32_t half_sh_words(int coefficients) noexcept {
+  return 3u + (3u * static_cast<std::uint32_t>(coefficients - 1) + 1u) / 2u;
+}
+// GaussianCloud::sh to that layout, rounded to nearest, and back.
+[[nodiscard]] std::vector<std::uint32_t> pack_half_sh(std::span<const float> sh, int coefficients);
+[[nodiscard]] std::vector<float> unpack_half_sh(std::span<const std::uint32_t> words, int coefficients);
 
 struct Bounds {
   float min[3]{};

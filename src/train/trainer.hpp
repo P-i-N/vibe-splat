@@ -55,8 +55,8 @@ struct LearningRates {
   float opacity = 0.05f;
   float sh = 0.025f;
   float shRestScale = 0.05f; // SH above degree 0, relative to `sh`
-  // Above 0, once enable_second_order() was called: position, scale, opacity
-  // and SH step by curvature within this trust region, rotation still by Adam.
+  // Once enable_second_order() was called: position, scale, opacity and SH
+  // step by curvature within this trust region, rotation still by Adam.
   float trustRegion = 0.f;
 };
 
@@ -97,22 +97,27 @@ public:
   // of the transmittance.
   [[nodiscard]] std::vector<float> render(const Camera &camera);
 
-  // Forward, loss and backward, leaving the gradients ready. `target` is
-  // RGBA8, width * height * 4 bytes.
+  // Forward, loss and backward, leaving the gradients ready for gradients()
+  // and apply_gradients(). `target` is RGBA8, width * height * 4 bytes. The
+  // gradients take a float per parameter, which training (step()) never needs
+  // and which the memory budget leaves out.
   StepStats compute_gradients(const Camera &camera, std::span<const std::uint8_t> target);
+  // The same, for the densification statistics only.
+  StepStats collect_statistics(const Camera &camera, std::span<const std::uint8_t> target);
 
   // The same, and also counts for each Gaussian the pixels it reaches whose
   // error is above errorShare of this view's worst, each counting as
   // pixelWeight, for densification to use (FastGS).
   StepStats score_view(const Camera &camera, std::span<const std::uint8_t> target, float errorShare, float pixelWeight = 1.f);
 
-  // Second-order training: makes room for the curvature, and from then on
-  // update_curvature() adds an estimate to it from the view rendered last, on
-  // top of what compute_gradients() or step() left. Needs float atomics.
+  // Second-order training: the curvature takes the place of Adam's second
+  // moment, so from then on all but rotation step by it (see
+  // LearningRates::trustRegion). update_curvature() adds an estimate to it
+  // from the view rendered last. Needs float atomics.
   void enable_second_order();
   void update_curvature();
 
-  // One Adam step from the current gradients.
+  // One Adam step from what the last compute_gradients() found, once.
   void apply_gradients(const LearningRates &rates);
 
   // Both of the above. A nextTarget, the image of the step after this one, is
@@ -126,8 +131,9 @@ public:
   [[nodiscard]] GaussianCloud cloud() const;
 
   // The raw parameters on the GPU, laid out as in GaussianCloud: 0 positions,
-  // 1 scales, 2 rotations, 3 opacities, 4 SH. Valid until the Gaussians change
-  // in number (densify, remove_largest_gaussians).
+  // 1 scales, 2 rotations, 3 opacities, 4 SH, but SH as half_sh_words()
+  // describes. Valid until the Gaussians change in number (densify,
+  // remove_largest_gaussians).
   [[nodiscard]] const vk::Buffer &parameters(std::size_t group) const;
   [[nodiscard]] int sh_degree() const noexcept { return shDegree_; }
   [[nodiscard]] int active_sh_degree() const noexcept { return activeShDegree_; }
@@ -191,7 +197,8 @@ public:
   static constexpr std::uint64_t kBytesPerPixel = 112;
 
 private:
-  struct Group; // A flat parameter array with its gradient and Adam state
+  struct Group; // A flat parameter array with its optimiser state
+  enum class Chain : std::uint32_t;
 
   void allocate_per_gaussian();
   void apply_changes(const DensifyResult &result);
@@ -204,17 +211,20 @@ private:
   void record_forward(VkCommandBuffer cmd, std::uint32_t entries);
   void record_backward(VkCommandBuffer cmd);
   void record_backward_from_adjoint(VkCommandBuffer cmd);
-  void record_adam(VkCommandBuffer cmd, const LearningRates &rates);
+  // The chain rule from the backward pass's sums to the parameters, and what
+  // becomes of the gradients; `statistics` adds to the densification statistics.
+  void record_chain(VkCommandBuffer cmd, Chain mode, bool statistics, const LearningRates *rates);
   void record_noise(VkCommandBuffer cmd, float scaler, std::uint32_t iteration);
-  // Forward, loss, backward and, when rates are given, the Adam step, in one submission.
-  StepStats run(const Camera &camera, std::span<const std::uint8_t> target, const LearningRates *rates,
+  // Forward, loss, backward and the chain rule, in one submission. Rates are for Chain::Step.
+  StepStats run(const Camera &camera, std::span<const std::uint8_t> target, Chain chain, const LearningRates *rates,
                 std::span<const std::uint8_t> nextTarget = {});
 
   vk::Context &ctx_;
   TrainerOptions options_;
   std::uint32_t count_ = 0;
   int shDegree_ = 0;
-  std::uint32_t shFloats_ = 3;
+  std::uint32_t shFloats_ = 3; // Of GaussianCloud's sh per Gaussian
+  std::uint32_t shWords_ = 3;  // Of the GPU's, see half_sh_words()
   int activeShDegree_ = 0;
   std::uint32_t adamStep_ = 0;
   float shDropout_ = 0.f;      // As set
@@ -224,8 +234,9 @@ private:
   int width_ = 0, height_ = 0;
   std::uint32_t gridW_ = 0, tileCount_ = 0;
 
-  vk::ComputePipeline preprocess_, binCount_, binEmit_, tileRanges_, forward_, exposure_, ssim_, loss_, exposureBackward_, errorMask_, score_, pose_, hutchinson_, curvature_, secondOrder_, gradient_,
-      adam_, noise_, gather_;
+  vk::ComputePipeline preprocess_, binCount_, binEmit_, tileRanges_, forward_, exposure_, ssim_, loss_, exposureBackward_, errorMask_, score_, hutchinson_, gradient_,
+      shStep_, noise_, gather_;
+  bool secondOrder_ = false;
   std::uint32_t curvatureUpdates_ = 0;
   Exposure exposureValues_ = kNeutralExposure;
   bool exposing_ = false; // The last iteration ran the exposure passes

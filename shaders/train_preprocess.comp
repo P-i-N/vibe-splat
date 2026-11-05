@@ -12,12 +12,14 @@ layout(std430, binding = 0) readonly buffer Positions { float positions[]; };
 layout(std430, binding = 1) readonly buffer Scales { float scales[]; };
 layout(std430, binding = 2) readonly buffer Rotations { float rotations[]; };
 layout(std430, binding = 3) readonly buffer Opacities { float opacities[]; };
-layout(std430, binding = 4) readonly buffer SH { float sh[]; };
+layout(std430, binding = 4) readonly buffer SH { uint sh[]; }; // See train_sh.glsl
 layout(std430, binding = 5) readonly buffer Camera { CameraParams cam; };
 layout(std430, binding = 6) writeonly buffer Splats { TrainSplat splats[]; };
 layout(std430, binding = 7) writeonly buffer Keys { uint keys[]; };
 layout(std430, binding = 8) writeonly buffer Values { uint values[]; };
 layout(std430, binding = 9) readonly buffer Filter3d { float filter3d[]; }; // Mip-Splatting's 3D smoothing filter, 0 for none
+
+#include "train_sh.glsl"
 
 layout(push_constant) uniform Push {
   uint mipFilter; // Mip-Splatting's 2D filter instead of the 0.3 dilation
@@ -108,7 +110,7 @@ void main() {
   const uint base = i * cam.counts.z;
   vec3 color = vec3(0.5);
   for (uint k = 0u; k < coefficients; ++k) {
-    color += basis[k] * vec3(sh[base + k * 3u], sh[base + k * 3u + 1u], sh[base + k * 3u + 2u]);
+    color += basis[k] * sh_coefficient(base, k);
   }
 
   if (!all(lessThan(abs(color), vec3(1e30)))) {

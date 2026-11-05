@@ -1,39 +1,87 @@
 #version 460
 // Backward pass, step 2: the chain rule from the screen-space sums of the
-// previous step down to the raw parameters. The maths is mirrored and checked
-// against finite differences in src/train/reference.cpp.
+// previous step down to the raw parameters, and what becomes of the result
+// (pc.mode): only the densification statistics, the gradients stored, or the
+// optimiser's step taken at once, which is how training runs, so that no
+// gradient is ever stored. The maths is mirrored and checked against finite
+// differences in src/train/reference.cpp. SH steps in a pass of its own,
+// train_sh_step.comp, one thread per word: a thread here stepping all of a
+// Gaussian's would touch memory at a stride, several times slower.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_GOOGLE_include_directive : require
+#include "bf16.glsl"
 #include "splat_types.glsl"
 #include "train_types.glsl"
+#include "workgroup_sum.glsl"
 
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly buffer Positions { float positions[]; };
-layout(std430, binding = 1) readonly buffer Scales { float scales[]; };
-layout(std430, binding = 2) readonly buffer Rotations { float rotations[]; };
-layout(std430, binding = 3) readonly buffer Opacities { float opacities[]; };
-layout(std430, binding = 4) readonly buffer SH { float sh[]; };
+layout(std430, binding = 0) buffer Positions { float positions[]; };
+layout(std430, binding = 1) buffer Scales { float scales[]; };
+layout(std430, binding = 2) buffer Rotations { float rotations[]; };
+layout(std430, binding = 3) buffer Opacities { float opacities[]; };
+layout(std430, binding = 4) buffer SH { uint sh[]; }; // See train_sh.glsl
 layout(std430, binding = 5) readonly buffer Camera { CameraParams cam; };
-layout(std430, binding = 6) readonly buffer Raw { float raw[]; };
-layout(std430, binding = 7) writeonly buffer GradPositions { float gradPositions[]; };
-layout(std430, binding = 8) writeonly buffer GradScales { float gradScales[]; };
-layout(std430, binding = 9) writeonly buffer GradRotations { float gradRotations[]; };
-layout(std430, binding = 10) writeonly buffer GradOpacities { float gradOpacities[]; };
-layout(std430, binding = 11) writeonly buffer GradSH { float gradSh[]; };
-layout(std430, binding = 12) readonly buffer Splats { TrainSplat splats[]; };
-layout(std430, binding = 13) buffer DensifyStats { DensifyStat densifyStats[]; };
-layout(std430, binding = 14) readonly buffer Filter3d { float filter3d[]; }; // As in train_preprocess.comp
+// The backward pass's sums, RAW_PER_SPLAT per splat. In MODE_STEP and
+// MODE_CURVATURE they are replaced, for the SH pass, by what it needs: see
+// the end of chain().
+layout(std430, binding = 6) buffer Raw { float raw[]; };
+layout(std430, binding = 7) readonly buffer Splats { TrainSplat splats[]; };
+layout(std430, binding = 8) buffer DensifyStats { DensifyStat densifyStats[]; };
+layout(std430, binding = 9) readonly buffer Filter3d { float filter3d[]; }; // As in train_preprocess.comp
+// The optimiser's state, one word per parameter: two bfloat16, the first
+// moment in the low half and in the high half the second moment or, once
+// steps are second order, the curvature.
+layout(std430, binding = 10) buffer PositionState { uint positionState[]; };
+layout(std430, binding = 11) buffer ScaleState { uint scaleState[]; };
+layout(std430, binding = 12) buffer RotationState { uint rotationState[]; };
+layout(std430, binding = 13) buffer OpacityState { uint opacityState[]; };
+layout(std430, binding = 14) buffer SHState { uint shState[]; };
+// MODE_GRADIENTS only.
+layout(std430, binding = 15) writeonly buffer GradPositions { float gradPositions[]; };
+layout(std430, binding = 16) writeonly buffer GradScales { float gradScales[]; };
+layout(std430, binding = 17) writeonly buffer GradRotations { float gradRotations[]; };
+layout(std430, binding = 18) writeonly buffer GradOpacities { float gradOpacities[]; };
+layout(std430, binding = 19) writeonly buffer GradSH { float gradSh[]; };
+// FLAG_POSE only: 6 per workgroup, w and v, as main() describes.
+layout(std430, binding = 20) writeonly buffer PoseTotals { float poseTotals[]; };
 
-// 3DGS-MCMC's penalties, reg * mean(sigmoid(opacity)) and reg * mean(exp(scale))
-// over the Gaussians, already divided by their count.
-layout(push_constant) uniform Push {
-  float opacityReg;
-  float scaleReg;
-  uint mipFilter; // As in train_preprocess.comp
-  float shDropout;
-  uint shRetained;
-  uint shSeed;
-} pc;
+#include "train_sh.glsl"
+#include "train_step.glsl"
+
+// What becomes of gradient g of parameter `at` of a group, by pc.mode. A
+// parameter without a gradient was out of view: second-order steps and the
+// curvature leave it alone, and Adam too when selective (gsplat, Taming 3DGS),
+// rather than letting it drift on momentum from other views.
+#define EMITTER(name, value, state, gradient, group)                                                    \
+  void name(uint at, float g, float rate, float radius) {                                              \
+    if (pc.mode == MODE_GRADIENTS) {                                                                   \
+      gradient[at] = g;                                                                                \
+    } else if (g != 0.0 || (pc.mode == MODE_STEP && (pc.flags & FLAG_SELECTIVE) == 0u && radius < 0.0)) { \
+      uint s = state[at];                                                                              \
+      if (pc.mode == MODE_CURVATURE) {                                                                 \
+        state[at] = with_curvature(s, g, at * 5u + group);                                             \
+      } else {                                                                                         \
+        float v = value[at];                                                                           \
+        step_parameter(v, s, g, rate, radius, at * 5u + group);                                        \
+        value[at] = v;                                                                                 \
+        state[at] = s;                                                                                 \
+      }                                                                                                \
+    }                                                                                                  \
+  }
+EMITTER(emit_position, positions, positionState, gradPositions, 0u)
+EMITTER(emit_scale, scales, scaleState, gradScales, 1u)
+EMITTER(emit_rotation, rotations, rotationState, gradRotations, 2u)
+EMITTER(emit_opacity, opacities, opacityState, gradOpacities, 3u)
+
+// The SH pass (train_sh_step.comp) takes the steps of SH; this stores its
+// gradients, of element j of Gaussian i's.
+void store_sh(uint i, uint j, float g) {
+  if (pc.mode == MODE_GRADIENTS) {
+    gradSh[i * pc.shFloats + j] = g;
+  }
+}
 
 // tr(G A X J^T) for 2x2 symmetric G, with A and J 2x3 and X 3x3.
 float trace_term(mat2 G, mat3x2 A, mat3 X, mat3x2 J) {
@@ -41,31 +89,80 @@ float trace_term(mat2 G, mat3x2 A, mat3 X, mat3x2 J) {
   return product[0][0] + product[1][1];
 }
 
-void main() {
-  const uint i = gl_GlobalInvocationID.x;
-  if (i >= cam.counts.x) {
-    return;
-  }
-  // Nothing reached this splat. The buffers were cleared, so skip the maths,
+// What densification decides on. Only this invocation touches this element.
+// Per half the image rather than per pixel, so that one threshold suits any resolution.
+void add_statistics(uint i) {
+  const uint at = i * RAW_PER_SPLAT;
+  densifyStats[i].main.x += length(vec2(raw[at + 1u], raw[at + 2u]) * 0.5 * cam.viewport.xy);
+  densifyStats[i].main.y += 1.0;
+  densifyStats[i].main.z = max(densifyStats[i].main.z, splats[i].colorRadius.w);
+  densifyStats[i].main.w += raw[at + 9u] * 3.0 * cam.viewport.x * cam.viewport.y; // In pixels
+  densifyStats[i].more.x += length(vec2(raw[at + 10u], raw[at + 11u]) * 0.5 * cam.viewport.xy);
+}
+
+// Gaussian i's chain rule, and what becomes of it. Returns how the loss
+// changes with the camera through this Gaussian's position, for FLAG_POSE.
+void chain(uint i, out vec3 poseW, out vec3 poseV) {
+  poseW = vec3(0.0);
+  poseV = vec3(0.0);
+  // Nothing reached this splat. The sums were cleared, so skip the maths,
   // which would not even be defined for a splat behind the camera.
   bool touched = false;
   for (uint k = 0u; k < RAW_PER_SPLAT; ++k) {
     touched = touched || raw[i * RAW_PER_SPLAT + k] != 0.0;
   }
-  if (!touched) {
-    // Nothing from the pixels, but the penalties still apply.
-    if (pc.opacityReg > 0.0 || pc.scaleReg > 0.0) {
-      const float o = 1.0 / (1.0 + exp(-opacities[i]));
-      gradOpacities[i] = pc.opacityReg * o * (1.0 - o);
-      for (uint a = 0u; a < 3u; ++a) {
-        gradScales[i * 3u + a] = pc.scaleReg * exp(scales[i * 3u + a]);
-      }
+  // Whether gradients of zero do anything: stored, or as Adam's step when not selective.
+  const bool zeros = pc.mode == MODE_GRADIENTS || (pc.mode == MODE_STEP && (pc.flags & FLAG_SELECTIVE) == 0u);
+  const bool penalties = pc.opacityReg > 0.0 || pc.scaleReg > 0.0;
+  if (pc.mode == MODE_STATISTICS || (!touched && !zeros && !penalties)) {
+    if (touched && (pc.flags & FLAG_STATISTICS) != 0u) {
+      add_statistics(i);
     }
     return;
   }
 
-  const vec3 p = vec3(positions[i * 3u], positions[i * 3u + 1u], positions[i * 3u + 2u]);
   const vec3 logScale = vec3(scales[i * 3u], scales[i * 3u + 1u], scales[i * 3u + 2u]);
+  const float opacity = 1.0 / (1.0 + exp(-opacities[i]));
+  const vec3 s2 = exp(2.0 * logScale);
+  // The radii of 3DGS^2-TR: how far each parameter can move before the
+  // Gaussian's contribution changes by more than epsilon in squared Hellinger
+  // distance. Below 0 for Adam, which rotation always steps by: the paper's
+  // bound for it has a constant it never gives.
+  const bool secondOrder = (pc.flags & FLAG_SECOND_ORDER) != 0u;
+  const float alpha = max(opacity, 1e-3), e = pc.trustRegion;
+  const float positionRadius = secondOrder ? sqrt(8.0 * (s2.x + s2.y + s2.z) / 3.0 * e / alpha) : -1.0;
+  const float scaleRadius = secondOrder ? sqrt(2.0 * e / alpha) : -1.0; // The parameter is the log of the scale
+  const float opacityRadius = secondOrder ? sqrt(4.0 * alpha * e) / max(alpha * (1.0 - alpha), 1e-3) : -1.0; // The logit
+  const uint base = i * cam.counts.z, stored = pc.shFloats / 3u;
+  vec3 shRadius = vec3(-1.0);
+  if (secondOrder) {
+    const vec3 colour = clamp(0.5 + SH_C0 * sh_coefficient(base, 0u), 0.02, 1.0);
+    shRadius = sqrt(4.0 * colour * e / alpha) / SH_C0;
+  }
+
+  if (!touched) {
+    // Nothing from the pixels, but the penalties still apply.
+    const float o = penalties ? pc.opacityReg * opacity * (1.0 - opacity) : 0.0;
+    for (uint a = 0u; a < 3u; ++a) {
+      emit_position(i * 3u + a, 0.0, pc.rates[0], positionRadius);
+      emit_scale(i * 3u + a, penalties ? pc.scaleReg * exp(logScale[a]) : 0.0, pc.rates[1], scaleRadius);
+    }
+    if (pc.mode != MODE_CURVATURE) {
+      for (uint a = 0u; a < 4u; ++a) {
+        emit_rotation(i * 4u + a, 0.0, pc.rates[2], -1.0);
+      }
+    }
+    emit_opacity(i, o, pc.rates[3], opacityRadius);
+    for (uint j = 0u; j < pc.shFloats; ++j) {
+      store_sh(i, j, 0.0);
+    }
+    return;
+  }
+  if ((pc.flags & FLAG_STATISTICS) != 0u) {
+    add_statistics(i);
+  }
+
+  const vec3 p = vec3(positions[i * 3u], positions[i * 3u + 1u], positions[i * 3u + 2u]);
   vec4 quat = vec4(rotations[i * 4u], rotations[i * 4u + 1u], rotations[i * 4u + 2u], rotations[i * 4u + 3u]);
   const float quatLength = length(quat);
   quat = quatLength > 0.0 ? quat / quatLength : vec4(1.0, 0.0, 0.0, 0.0);
@@ -78,20 +175,11 @@ void main() {
   // Screen-space sums: dL/dcentre and dL/dcovariance as a symmetric matrix.
   const vec2 gCentre = vec2(raw[at + 1u], raw[at + 2u]);
 
-  // What densification decides on. Only this invocation touches this element.
-  // Per half the image rather than per pixel, so that one threshold suits any resolution.
-  densifyStats[i].main.x += length(gCentre * 0.5 * cam.viewport.xy);
-  densifyStats[i].main.y += 1.0;
-  densifyStats[i].main.z = max(densifyStats[i].main.z, splats[i].colorRadius.w);
-  densifyStats[i].main.w += raw[at + 9u] * 3.0 * cam.viewport.x * cam.viewport.y; // In pixels
-  densifyStats[i].more.x += length(vec2(raw[at + 10u], raw[at + 11u]) * 0.5 * cam.viewport.xy);
   mat2 G = mat2(raw[at + 3u], raw[at + 4u], raw[at + 4u], raw[at + 5u]);
-  const float opacity = 1.0 / (1.0 + exp(-opacities[i]));
   float k2 = 1.0; // The 2D Mip filter's opacity factor
 
   const mat3 Rv = mat3(cam.view);
   const mat3 R = train_quat_to_mat(quat);
-  const vec3 s2 = exp(2.0 * logScale);
   const mat3 D = mat3(s2.x, 0.0, 0.0, 0.0, s2.y, 0.0, 0.0, 0.0, s2.z);
   const float smooth3d = filter3d[i];
   const mat3 sigma = R * D * transpose(R) + mat3(smooth3d);
@@ -136,10 +224,11 @@ void main() {
   // The 3D covariance: dL = tr(G3 dSigma).
   const mat3x2 T = J * Rv;
   const mat3 G3 = transpose(T) * G * T;
+  vec3 gScale;
   for (int a = 0; a < 3; ++a) {
     const vec3 axis = R[a];
     // Plus the filter's opacity factor moving with the scale, and the penalty.
-    gradScales[i * 3u + uint(a)] = 2.0 * s2[a] * dot(axis, G3 * axis) + raw[at] * k2 * opacity * k3 * smooth3d / (s2[a] + smooth3d) + pc.scaleReg * exp(logScale[a]);
+    gScale[a] = 2.0 * s2[a] * dot(axis, G3 * axis) + raw[at] * k2 * opacity * k3 * smooth3d / (s2[a] + smooth3d) + pc.scaleReg * exp(logScale[a]);
   }
 
   // Rotation: dL = tr(P^T dR). The matrices are dR/dw, dR/dx, dR/dy, dR/dz of
@@ -156,21 +245,16 @@ void main() {
                        dot(P[0], dRz[0]) + dot(P[1], dRz[1]) + dot(P[2], dRz[2]));
   // The quaternion is normalised before use, so only its tangent part counts.
   const vec4 tangent = (gq - quat * dot(quat, gq)) / max(quatLength, 1e-12);
-  gradRotations[i * 4u] = tangent.x;
-  gradRotations[i * 4u + 1u] = tangent.y;
-  gradRotations[i * 4u + 2u] = tangent.z;
-  gradRotations[i * 4u + 3u] = tangent.w;
 
-  gradOpacities[i] = (raw[at] * k2 * k3 + pc.opacityReg) * opacity * (1.0 - opacity);
+  const float gOpacity = (raw[at] * k2 * k3 + pc.opacityReg) * opacity * (1.0 - opacity);
 
   const vec3 gColour = vec3(raw[at + 6u], raw[at + 7u], raw[at + 8u]);
   float basis[16];
   sh_basis(normalize(p - cam.position.xyz), cam.counts.y, basis);
   const uint coefficients = train_sh_coefficients(i, cam.counts.w, pc.shDropout, pc.shRetained, pc.shSeed);
-  const uint base = i * cam.counts.z;
   vec3 colour = vec3(0.5);
   for (uint k = 0u; k < coefficients; ++k) {
-    colour += basis[k] * vec3(sh[base + k * 3u], sh[base + k * 3u + 1u], sh[base + k * 3u + 2u]);
+    colour += basis[k] * sh_coefficient(base, k);
   }
   // Colour is clamped at zero, where the coefficients stop mattering.
   const vec3 unclamped = vec3(greaterThan(colour, vec3(0.0)));
@@ -184,19 +268,72 @@ void main() {
     sh_basis_gradient(dir, cam.counts.y, basisGradient);
     vec3 gDir = vec3(0.0);
     for (uint k = 1u; k < coefficients; ++k) {
-      const vec3 coefficient = vec3(sh[base + k * 3u], sh[base + k * 3u + 1u], sh[base + k * 3u + 2u]);
+      const vec3 coefficient = sh_coefficient(base, k);
       gDir += dot(gColour * unclamped, coefficient) * basisGradient[k];
     }
     gP += (gDir - dir * dot(dir, gDir)) / distance;
   }
-  gradPositions[i * 3u] = gP.x;
-  gradPositions[i * 3u + 1u] = gP.y;
-  gradPositions[i * 3u + 2u] = gP.z;
+  if ((pc.flags & FLAG_POSE) != 0u && gP != vec3(0.0)) {
+    poseV = Rv * gP;
+    poseW = cross(t, poseV);
+  }
 
-  for (uint k = 0u; k < coefficients; ++k) {
-    const vec3 g = basis[k] * gColour * unclamped;
-    gradSh[base + k * 3u] = g.r;
-    gradSh[base + k * 3u + 1u] = g.g;
-    gradSh[base + k * 3u + 2u] = g.b;
+  // Everything above read the values and the sums before any of them changes.
+  for (uint a = 0u; a < 3u; ++a) {
+    emit_position(i * 3u + a, gP[a], pc.rates[0], positionRadius);
+    emit_scale(i * 3u + a, gScale[a], pc.rates[1], scaleRadius);
+  }
+  if (pc.mode != MODE_CURVATURE) {
+    for (uint a = 0u; a < 4u; ++a) {
+      emit_rotation(i * 4u + a, tangent[a], pc.rates[2], -1.0);
+    }
+  }
+  emit_opacity(i, gOpacity, pc.rates[3], opacityRadius);
+  if (pc.mode == MODE_GRADIENTS) {
+    for (uint k = 0u; k < stored; ++k) {
+      const vec3 g = k < coefficients ? basis[k] * gColour * unclamped : vec3(0.0);
+      for (uint c = 0u; c < 3u; ++c) {
+        store_sh(i, k * 3u + c, g[c]);
+      }
+    }
+  } else {
+    // For the SH pass: the gradient of coefficient k is basis[k] times this
+    // colour gradient, for the coefficients in use, with the step's radii. A
+    // splat nothing reached keeps its sums of zero, so no coefficients.
+    const vec3 dir = normalize(p - cam.position.xyz);
+    raw[at] = gColour.r * unclamped.r;
+    raw[at + 1u] = gColour.g * unclamped.g;
+    raw[at + 2u] = gColour.b * unclamped.b;
+    raw[at + 3u] = dir.x;
+    raw[at + 4u] = dir.y;
+    raw[at + 5u] = dir.z;
+    raw[at + 6u] = shRadius.r;
+    raw[at + 7u] = shRadius.g;
+    raw[at + 8u] = shRadius.b;
+    raw[at + 9u] = uintBitsToFloat(coefficients);
+  }
+}
+
+// When refining poses: how the loss changes with the camera, from how it
+// changes with each Gaussian's position. Moving the camera by (rotation w,
+// translation v) moves a point t in camera space by w x t + v, so
+//   dL/dv = sum dL/dt    dL/dw = sum t x dL/dt
+// over each workgroup's Gaussians. It leaves out how the camera's rotation turns
+// each Gaussian's shape and view direction, which is much the smaller part.
+void main() {
+  const uint i = gl_GlobalInvocationID.x;
+  vec3 w = vec3(0.0), v = vec3(0.0);
+  if (i < cam.counts.x) {
+    chain(i, w, v);
+  }
+  if ((pc.flags & FLAG_POSE) != 0u) {
+    for (uint k = 0u; k < 3u; ++k) {
+      const float totalW = workgroup_sum(w[k]);
+      const float totalV = workgroup_sum(v[k]);
+      if (gl_LocalInvocationIndex == 0u) {
+        poseTotals[gl_WorkGroupID.x * 6u + k] = totalW;
+        poseTotals[gl_WorkGroupID.x * 6u + 3u + k] = totalV;
+      }
+    }
   }
 }

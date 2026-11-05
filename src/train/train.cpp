@@ -610,7 +610,7 @@ StepStats TrainSession::step() {
       trainer.reset_densify_stats();
       for (std::size_t i = 0; i < data_.trainViews.size(); ++i) {
         trainer.set_exposure(exposures_[i].value);
-        fitting([&] { return trainer.compute_gradients(data_.trainViews[i].camera, data_.trainViews[i].rgba); });
+        fitting([&] { return trainer.collect_statistics(data_.trainViews[i].camera, data_.trainViews[i].rgba); });
       }
     }
     const std::size_t removed = trainer.remove_least_contributing_gaussians(options.pruneShare);

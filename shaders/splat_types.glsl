@@ -63,13 +63,29 @@ uint packed_sh_words(uint coefficients) {
   return 2u + (3u * (coefficients - 1u) + 3u) / 4u;
 }
 
+// SH as the trainer keeps it, per Gaussian: the DC term's 3 floats, then the
+// other coefficients as half floats, two to a word. As half_sh_words() in
+// src/splat/gaussian_cloud.hpp.
+uint trainer_sh_words(uint coefficients) {
+  return 3u + (3u * (coefficients - 1u) + 1u) / 2u;
+}
+
+// The word of a Gaussian's that holds element j of GaussianCloud's sh, and
+// that element from it.
+uint trainer_sh_word(uint j) {
+  return j < 3u ? j : 3u + (j - 3u) / 2u;
+}
+float trainer_sh_value(uint word, uint j) {
+  return j < 3u ? uintBitsToFloat(word) : unpackHalf2x16(word)[(j - 3u) & 1u];
+}
+
 // OpenCV-style pinhole camera: x right, y down, z forward.
 struct CameraParams {
   mat4 view;       // world -> camera
   vec4 position;   // camera centre in world space
   vec4 intrinsics; // fx, fy, cx, cy (pixels)
   vec4 viewport;   // width, height, tan(half fov x), tan(half fov y)
-  uvec4 counts;    // gaussian count, SH degree, SH words (floats when not packed) per gaussian, SH coefficients in use (training only)
+  uvec4 counts;    // gaussian count, SH degree, SH words per gaussian, SH coefficients in use (training only)
 };
 
 #endif

@@ -2,6 +2,8 @@
 
 #include "splat/cgc.hpp"
 
+#include <glm/gtc/packing.hpp>
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -530,6 +532,36 @@ GaussianCloud make_test_scene(std::size_t count, std::uint32_t seed) {
     }
   }
   return cloud;
+}
+
+std::vector<std::uint32_t> pack_half_sh(std::span<const float> sh, int coefficients) {
+  const auto floats = static_cast<std::size_t>(3 * coefficients), words = std::size_t{half_sh_words(coefficients)};
+  const std::size_t count = sh.size() / floats;
+  std::vector<std::uint32_t> out(count * words, 0u);
+  for (std::size_t i = 0; i < count; ++i) {
+    const float *in = sh.data() + i * floats;
+    std::uint32_t *to = out.data() + i * words;
+    for (std::size_t j = 0; j < 3; ++j) to[j] = std::bit_cast<std::uint32_t>(in[j]);
+    for (std::size_t j = 3; j < floats; ++j) {
+      to[3 + (j - 3) / 2] |= std::uint32_t{glm::packHalf1x16(in[j])} << (16 * ((j - 3) & 1));
+    }
+  }
+  return out;
+}
+
+std::vector<float> unpack_half_sh(std::span<const std::uint32_t> words, int coefficients) {
+  const auto floats = static_cast<std::size_t>(3 * coefficients), stride = std::size_t{half_sh_words(coefficients)};
+  const std::size_t count = words.size() / stride;
+  std::vector<float> out(count * floats);
+  for (std::size_t i = 0; i < count; ++i) {
+    const std::uint32_t *in = words.data() + i * stride;
+    float *to = out.data() + i * floats;
+    for (std::size_t j = 0; j < 3; ++j) to[j] = std::bit_cast<float>(in[j]);
+    for (std::size_t j = 3; j < floats; ++j) {
+      to[j] = glm::unpackHalf1x16(static_cast<std::uint16_t>(in[3 + (j - 3) / 2] >> (16 * ((j - 3) & 1))));
+    }
+  }
+  return out;
 }
 
 } // namespace splat

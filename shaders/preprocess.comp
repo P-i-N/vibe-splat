@@ -9,7 +9,7 @@
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer Gaussians { Gaussian gaussians[]; };
-layout(std430, binding = 1) readonly buffer SH { uint sh[]; }; // Packed by pack_sh.comp, or floats
+layout(std430, binding = 1) readonly buffer SH { uint sh[]; }; // Packed by pack_sh.comp, or the trainer's
 layout(std430, binding = 2) readonly buffer Camera { CameraParams cam; };
 layout(std430, binding = 3) writeonly buffer Splats { Splat2D splats[]; };
 layout(std430, binding = 4) writeonly buffer Keys { uint keys[]; };
@@ -28,7 +28,7 @@ layout(push_constant) uniform Settings {
   uint maxShDegree;
   uint pointMode;
   float pointRadius;
-  uint packedSh; // Whether sh[] is packed rather than GaussianCloud's floats
+  uint packedSh; // Whether sh[] is packed by pack_sh.comp rather than the trainer's (trainer_sh_word())
 } settings;
 
 const float SH_C0 = 0.28209479177387814;
@@ -45,8 +45,12 @@ float sh_rest(uint base, uint j, float scale) {
 
 vec3 sh_coeff(uint base, uint k) {
   if (settings.packedSh == 0u) {
-    const uint o = base + k * 3u;
-    return uintBitsToFloat(uvec3(sh[o], sh[o + 1u], sh[o + 2u]));
+    vec3 c;
+    for (uint channel = 0u; channel < 3u; ++channel) {
+      const uint j = k * 3u + channel;
+      c[channel] = trainer_sh_value(sh[base + trainer_sh_word(j)], j);
+    }
+    return c;
   }
   const vec2 high = unpackHalf2x16(sh[base + 1u]);
   if (k == 0u) {

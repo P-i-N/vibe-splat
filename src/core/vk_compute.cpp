@@ -32,7 +32,7 @@ VkShaderModule create_shader_module(VkDevice device, std::span<const std::uint32
 
 void push_storage_buffers(VkCommandBuffer cmd, VkPipelineBindPoint bindPoint, VkPipelineLayout layout,
                           std::initializer_list<const Buffer *> buffers) {
-  constexpr std::size_t kMax = 16;
+  constexpr std::size_t kMax = 32; // The least maxPushDescriptors VK_KHR_push_descriptor allows
   if (buffers.size() > kMax) {
     throw Error("push_storage_buffers: too many buffers");
   }

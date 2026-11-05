@@ -210,7 +210,7 @@ void SplatRenderer::allocate(std::size_t count) {
 void SplatRenderer::set_scene(VkCommandBuffer cmd, const GpuCloud &cloud) {
   count_ = cloud.count;
   shDegree_ = std::min(cloud.activeDegree, cloud.shDegree);
-  shStride_ = static_cast<std::uint32_t>(3 * (cloud.shDegree + 1) * (cloud.shDegree + 1));
+  shStride_ = half_sh_words((cloud.shDegree + 1) * (cloud.shDegree + 1));
   sh_.reset();
   shExternal_ = cloud.sh;
   if (count_ == 0) return;
