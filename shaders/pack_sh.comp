@@ -1,8 +1,7 @@
 #version 460
 // Packs SH coefficients, laid out as in GaussianCloud, for the renderer: per
-// Gaussian the DC term and the largest magnitude of the rest as half floats,
-// then the rest as signed bytes relative to that magnitude (see
-// packed_sh_words()).
+// Gaussian the DC term and each band's largest magnitude as half floats, then
+// the coefficients relative to that (see packed_sh_words()).
 #extension GL_GOOGLE_include_directive : require
 #include "splat_types.glsl"
 
@@ -22,23 +21,37 @@ void main() {
     return;
   }
   const uint in0 = i * 3u * pc.coefficients;
-  const uint rest = 3u * (pc.coefficients - 1u);
   const uint out0 = i * packed_sh_words(pc.coefficients);
-  float largest = 0.0;
-  for (uint j = 0u; j < rest; ++j) {
-    largest = max(largest, abs(sh[in0 + 3u + j]));
+  vec3 largest = vec3(0.0); // Per band
+  for (uint j = 3u; j < 3u * pc.coefficients; ++j) {
+    const uint band = sh_band(j / 3u) - 1u;
+    largest[band] = max(largest[band], abs(sh[in0 + j]));
   }
+  // Against the scales as the renderer reads them. Where rounding made one
+  // smaller, its largest value is clamped to it, an error of under 0.05 %.
+  const vec3 scale = vec3(unpackHalf2x16(packHalf2x16(largest.xy)), unpackHalf2x16(packHalf2x16(vec2(largest.z))).x);
   packed[out0] = packHalf2x16(vec2(sh[in0], sh[in0 + 1u]));
-  packed[out0 + 1u] = packHalf2x16(vec2(sh[in0 + 2u], largest));
-  // Against the scale as the renderer reads it. Where rounding made it smaller,
-  // packSnorm4x8() clamps the largest to it, an error of under 0.05 %.
-  const float scale = unpackHalf2x16(packHalf2x16(vec2(largest))).x;
-  const float inverse = scale > 0.0 ? 1.0 / scale : 0.0;
-  for (uint j = 0u; j < rest; j += 4u) {
-    vec4 v = vec4(0.0);
-    for (uint k = 0u; k < 4u && j + k < rest; ++k) {
-      v[k] = sh[in0 + 3u + j + k] * inverse;
+  packed[out0 + 1u] = packHalf2x16(vec2(sh[in0 + 2u], largest.x));
+  const uint header = packed_sh_header(pc.coefficients);
+  if (header > 2u) {
+    packed[out0 + 2u] = packHalf2x16(largest.yz);
+  }
+  uint word = 0u, at = 0u; // The word being filled, and its index after the header
+  for (uint k = 1u; k < pc.coefficients; ++k) {
+    const float s = scale[sh_band(k) - 1u];
+    for (uint c = 0u; c < 3u; ++c) {
+      const uvec2 bits = packed_sh_bits(k, c);
+      if (bits.x / 32u != at) {
+        packed[out0 + header + at] = word;
+        word = 0u;
+        at = bits.x / 32u;
+      }
+      const float levels = float((1u << (bits.y - 1u)) - 1u); // 127 or 7, the same either way of zero
+      const float v = s > 0.0 ? clamp(round(sh[in0 + k * 3u + c] / s * levels), -levels, levels) : 0.0;
+      word |= (uint(int(v)) & ((1u << bits.y) - 1u)) << (bits.x % 32u);
     }
-    packed[out0 + 2u + j / 4u] = packSnorm4x8(v);
+  }
+  if (pc.coefficients > 1u) {
+    packed[out0 + header + at] = word;
   }
 }

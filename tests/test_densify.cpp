@@ -656,12 +656,14 @@ TEST_CASE("Only the active SH degrees render and train", "[densify][vulkan]") {
   CHECK(worst < 1e-5);
   CHECK(inactive == 0.0);
 
-  // An inactive coefficient does not move, and the output keeps all of them.
+  // An inactive coefficient does not move, and the output keeps all of them,
+  // as the trainer holds them: half floats above degree 0.
   trainer.apply_gradients({});
   const GaussianCloud after = trainer.cloud();
+  const std::vector<float> held = unpack_half_sh(pack_half_sh(full.sh, 16), 16);
   CHECK(after.shDegree == 3);
   for (std::size_t i = 0; i < full.size(); ++i) {
-    for (std::size_t k = 12; k < 48; ++k) REQUIRE(after.sh[i * 48 + k] == full.sh[i * 48 + k]);
+    for (std::size_t k = 12; k < 48; ++k) REQUIRE(after.sh[i * 48 + k] == held[i * 48 + k]);
   }
 
   // At full degree, the GPU agrees with the reference too.

@@ -66,12 +66,18 @@ struct ErrorMaskPush {
   std::uint32_t pixels;
   float share;
 };
+constexpr std::uint32_t kStatisticsFlag = 1, kPoseFlag = 2, kSelectiveFlag = 4, kSecondOrderFlag = 8;
+
 struct GradientPush {
   float opacityReg, scaleReg; // Per Gaussian: the option divided by the count
   std::uint32_t mipFilter;
   float shDropout;
-  std::uint32_t shRetained, shSeed;
+  std::uint32_t shRetained, shSeed, mode, flags;
+  float rates[5];
+  float restScale, beta1, beta2, epsilon, correction1, correction2, trustRegion, curvatureScale, curvatureBeta, perValue;
+  std::uint32_t seed, shFloats;
 };
+static_assert(sizeof(GradientPush) <= 128);
 
 struct PreprocessPush {
   std::uint32_t mipFilter;
@@ -93,31 +99,12 @@ struct FixedPush {
   std::uint32_t count;
   float scale;
 };
-struct AdamPush {
-  std::uint32_t count;
-  float learningRate, beta1, beta2, epsilon, correction1, correction2;
-  std::uint32_t dcStride;
-  float restScale;
-  std::uint32_t selective, seed;
-};
 struct HutchinsonPush {
   std::uint32_t pixels, seed;
 };
-struct CurvaturePush {
-  std::uint32_t count;
-  float beta, perValue;
-};
-struct SecondOrderPush {
-  std::uint32_t count;
-  float beta1, correction1, curvatureScale, epsilon;
-  std::uint32_t kind, stride;
-};
 struct GatherPush {
-  std::uint32_t count, stride, halves;
+  std::uint32_t count, stride;
 };
-
-// Bytes of n bfloat16 values, two to a word (shaders/bf16.glsl).
-VkDeviceSize bf16_bytes(std::size_t n) { return VkDeviceSize{(n + 1) / 2} * 4; }
 
 std::unique_ptr<Buffer> gpu_buffer(vk::Context &ctx, VkDeviceSize bytes) {
   return std::make_unique<Buffer>(ctx, std::max<VkDeviceSize>(bytes, 4), kStorage, MemoryUsage::GpuOnly);
@@ -126,6 +113,9 @@ std::unique_ptr<Buffer> gpu_buffer(vk::Context &ctx, VkDeviceSize bytes) {
 void clear(VkCommandBuffer cmd, const Buffer &buffer) { vkCmdFillBuffer(cmd, buffer.handle(), 0, VK_WHOLE_SIZE, 0); }
 
 } // namespace
+
+// What the chain-rule pass does with the gradients, as MODE_* in train_gradient.comp.
+enum class Trainer::Chain : std::uint32_t { Statistics, Gradients, Step, Curvature };
 
 Camera refined_pose(const Camera &camera, const std::array<float, 6> &move) {
   const glm::dvec3 w(move[0], move[1], move[2]), v(move[3], move[4], move[5]);
@@ -145,20 +135,20 @@ Camera refined_pose(const Camera &camera, const std::array<float, 6> &move) {
   return out;
 }
 
+// The optimiser's state is a word per parameter, as train_gradient.comp
+// describes. The values are a float each, but for SH (see half_sh_words()).
+// Gradients are only stored for compute_gradients(), so they are made then,
+// a float per parameter.
 struct Trainer::Group {
-  std::unique_ptr<Buffer> values, gradients, first, second, curvature;
+  std::unique_ptr<Buffer> values, state, gradients;
 
   Group() = default;
-  Group(vk::Context &ctx, std::span<const float> initial) {
-    const VkDeviceSize bytes = initial.size_bytes();
-    values = gpu_buffer(ctx, bytes);
+  template <class T> Group(vk::Context &ctx, std::span<const T> initial, std::size_t parameters) {
+    values = gpu_buffer(ctx, initial.size_bytes());
     values->upload(ctx, initial);
-    gradients = gpu_buffer(ctx, bytes);
-    first = gpu_buffer(ctx, bf16_bytes(initial.size()));
-    second = gpu_buffer(ctx, bf16_bytes(initial.size()));
+    state = gpu_buffer(ctx, VkDeviceSize{parameters} * sizeof(std::uint32_t));
     ctx.submit_and_wait([&](VkCommandBuffer cmd) {
-      clear(cmd, *first);
-      clear(cmd, *second);
+      clear(cmd, *state);
       vk::compute_barrier(cmd);
     });
   }
@@ -175,11 +165,10 @@ Trainer::Trainer(vk::Context &ctx, const GaussianCloud &initial, const TrainerOp
       loss_(ctx, shaders::train_loss_comp, 7, sizeof(LossPush)),
       exposureBackward_(ctx, shaders::train_exposure_backward_comp, 3, sizeof(ExposurePush)),
       errorMask_(ctx, shaders::train_error_mask_comp, 2, sizeof(ErrorMaskPush)),
-      score_(ctx, shaders::train_score_comp, 2, sizeof(ScorePush)), pose_(ctx, shaders::train_pose_comp, 4),
+      score_(ctx, shaders::train_score_comp, 2, sizeof(ScorePush)),
       hutchinson_(ctx, shaders::train_hutchinson_comp, 1, sizeof(HutchinsonPush)),
-      curvature_(ctx, shaders::train_curvature_comp, 2, sizeof(CurvaturePush)),
-      secondOrder_(ctx, shaders::train_second_order_comp, 7, sizeof(SecondOrderPush)), gradient_(ctx, shaders::train_gradient_comp, 15, sizeof(GradientPush)),
-      adam_(ctx, shaders::train_adam_comp, 4, sizeof(AdamPush)), noise_(ctx, shaders::train_noise_comp, 4, sizeof(NoisePush)), gather_(ctx, shaders::train_gather_comp, 3, sizeof(GatherPush)),
+      gradient_(ctx, shaders::train_gradient_comp, 21, sizeof(GradientPush)), shStep_(ctx, shaders::train_sh_step_comp, 4, sizeof(GradientPush)),
+      noise_(ctx, shaders::train_noise_comp, 4, sizeof(NoisePush)), gather_(ctx, shaders::train_gather_comp, 3, sizeof(GatherPush)),
       sorter_(ctx) {
   initial.validate();
   if (initial.empty()) throw std::runtime_error("nothing to train: the cloud is empty");
@@ -187,6 +176,7 @@ Trainer::Trainer(vk::Context &ctx, const GaussianCloud &initial, const TrainerOp
   shDegree_ = initial.shDegree;
   activeShDegree_ = initial.shDegree;
   shFloats_ = static_cast<std::uint32_t>(3 * initial.shCoeffs());
+  shWords_ = half_sh_words(initial.shCoeffs());
 
   fixedPoint_ = options.forceFixedPoint || !ctx.info().floatAtomicAdd;
   if (fixedPoint_) {
@@ -197,11 +187,11 @@ Trainer::Trainer(vk::Context &ctx, const GaussianCloud &initial, const TrainerOp
     backward_.emplace(ctx, shaders::train_backward_float_comp, 8, sizeof(TilePush));
   }
 
-  groups_.push_back(std::make_unique<Group>(ctx, initial.positions));
-  groups_.push_back(std::make_unique<Group>(ctx, initial.scales));
-  groups_.push_back(std::make_unique<Group>(ctx, initial.rotations));
-  groups_.push_back(std::make_unique<Group>(ctx, initial.opacities));
-  groups_.push_back(std::make_unique<Group>(ctx, initial.sh));
+  for (const auto *values : {&initial.positions, &initial.scales, &initial.rotations, &initial.opacities}) {
+    groups_.push_back(std::make_unique<Group>(ctx, std::span<const float>(*values), values->size()));
+  }
+  const std::vector<std::uint32_t> sh = pack_half_sh(initial.sh, initial.shCoeffs());
+  groups_.push_back(std::make_unique<Group>(ctx, std::span<const std::uint32_t>(sh), initial.sh.size()));
 
   camera_ = std::make_unique<Buffer>(ctx, sizeof(GpuCamera), kStorage, MemoryUsage::Upload);
   counters_ = std::make_unique<Buffer>(ctx, sizeof(std::uint32_t) * 2, kStorage, MemoryUsage::Readback);
@@ -266,6 +256,7 @@ void Trainer::allocate_per_gaussian() {
   ctx_.submit_and_wait([&](VkCommandBuffer cmd) {
     clear(cmd, *stats_);
     clear(cmd, *filter3d_);
+    clear(cmd, *rawGradients_);
     vk::compute_barrier(cmd);
   });
 }
@@ -326,7 +317,7 @@ void Trainer::upload_camera(const Camera &camera) {
   gc.viewport[3] = 0.5f * static_cast<float>(camera.height) / camera.fy;
   gc.counts[0] = count_;
   gc.counts[1] = static_cast<std::uint32_t>(activeShDegree_);
-  gc.counts[2] = shFloats_;
+  gc.counts[2] = shWords_;
   gc.counts[3] = static_cast<std::uint32_t>((activeShDegree_ + 1) * (activeShDegree_ + 1));
   std::memcpy(camera_->mapped().data(), &gc, sizeof(gc));
   camera_->flush();
@@ -436,7 +427,6 @@ void Trainer::record_backward(VkCommandBuffer cmd) {
 void Trainer::record_backward_from_adjoint(VkCommandBuffer cmd) {
   const auto w = static_cast<std::uint32_t>(width_), h = static_cast<std::uint32_t>(height_);
   clear(cmd, *rawGradients_);
-  for (const auto &group : groups_) clear(cmd, *group->gradients);
   vk::compute_barrier(cmd);
   const TilePush push{w, h, gridW_, tileCount_, {options_.background[0], options_.background[1], options_.background[2], 0.f}};
   if (fixedPoint_) {
@@ -451,19 +441,59 @@ void Trainer::record_backward_from_adjoint(VkCommandBuffer cmd) {
   }
   vk::compute_barrier(cmd);
   mark(cmd, "backward");
+}
+
+void Trainer::record_chain(VkCommandBuffer cmd, Chain mode, bool statistics, const LearningRates *rates) {
+  GradientPush push{};
+  push.opacityReg = options_.opacityReg / static_cast<float>(count_);
+  push.scaleReg = options_.scaleReg / static_cast<float>(count_);
+  push.mipFilter = options_.mipFilter2d ? 1u : 0u;
+  push.shDropout = dropoutNow_;
+  push.shRetained = shRetained_;
+  push.shSeed = shSeed_;
+  push.mode = static_cast<std::uint32_t>(mode);
+  push.flags = (statistics ? kStatisticsFlag : 0u) | (options_.poseGradients && mode != Chain::Curvature ? kPoseFlag : 0u) |
+               (options_.selectiveAdam ? kSelectiveFlag : 0u) | (secondOrder_ ? kSecondOrderFlag : 0u);
+  push.beta1 = kBeta1;
+  push.beta2 = kBeta2;
+  push.epsilon = kEpsilon;
+  push.curvatureBeta = kCurvatureBeta;
+  push.curvatureScale = 1.f / (1.f - std::pow(kCurvatureBeta, static_cast<float>(std::max(curvatureUpdates_, 1u))));
+  if (mode == Chain::Step) {
+    ++adamStep_;
+    const float learning[5] = {rates->position, rates->scale, rates->rotation, rates->opacity, rates->sh};
+    std::copy(std::begin(learning), std::end(learning), push.rates);
+    push.restScale = rates->shRestScale;
+    push.correction1 = 1.f - std::pow(kBeta1, static_cast<float>(adamStep_));
+    push.correction2 = 1.f - std::pow(kBeta2, static_cast<float>(adamStep_));
+    push.trustRegion = rates->trustRegion;
+    push.seed = adamStep_;
+  } else if (mode == Chain::Curvature) {
+    push.perValue = 1.f / (3.f * static_cast<float>(width_) * static_cast<float>(height_));
+    push.seed = curvatureUpdates_;
+  } else if (mode == Chain::Gradients) {
+    for (const auto &group : groups_) {
+      if (!group->gradients) group->gradients = gpu_buffer(ctx_, group->state->size());
+    }
+  }
+  push.shFloats = shFloats_;
+  // Bindings a pass does not use get any buffer: they are never touched. A step
+  // or curvature update replaces the backward pass's sums with what the SH pass needs.
+  const auto gradients = [&](std::size_t g) { return mode == Chain::Gradients ? groups_[g]->gradients.get() : rawGradients_.get(); };
   gradient_.dispatch(cmd,
                      {groups_[0]->values.get(), groups_[1]->values.get(), groups_[2]->values.get(), groups_[3]->values.get(),
-                      groups_[4]->values.get(), camera_.get(), rawGradients_.get(), groups_[0]->gradients.get(),
-                      groups_[1]->gradients.get(), groups_[2]->gradients.get(), groups_[3]->gradients.get(), groups_[4]->gradients.get(),
-                      splats_.get(), stats_.get(), filter3d_.get()},
-                     GradientPush{options_.opacityReg / static_cast<float>(count_), options_.scaleReg / static_cast<float>(count_), options_.mipFilter2d ? 1u : 0u, dropoutNow_, shRetained_, shSeed_},
-                     vk::div_up(count_, 256));
+                      groups_[4]->values.get(), camera_.get(), rawGradients_.get(), splats_.get(), stats_.get(), filter3d_.get(),
+                      groups_[0]->state.get(), groups_[1]->state.get(), groups_[2]->state.get(), groups_[3]->state.get(), groups_[4]->state.get(),
+                      gradients(0), gradients(1), gradients(2), gradients(3), gradients(4),
+                      poseTotals_ ? poseTotals_.get() : rawGradients_.get()},
+                     push, vk::div_up(count_, 256));
   vk::compute_barrier(cmd);
-  if (options_.poseGradients) {
-    pose_.dispatch(cmd, {groups_[0]->values.get(), groups_[0]->gradients.get(), camera_.get(), poseTotals_.get()}, std::span<const std::byte>{}, vk::div_up(count_, 256));
+  if (mode == Chain::Step || mode == Chain::Curvature) {
+    shStep_.dispatch(cmd, {groups_[4]->values.get(), groups_[4]->state.get(), rawGradients_.get(), camera_.get()}, push,
+                     vk::div_up(count_ * shWords_, 256));
     vk::compute_barrier(cmd);
   }
-  mark(cmd, "chain rule");
+  mark(cmd, mode == Chain::Step ? "chain rule and step" : "chain rule");
 }
 
 std::vector<float> Trainer::render(const Camera &camera) {
@@ -481,12 +511,16 @@ std::vector<float> Trainer::render(const Camera &camera) {
 }
 
 StepStats Trainer::compute_gradients(const Camera &camera, std::span<const std::uint8_t> target) {
-  return run(camera, target, nullptr);
+  return run(camera, target, Chain::Gradients, nullptr);
+}
+
+StepStats Trainer::collect_statistics(const Camera &camera, std::span<const std::uint8_t> target) {
+  return run(camera, target, Chain::Statistics, nullptr);
 }
 
 StepStats Trainer::score_view(const Camera &camera, std::span<const std::uint8_t> target, float errorShare, float pixelWeight) {
   scoreErrorShare_ = errorShare;
-  const StepStats stats = run(camera, target, nullptr);
+  const StepStats stats = run(camera, target, Chain::Statistics, nullptr);
   scoreErrorShare_ = 0.f;
   // The raw sums are over 3 pixels of the image, like the derivatives.
   const float toPixels = 3.f * static_cast<float>(width_) * static_cast<float>(height_) * pixelWeight;
@@ -529,7 +563,8 @@ void Trainer::prefetch_target(std::span<const std::uint8_t> target) {
   prefetchChanged_.notify_all();
 }
 
-StepStats Trainer::run(const Camera &camera, std::span<const std::uint8_t> target, const LearningRates *rates, std::span<const std::uint8_t> nextTarget) {
+StepStats Trainer::run(const Camera &camera, std::span<const std::uint8_t> target, Chain chain, const LearningRates *rates,
+                       std::span<const std::uint8_t> nextTarget) {
   upload_camera(camera);
   dropoutNow_ = rates != nullptr ? shDropout_ : 0.f; // Dropout trains; scoring and statistics see the whole model
   const std::size_t bytes = static_cast<std::size_t>(width_) * height_ * 4;
@@ -562,7 +597,7 @@ StepStats Trainer::run(const Camera &camera, std::span<const std::uint8_t> targe
     vkCmdCopyBuffer(cmd, targetStaging_->handle(), target_->handle(), 1, &region);
     record_forward(cmd, entries);
     record_backward(cmd);
-    if (rates != nullptr) record_adam(cmd, *rates);
+    record_chain(cmd, chain, true, rates);
     if (rates != nullptr && options_.positionNoise > 0.f) record_noise(cmd, options_.positionNoise * rates->position, adamStep_);
   });
   finish_timing();
@@ -604,43 +639,17 @@ StepStats Trainer::run(const Camera &camera, std::span<const std::uint8_t> targe
   return stats;
 }
 
-void Trainer::record_adam(VkCommandBuffer cmd, const LearningRates &rates) {
-  ++adamStep_;
-  const float correction1 = 1.f - std::pow(kBeta1, static_cast<float>(adamStep_));
-  const float correction2 = 1.f - std::pow(kBeta2, static_cast<float>(adamStep_));
-  const float learning[5] = {rates.position, rates.scale, rates.rotation, rates.opacity, rates.sh};
-  for (std::size_t g = 0; g < groups_.size(); ++g) {
-    const Group &group = *groups_[g];
-    const auto floats = static_cast<std::uint32_t>(group.values->size() / sizeof(float));
-    if (rates.trustRegion > 0.f && group.curvature) {
-      const std::uint32_t strides[5] = {3, 3, 4, 1, shFloats_}, kinds[5] = {0, 1, 0, 2, 3};
-      const SecondOrderPush push{floats, kBeta1, correction1, 1.f / (1.f - std::pow(kCurvatureBeta, static_cast<float>(std::max(curvatureUpdates_, 1u)))),
-                                 rates.trustRegion, kinds[g], strides[g]};
-      secondOrder_.dispatch(cmd, {group.values.get(), group.gradients.get(), group.first.get(), group.curvature.get(), groups_[1]->values.get(),
-                                  groups_[3]->values.get(), groups_[4]->values.get()}, push, vk::div_up(vk::div_up(floats, 2u), 256u));
-      // The next group reads what this one wrote.
-      vk::compute_barrier(cmd);
-      continue;
-    }
-    const AdamPush push{floats, learning[g], kBeta1, kBeta2, kEpsilon, correction1, correction2,
-                        g == 4 ? shFloats_ : 0u, rates.shRestScale, options_.selectiveAdam ? 1u : 0u, adamStep_};
-    adam_.dispatch(cmd, {group.values.get(), group.gradients.get(), group.first.get(), group.second.get()}, push,
-                   vk::div_up(vk::div_up(floats, 2u), 256u));
-  }
-  vk::compute_barrier(cmd);
-  mark(cmd, "adam");
-}
-
 void Trainer::enable_second_order() {
   if (fixedPoint_) throw std::runtime_error("second-order training needs float atomics");
+  if (secondOrder_) return;
+  // The curvature takes the place of the second moment, from zero.
   for (std::size_t g = 0; g < groups_.size(); ++g) {
     if (g == 2) continue; // Rotation stays with Adam: the paper's bound for it has a constant it never gives
-    groups_[g]->curvature = gpu_buffer(ctx_, groups_[g]->values->size());
-    ctx_.submit_and_wait([&](VkCommandBuffer cmd) {
-      clear(cmd, *groups_[g]->curvature);
-      vk::compute_barrier(cmd);
-    });
+    std::vector<std::uint32_t> state = groups_[g]->state->download_as<std::uint32_t>(ctx_);
+    for (std::uint32_t &word : state) word &= 0xFFFFu;
+    groups_[g]->state->upload(ctx_, std::span<const std::uint32_t>(state));
   }
+  secondOrder_ = true;
   curvatureUpdates_ = 0;
 }
 
@@ -652,28 +661,24 @@ void Trainer::update_curvature() {
     hutchinson_.dispatch(cmd, {adjoint_.get()}, HutchinsonPush{pixels, curvatureUpdates_}, vk::div_up(pixels, 256));
     vk::compute_barrier(cmd);
     record_backward_from_adjoint(cmd);
-    for (const auto &group : groups_) {
-      if (!group->curvature) continue;
-      const auto floats = static_cast<std::uint32_t>(group->values->size() / sizeof(float));
-      curvature_.dispatch(cmd, {group->gradients.get(), group->curvature.get()}, CurvaturePush{floats, kCurvatureBeta, 1.f / (3.f * static_cast<float>(pixels))},
-                          vk::div_up(floats, 256));
-    }
-    vk::compute_barrier(cmd);
+    record_chain(cmd, Chain::Curvature, false, nullptr);
   });
   marks_.clear(); // Only training iterations count towards the timings
 }
 
 void Trainer::apply_gradients(const LearningRates &rates) {
+  // From the backward pass's sums, which compute_gradients() left: the
+  // gradients follow from them again. The step uses them up (see record_chain()).
   ctx_.submit_and_wait([&](VkCommandBuffer cmd) {
     begin_timing(cmd);
-    record_adam(cmd, rates);
+    record_chain(cmd, Chain::Step, false, &rates);
   });
   finish_timing();
 }
 
 StepStats Trainer::step(const Camera &camera, std::span<const std::uint8_t> target, const LearningRates &rates, std::span<const std::uint8_t> nextTarget) {
-  // One submission for the whole iteration, rather than one for the gradients and one for the step.
-  return run(camera, target, &rates, nextTarget);
+  // One submission for the whole iteration, and the step taken as the gradients are found.
+  return run(camera, target, Chain::Step, &rates, nextTarget);
 }
 
 void Trainer::set_active_sh_degree(int degree) { activeShDegree_ = std::clamp(degree, 0, shDegree_); }
@@ -745,6 +750,7 @@ void Trainer::apply_changes(const DensifyResult &result) {
   const std::size_t newCount = result.cloud.size();
   const std::vector<float> *newValues[5] = {&result.cloud.positions, &result.cloud.scales, &result.cloud.rotations,
                                             &result.cloud.opacities, &result.cloud.sh};
+  const std::vector<std::uint32_t> newSh = pack_half_sh(result.cloud.sh, result.cloud.shCoeffs());
 
   // The survivors keep their optimiser state: gathered on the GPU through
   // this table, so that the moments never cross to the CPU. One old buffer is
@@ -757,27 +763,23 @@ void Trainer::apply_changes(const DensifyResult &result) {
     }
     sourceTable.flush();
   }
-  const auto gather = [&](std::unique_ptr<Buffer> &from, std::uint32_t floats, std::uint32_t stride, bool halves = false) {
-    std::unique_ptr<Buffer> to = gpu_buffer(ctx_, halves ? bf16_bytes(floats) : VkDeviceSize{floats} * sizeof(float));
-    const std::uint32_t words = halves ? vk::div_up(floats, 2u) : floats;
-    ctx_.submit_and_wait([&](VkCommandBuffer cmd) {
-      gather_.dispatch(cmd, {&sourceTable, from.get(), to.get()}, GatherPush{floats, stride, halves ? 1u : 0u}, vk::div_up(words, 256u));
-      vk::compute_barrier(cmd);
-    });
-    from.reset();
-    return to;
-  };
   for (std::size_t g = 0; g < groups_.size(); ++g) {
     const auto stride = static_cast<std::uint32_t>(newValues[g]->size() / newCount);
     const auto floats = static_cast<std::uint32_t>(newValues[g]->size());
     auto moved = std::make_unique<Group>();
-    if (groups_[g]->curvature) moved->curvature = gather(groups_[g]->curvature, floats, stride);
-    moved->first = gather(groups_[g]->first, floats, stride, true);
-    moved->second = gather(groups_[g]->second, floats, stride, true);
+    moved->state = gpu_buffer(ctx_, VkDeviceSize{floats} * sizeof(std::uint32_t));
+    ctx_.submit_and_wait([&](VkCommandBuffer cmd) {
+      gather_.dispatch(cmd, {&sourceTable, groups_[g]->state.get(), moved->state.get()}, GatherPush{floats, stride}, vk::div_up(floats, 256u));
+      vk::compute_barrier(cmd);
+    });
     groups_[g].reset();
-    moved->values = gpu_buffer(ctx_, VkDeviceSize{floats} * sizeof(float));
-    moved->values->upload(ctx_, std::span<const float>(*newValues[g]));
-    moved->gradients = gpu_buffer(ctx_, VkDeviceSize{floats} * sizeof(float));
+    if (g == 4) {
+      moved->values = gpu_buffer(ctx_, newSh.size() * sizeof(std::uint32_t));
+      moved->values->upload(ctx_, std::span<const std::uint32_t>(newSh));
+    } else {
+      moved->values = gpu_buffer(ctx_, VkDeviceSize{floats} * sizeof(float));
+      moved->values->upload(ctx_, std::span<const float>(*newValues[g]));
+    }
     groups_[g] = std::move(moved);
   }
   count_ = static_cast<std::uint32_t>(newCount);
@@ -811,17 +813,16 @@ void Trainer::reset_opacity(float maximum) {
   for (float &v : values) v = std::min(v, limit);
   groups_[3]->values->upload(ctx_, std::span<const float>(values));
   ctx_.submit_and_wait([&](VkCommandBuffer cmd) {
-    clear(cmd, *groups_[3]->first);
-    clear(cmd, *groups_[3]->second);
+    clear(cmd, *groups_[3]->state);
     vk::compute_barrier(cmd);
   });
 }
 
 std::uint64_t Trainer::bytes_per_gaussian() const noexcept {
   const std::uint64_t floats = 3 + 3 + 4 + 1 + shFloats_;
-  // Value and gradient as floats, the moments in bfloat16, and the curvature
-  // of all but the rotation when second-order steps are on.
-  const std::uint64_t parameters = floats * (2 * sizeof(float) + 2 * 2) + (groups_[0]->curvature ? (floats - 4) * sizeof(float) : 0);
+  // The values, floats but for SH, and the optimiser's state, a word each. The
+  // gradients stored by compute_gradients() are left out, as training never makes them.
+  const std::uint64_t parameters = (floats - shFloats_ + shWords_) * sizeof(float) + floats * sizeof(std::uint32_t);
   // Sort keys and values with their copies, coverage and the 3D filter, then the backward sums and the densification stats.
   return parameters + sizeof(GpuSplat) + 4 * 6 + kRawGradientsPerSplat * sizeof(float) + 32;
 }
@@ -842,13 +843,14 @@ GaussianCloud Trainer::cloud() const {
   out.scales = groups_[1]->values->download_as<float>(ctx_);
   out.rotations = groups_[2]->values->download_as<float>(ctx_);
   out.opacities = groups_[3]->values->download_as<float>(ctx_);
-  out.sh = groups_[4]->values->download_as<float>(ctx_);
+  out.sh = unpack_half_sh(groups_[4]->values->download_as<std::uint32_t>(ctx_), out.shCoeffs());
   return out;
 }
 
 const vk::Buffer &Trainer::parameters(std::size_t group) const { return *groups_.at(group)->values; }
 
 Trainer::Gradients Trainer::gradients() const {
+  if (!groups_[0]->gradients) throw std::logic_error("no gradients: compute_gradients() stores them");
   Gradients out;
   out.positions = groups_[0]->gradients->download_as<float>(ctx_);
   out.scales = groups_[1]->gradients->download_as<float>(ctx_);

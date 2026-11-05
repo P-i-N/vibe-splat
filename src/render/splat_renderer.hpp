@@ -12,9 +12,10 @@
 
 namespace splat {
 
-// Gaussians already on the GPU, in GaussianCloud's raw layout (the trainer's
-// parameter buffers). The renderer reads `sh` in place, so it must outlive
-// every frame recorded with it.
+// Gaussians already on the GPU, in GaussianCloud's raw layout but for `sh`,
+// which is in the trainer's (see half_sh_words()): the trainer's parameter
+// buffers. The renderer reads `sh` in place, so it must outlive every frame
+// recorded with it.
 struct GpuCloud {
   const vk::Buffer *positions = nullptr;
   const vk::Buffer *scales = nullptr;
@@ -85,9 +86,9 @@ private:
 
   std::size_t count_ = 0;
   std::size_t capacity_ = 0;
-  const vk::Buffer *shExternal_ = nullptr; // From set_scene(cmd, GpuCloud), as floats, instead of the packed sh_
+  const vk::Buffer *shExternal_ = nullptr; // From set_scene(cmd, GpuCloud), in the trainer's layout, instead of the packed sh_
   int shDegree_ = 0;
-  std::uint32_t shStride_ = 3; // Words of sh_, or floats of shExternal_, per Gaussian
+  std::uint32_t shStride_ = 3; // Words of sh_ or shExternal_ per Gaussian
   std::unique_ptr<vk::Buffer> gaussians_;
   std::unique_ptr<vk::Buffer> sh_;
   std::unique_ptr<vk::Buffer> splats2d_;

@@ -133,7 +133,7 @@ TEST_CASE("Gaussians packed on the GPU render like those uploaded from the CPU",
   // Unnormalised rotations: the shader must normalise them as set_scene() does.
   for (float &q : cloud.rotations) q *= 1.7f;
   // Degree 3 with view-dependent colour of about the size 3DGS trains, which
-  // the CPU path packs to bytes and the GPU path reads as floats.
+  // the CPU path packs to bytes and the GPU path reads as the trainer keeps it.
   std::mt19937 rng(5);
   std::normal_distribution<float> rest(0.f, 0.1f);
   std::vector<float> degree3;
@@ -156,7 +156,10 @@ TEST_CASE("Gaussians packed on the GPU render like those uploaded from the CPU",
     return b;
   };
   const vk::Buffer positions = buffer(cloud.positions), scales = buffer(cloud.scales), rotations = buffer(cloud.rotations),
-                   opacities = buffer(cloud.opacities), sh = buffer(cloud.sh);
+                   opacities = buffer(cloud.opacities);
+  const std::vector<std::uint32_t> trainerSh = pack_half_sh(cloud.sh, cloud.shCoeffs());
+  vk::Buffer sh(*ctx, trainerSh.size() * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, vk::MemoryUsage::GpuOnly);
+  sh.upload(*ctx, std::span<const std::uint32_t>(trainerSh));
   SplatRenderer fromGpu(*ctx, VK_FORMAT_R8G8B8A8_UNORM);
   ctx->submit_and_wait([&](VkCommandBuffer cmd) {
     fromGpu.set_scene(cmd, {&positions, &scales, &rotations, &opacities, &sh, cloud.size(), cloud.shDegree, cloud.shDegree});

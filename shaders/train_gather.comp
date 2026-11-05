@@ -1,8 +1,7 @@
 #version 460
 // After densification: builds a per-Gaussian array for the new cloud from the
-// old one. Element g takes its values from old element source[g], or zeros
-// when source[g] is negative (a new Gaussian starts with fresh optimiser
-// state). Elements are floats, or bfloat16 two to a word. One thread per word.
+// old one. Element g takes its value from old element source[g], or zero when
+// source[g] is negative (a new Gaussian starts with fresh optimiser state).
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer Source { int source[]; };
@@ -12,34 +11,14 @@ layout(std430, binding = 2) writeonly buffer Out { uint result[]; };
 layout(push_constant) uniform Push {
   uint count;  // Elements in the new array
   uint stride; // Elements per Gaussian
-  uint halves; // Whether elements are 16 bits
 } pc;
 
-// Old element index of new element i, or -1 for none.
-int origin(uint i) {
+void main() {
+  const uint i = gl_GlobalInvocationID.x;
+  if (i >= pc.count) {
+    return;
+  }
   const uint g = i / pc.stride, k = i - g * pc.stride;
   const int from = source[g];
-  return from < 0 ? -1 : int(uint(from) * pc.stride + k);
-}
-
-void main() {
-  const uint w = gl_GlobalInvocationID.x;
-  if (pc.halves == 0u) {
-    if (w < pc.count) {
-      const int j = origin(w);
-      result[w] = j < 0 ? 0u : values[j];
-    }
-    return;
-  }
-  if (2u * w >= pc.count) {
-    return;
-  }
-  uint word = 0u;
-  for (uint slot = 0u; slot < 2u && 2u * w + slot < pc.count; ++slot) {
-    const int j = origin(2u * w + slot);
-    if (j >= 0) {
-      word |= ((values[uint(j) / 2u] >> (16u * (uint(j) & 1u))) & 0xFFFFu) << (16u * slot);
-    }
-  }
-  result[w] = word;
+  result[i] = from < 0 ? 0u : values[uint(from) * pc.stride + k];
 }

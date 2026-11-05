@@ -465,10 +465,14 @@ TEST_CASE("Adam matches a hand-computed step", "[train][vulkan]") {
 
   // In the first step m / (1 - beta1) = g and sqrt(v / (1 - beta2)) = |g|, so
   // every parameter moves by exactly its rate, against the gradient's sign.
+  // Above degree 0 SH is kept in half floats, rounded to nearest on the way in
+  // and at random after the step: within two of their steps, |v| / 512.
   for (std::size_t i = 0; i < cloud.sh.size(); ++i) {
     if (g.sh[i] == 0.f) continue;
-    const float rate = i % 12 < 3 ? rates.sh : rates.sh * rates.shRestScale;
-    CHECK_THAT(after.sh[i], WithinAbs(cloud.sh[i] - (g.sh[i] > 0.f ? rate : -rate), 2e-5));
+    const bool dc = i % 12 < 3;
+    const float rate = dc ? rates.sh : rates.sh * rates.shRestScale;
+    const float expected = cloud.sh[i] - (g.sh[i] > 0.f ? rate : -rate);
+    CHECK_THAT(after.sh[i], WithinAbs(expected, dc ? 2e-5 : std::max(2e-5, std::abs(expected) / 512.0)));
   }
   for (std::size_t i = 0; i < cloud.opacities.size(); ++i) {
     if (g.opacities[i] == 0.f) continue;
@@ -667,43 +671,50 @@ TEST_CASE("SH dropout trains with the retained degrees only and never renders wi
     }
     return worst;
   };
-  const auto higher_degrees_touched = [&](const Trainer::Gradients &g) {
+  // Gaussians whose coefficients above degree 0 are nonzero in `values`.
+  const auto higher_degrees_nonzero = [&](const std::vector<float> &values) {
     std::size_t touched = 0;
     for (std::size_t i = 0; i < cloud.size(); ++i) {
       bool any = false;
       for (std::size_t k = 1; k < coefficients; ++k) {
-        for (int c = 0; c < 3; ++c) any = any || g.sh[(i * coefficients + k) * 3 + static_cast<std::size_t>(c)] != 0.f;
+        for (int c = 0; c < 3; ++c) any = any || values[(i * coefficients + k) * 3 + static_cast<std::size_t>(c)] != 0.f;
       }
       touched += any ? 1 : 0;
     }
     return touched;
   };
-
+  // Those whose coefficients above degree 0 a training step moved.
   Trainer trainer(*ctx, cloud);
+  const auto higher_degrees_trained = [&](const LearningRates &rates) {
+    const std::vector<float> before = trainer.cloud().sh;
+    trainer.step(camera, target, rates);
+    std::vector<float> moved = trainer.cloud().sh;
+    for (std::size_t i = 0; i < moved.size(); ++i) moved[i] -= before[i];
+    return higher_degrees_nonzero(moved);
+  };
+
   trainer.set_active_sh_degree(3);
   LearningRates rates;
-  rates.position = 0.f; // Nothing moves, so the renders below stay comparable
-  rates.scale = rates.rotation = rates.opacity = rates.sh = 0.f;
+  rates.position = 0.f; // Only SH moves
+  rates.scale = rates.rotation = rates.opacity = 0.f;
+  rates.sh = 0.01f;
 
   // Dropout on every Gaussian: a training step trains degree 0 only, but
   // rendering, as the reports and the final evaluation do, still shows everything.
   trainer.set_sh_dropout(1.f, 0, 1);
   CHECK(worst_against(trainer.render(camera), full) < 1e-3);
-  trainer.step(camera, target, rates);
-  CHECK(higher_degrees_touched(trainer.gradients()) == 0);
+  CHECK(higher_degrees_trained(rates) == 0);
   trainer.compute_gradients(camera, target); // Statistics for densification: not training, not dropped
-  CHECK(higher_degrees_touched(trainer.gradients()) > 250);
+  CHECK(higher_degrees_nonzero(trainer.gradients().sh) > 250);
 
   // Half the Gaussians: about half keep their higher degrees in a step.
   trainer.set_sh_dropout(0.5f, 0, 9);
-  trainer.step(camera, target, rates);
-  const std::size_t kept = higher_degrees_touched(trainer.gradients());
+  const std::size_t kept = higher_degrees_trained(rates);
   std::println("  SH dropout at 0.5: {} of {} Gaussians kept their higher degrees in a step", kept, cloud.size());
   CHECK(kept > 100);
   CHECK(kept < 200);
   trainer.set_sh_dropout(0.f, 0, 1);
-  trainer.step(camera, target, rates);
-  CHECK(higher_degrees_touched(trainer.gradients()) > 250);
+  CHECK(higher_degrees_trained(rates) > 250);
 }
 
 TEST_CASE("Pose gradients match finite differences of the loss", "[train][vulkan]") {
