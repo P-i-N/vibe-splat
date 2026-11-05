@@ -40,8 +40,8 @@ std::uint64_t GpuMatcher::descriptor_bytes(const std::vector<ImageFeatures> &fea
 }
 
 GpuMatcher::GpuMatcher(vk::Context &ctx, const std::vector<ImageFeatures> &features, float ratio)
-    : ctx_(ctx), ratio_(ratio), score_(ctx, shaders::match_score_comp, 4, sizeof(ScorePush)),
-      compact_(ctx, shaders::match_compact_comp, 5, sizeof(CompactPush)) {
+    : ctx_(ctx), ratio_(ratio), score_(ctx, shaders::match_score_comp(), 4, sizeof(ScorePush)),
+      compact_(ctx, shaders::match_compact_comp(), 5, sizeof(CompactPush)) {
   std::uint32_t total = 0;
   for (const ImageFeatures &f : features) {
     if (f.keypoints.size() > kMaxKeypoints) {

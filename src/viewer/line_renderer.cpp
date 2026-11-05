@@ -34,8 +34,8 @@ LineRenderer::LineRenderer(vk::Context &ctx, VkFormat colorFormat) : ctx_(ctx) {
   plci.pPushConstantRanges = &range;
   vk::check(vkCreatePipelineLayout(dev, &plci, nullptr, &layout_), "vkCreatePipelineLayout");
 
-  VkShaderModule vert = vk::create_shader_module(dev, shaders::debug_line_vert);
-  VkShaderModule frag = vk::create_shader_module(dev, shaders::debug_line_frag);
+  VkShaderModule vert = vk::create_shader_module(dev, shaders::debug_line_vert());
+  VkShaderModule frag = vk::create_shader_module(dev, shaders::debug_line_frag());
   VkPipelineShaderStageCreateInfo stages[2]{};
   stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
   stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;

@@ -17,7 +17,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <deque>
 #include <format>
 #include <fstream>
 #include <functional>
@@ -351,6 +350,12 @@ Photo load_photo(const fs::path &file, std::size_t view) {
   return {view, image.width, image.height, std::move(image.pixels)};
 }
 
+// "splat.ply + splat.cgc": the files training saves to.
+std::string saved_names(const TrainOptions &options) {
+  const auto [ply, cgc] = output_paths(options);
+  return std::format("{} + {}", ply.filename().string(), cgc.filename().string());
+}
+
 enum class TrainState { Idle, Loading, Running, Paused, Finished, Failed };
 
 const ImVec4 kDim{0.62f, 0.66f, 0.72f, 1.f};
@@ -370,6 +375,8 @@ private:
   void open_scene(const fs::path &path);
   void open_dropped(const fs::path &path);
   void reset_home();
+  // Finds how the project's poses are shown, from the floor under them.
+  void set_alignment();
   void start_training();
   void stop_training(bool save);
 
@@ -394,6 +401,10 @@ private:
 
   // Helpers
   [[nodiscard]] Camera render_camera(VkExtent2D extent) const;
+  // A camera in the shown frame as one in the poses' frame, and the other way.
+  [[nodiscard]] Camera to_pose_frame(const Camera &shownCamera) const;
+  [[nodiscard]] Camera from_pose_frame(const Camera &poseCamera) const;
+  [[nodiscard]] glm::vec3 shown(glm::vec3 posePoint) const { return glm::vec3(align_ * glm::vec4(posePoint, 1.f)); }
   [[nodiscard]] float pixels_per_point() const;
   [[nodiscard]] std::optional<std::size_t> view_at(glm::vec2 pixel, float radius) const;
   void snap_to(std::size_t view);
@@ -425,8 +436,15 @@ private:
   std::optional<ColmapModel> model_;
   std::vector<PosedView> views_;
   float cameraSpacing_ = 0.f;
-  Bounds bounds_;
-  OrbitCamera home_, orbit_;
+  Bounds bounds_; // In the shown frame
+  // The camera poses, sparse points and the Gaussians being trained are in the
+  // frame of the poses; they are shown turned so that the floor is level at
+  // y = 0, as training saves them (see scene_alignment()). A loaded scene is
+  // shown as it is.
+  glm::mat4 align_{1.f}, unalign_{1.f}; // Pose frame to shown, and back
+  bool floorKnown_ = false;             // The shown frame has its floor at y = 0
+  bool splatsInPoseFrame_ = false;      // The splats are the trainer's, not a loaded scene
+  OrbitCamera home_, orbit_;            // In the shown frame
   std::optional<std::pair<Bounds, OrbitCamera>> sceneHome_; // Of the loaded .ply
   std::uint32_t visible_ = 0;
 
@@ -436,6 +454,7 @@ private:
   bool showCameras_ = true, showPoints_ = false, showGrid_ = false, showAxes_ = false;
   bool pointMode_ = false, autoRotate_ = false, vsync_ = true;
   float splatScale_ = 1.f, pointRadius_ = 2.f, frustumScale_ = 1.f;
+  float moveSpeed_ = 1.f; // WASD/stick multiplier on kMoveSpeed
   int shDegree_ = 3;
   float background_[3] = {0.f, 0.f, 0.f};
 
@@ -465,9 +484,9 @@ private:
   std::vector<float> lossHistory_;
   double lossBucket_ = 0.0;
   int lossBucketCount_ = 0;
-  std::deque<std::string> log_;
   std::string failure_;
   TrainReport finalReport_;
+  std::future<void> cgcWriting_; // The finished run's .cgc
 
   // Frame timing, toasts, screenshots, work for after the fence
   double frameMs_ = 16.0;
@@ -551,6 +570,10 @@ Viewer::~Viewer() {
   VkDevice dev = ctx_.device();
   vkDeviceWaitIdle(dev);
   for (auto &task : tasks_) task.wait();
+  if (cgcWriting_.valid()) {
+    std::println("Waiting for the .cgc to be written");
+    cgcWriting_.wait();
+  }
   if (photoLoading_.valid()) photoLoading_.wait();
   if (trainLoading_.valid()) trainLoading_.wait();
   imgui_->destroy_texture(photoTexture_);
@@ -582,12 +605,9 @@ void Viewer::open_project(const fs::path &project) {
   } else {
     points_->set_scene(GaussianCloud{});
   }
+  set_alignment();
   trainOptions_.project = project;
-  if (trainOptions_.out.empty() || !options_.train) {
-    // Trained again in the format it was trained in before.
-    const fs::path previous = project_scene(project);
-    trainOptions_.out = project / (previous.empty() ? fs::path("splat.ply") : previous.filename());
-  }
+  if (trainOptions_.out.empty() || !options_.train) trainOptions_.out = project / "splat.ply";
   sceneName_ = project.filename().string();
 }
 
@@ -597,6 +617,7 @@ void Viewer::open_scene(const fs::path &path) {
   const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
   std::println("Loaded {} Gaussians (SH degree {}) from {} in {:.0f} ms", cloud.size(), cloud.shDegree, path.string(), ms);
   renderer_->set_scene(cloud);
+  splatsInPoseFrame_ = false;
   sceneHome_.emplace(compute_bounds(cloud), default_orbit(cloud, options_.up));
   shDegree_ = cloud.shDegree;
   scenePath_ = path;
@@ -630,6 +651,7 @@ void Viewer::open_dropped(const fs::path &path) {
         photoWanted_.reset();
         photoView_ = ~std::size_t{0};
         points_->set_scene(GaussianCloud{});
+        set_alignment();
       }
       open_scene(path);
     }
@@ -659,8 +681,29 @@ void Viewer::reset_home() {
     home_.up = options_.up;
     return;
   }
+  for (std::size_t i = 0; i < probe.size(); ++i) {
+    float *p = &probe.positions[i * 3];
+    const glm::vec3 q = shown({p[0], p[1], p[2]});
+    p[0] = q.x;
+    p[1] = q.y;
+    p[2] = q.z;
+  }
   bounds_ = compute_bounds(probe);
   home_ = default_orbit(probe, options_.up);
+}
+
+void Viewer::set_alignment() {
+  align_ = unalign_ = glm::mat4(1.f);
+  floorKnown_ = false;
+  // Without --no-align, the same alignment the trained scene is saved with.
+  if (!model_ || !trainOptions_.alignFloor) return;
+  const SceneAlignment alignment = scene_alignment(*model_);
+  glm::dmat4 m(alignment.transform.rotation);
+  m[3] = glm::dvec4(alignment.transform.translation, 1.0);
+  align_ = glm::mat4(m);
+  unalign_ = glm::inverse(align_);
+  floorKnown_ = true;
+  std::println("Shown with the floor level: {}", alignment.describe());
 }
 
 void Viewer::start_training() {
@@ -669,12 +712,13 @@ void Viewer::start_training() {
     return;
   }
   if (state_ == TrainState::Loading || training_active()) return;
+  // The last run's .cgc goes to the same file.
+  if (cgcWriting_.valid()) cgcWriting_.wait();
   session_.reset();
   lossHistory_.clear();
   lossBucket_ = 0.0;
   lossBucketCount_ = 0;
   failure_.clear();
-  log_.clear();
   loadDone_->store(0);
   loadTotal_->store(views_.size());
   // Views are decoded on another thread; the trainer starts once they are in.
@@ -695,9 +739,15 @@ void Viewer::stop_training(bool save) {
   if (!session_) return;
   try {
     if (save) {
-      finalReport_ = session_->finish();
-      toast(std::format("Saved {} Gaussians to {}", human(static_cast<double>(finalReport_.gaussians)), session_->options().out.filename().string()));
-      scenePath_ = session_->options().out;
+      // The .cgc takes a while at full quality, so it is written on another
+      // thread and the window stays responsive.
+      std::function<void()> writeCgc;
+      finalReport_ = session_->finish(writeCgc);
+      const auto [ply, cgc] = output_paths(session_->options());
+      toast(std::format("Saved {} Gaussians to {}, compressing {}", human(static_cast<double>(finalReport_.gaussians)), ply.filename().string(),
+                        cgc.filename().string()));
+      cgcWriting_ = std::async(std::launch::async, std::move(writeCgc));
+      scenePath_ = cgc;
     }
     state_ = TrainState::Finished;
   } catch (const std::exception &e) {
@@ -810,8 +860,7 @@ void Viewer::run() {
   check(vkWaitForFences(ctx_.device(), 1, &frameFence_, VK_TRUE, UINT64_MAX), "vkWaitForFences");
   // Closing mid-training keeps what was learnt so far.
   if (session_ && training_active() && !session_->finished()) {
-    session_->save(session_->options().out);
-    std::println("Saved iteration {} to {}", session_->iteration(), session_->options().out.string());
+    session_->save();
   }
 }
 
@@ -957,8 +1006,8 @@ void Viewer::handle_key(const SDL_KeyboardEvent &key) {
   case SDLK_S:
     if (ctrl && session_) {
       pending_.push_back([this] {
-        session_->save(session_->options().out);
-        toast(std::format("Saved iteration {} to {}", session_->iteration(), session_->options().out.filename().string()));
+        session_->save();
+        toast(std::format("Saved iteration {} to {}", session_->iteration(), saved_names(session_->options())));
       });
     }
     break;
@@ -977,7 +1026,9 @@ void Viewer::update_input(float dt) {
     right = static_cast<float>(keys[SDL_SCANCODE_D]) - static_cast<float>(keys[SDL_SCANCODE_A]);
     upward = static_cast<float>(keys[SDL_SCANCODE_E]) - static_cast<float>(keys[SDL_SCANCODE_Q]);
   }
-  const float speed = (SDL_GetModState() & SDL_KMOD_SHIFT ? 2.4f : 0.6f) * dt;
+  // A fraction of the orbit distance per second; Shift moves 4x faster.
+  constexpr float kMoveSpeed = 0.2f;
+  const float speed = kMoveSpeed * moveSpeed_ * (SDL_GetModState() & SDL_KMOD_SHIFT ? 4.f : 1.f) * dt;
   if (pad_ != nullptr) {
     fwd -= stick(pad_, SDL_GAMEPAD_AXIS_LEFTY);
     right += stick(pad_, SDL_GAMEPAD_AXIS_LEFTX);
@@ -1076,12 +1127,23 @@ void Viewer::after_fence() {
     }
   }
 
+  // The finished run's .cgc written.
+  if (cgcWriting_.valid() && cgcWriting_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+    try {
+      cgcWriting_.get();
+      toast(std::format("Saved {}", scenePath_.filename().string()));
+    } catch (const std::exception &e) {
+      toast(std::format("Could not save {}: {}", scenePath_.filename().string(), e.what()), true);
+    }
+  }
+
   // Training data loaded: the trainer can start.
   if (state_ == TrainState::Loading && trainLoading_.valid() &&
       trainLoading_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
     try {
       session_ = std::make_unique<TrainSession>(ctx_, trainOptions_, trainLoading_.get(), [this](const std::string &line) { log(line); });
       state_ = TrainState::Running;
+      splatsInPoseFrame_ = true;
       scenePath_.clear();
       showPoints_ = false;
       reset_home();
@@ -1120,6 +1182,7 @@ void Viewer::train_tick() {
 void Viewer::record(VkCommandBuffer cmd, std::uint32_t imageIndex) {
   const VkExtent2D extent = swapchain_.extent();
   const Camera camera = render_camera(extent);
+  const Camera poseCamera = to_pose_frame(camera);
   const VkImage image = swapchain_.image(imageIndex);
   const VkImageView target = swapchain_.view(imageIndex);
   const std::array<float, 4> background{background_[0], background_[1], background_[2], 1.f};
@@ -1134,8 +1197,8 @@ void Viewer::record(VkCommandBuffer cmd, std::uint32_t imageIndex) {
   image_barrier(cmd, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                 VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, 0, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                 VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-  renderer_->record(cmd, camera, target, extent, background);
-  if (showPoints_ && points_->splat_count() > 0) points_->record(cmd, camera, target, extent, background, false);
+  renderer_->record(cmd, splatsInPoseFrame_ ? poseCamera : camera, target, extent, background);
+  if (showPoints_ && points_->splat_count() > 0) points_->record(cmd, poseCamera, target, extent, background, false);
 
   // Screenshots show the scene, without the overlays.
   if (screenshotWanted_) {
@@ -1195,10 +1258,12 @@ void Viewer::build_lines(const Camera &camera) {
   const glm::vec3 ref = std::abs(u.z) < 0.9f ? glm::vec3(0.f, 0.f, 1.f) : glm::vec3(1.f, 0.f, 0.f);
   const glm::vec3 a = glm::normalize(ref - u * glm::dot(ref, u));
   const glm::vec3 b = glm::cross(u, a);
-  const glm::vec3 center(bounds_.center[0], bounds_.center[1], bounds_.center[2]);
+  glm::vec3 center(bounds_.center[0], bounds_.center[1], bounds_.center[2]);
   const float radius = std::max(bounds_.radius, 1e-3f);
 
   if (showGrid_) {
+    // On the floor when it is known, else through the middle of the scene.
+    if (floorKnown_) center -= u * glm::dot(center, u);
     const float spacing = std::pow(10.f, std::floor(std::log10(radius * 0.5f)));
     const int n = std::clamp(static_cast<int>(std::ceil(radius * 1.5f / spacing)), 2, 40);
     const float half = static_cast<float>(n) * spacing;
@@ -1237,13 +1302,15 @@ void Viewer::build_lines(const Camera &camera) {
       if (trained == i) color = {0.35f, 1.f, 0.45f, 1.f};
       if (hovered_ == i) color = {1.f, 1.f, 1.f, 1.f};
       const Camera &c = v.camera;
+      const glm::mat4 toShown = align_ * v.toWorld;
       const auto corner = [&](float px, float py) {
         const glm::vec3 local((px - c.cx) / c.fx * depth, (py - c.cy) / c.fy * depth, depth);
-        return glm::vec3(v.toWorld * glm::vec4(local, 1.f));
+        return glm::vec3(toShown * glm::vec4(local, 1.f));
       };
       const auto w = static_cast<float>(c.width), h = static_cast<float>(c.height);
       const glm::vec3 p0 = corner(0.f, 0.f), p1 = corner(w, 0.f), p2 = corner(w, h), p3 = corner(0.f, h);
-      for (const glm::vec3 &p : {p0, p1, p2, p3}) lines_->line(c.position, p, color);
+      const glm::vec3 eye = shown(c.position);
+      for (const glm::vec3 &p : {p0, p1, p2, p3}) lines_->line(eye, p, color);
       lines_->line(p0, p1, color);
       lines_->line(p1, p2, color);
       lines_->line(p2, p3, color);
@@ -1268,8 +1335,22 @@ void Viewer::build_lines(const Camera &camera) {
 
 Camera Viewer::render_camera(VkExtent2D extent) const {
   const auto w = static_cast<int>(std::max(extent.width, 1u)), h = static_cast<int>(std::max(extent.height, 1u));
-  if (snapped_) return fit_to(views_[*snapped_].camera, w, h);
+  if (snapped_) return from_pose_frame(fit_to(views_[*snapped_].camera, w, h));
   return orbit_.camera(w, h);
+}
+
+Camera Viewer::to_pose_frame(const Camera &shownCamera) const {
+  Camera c = shownCamera;
+  c.view = shownCamera.view * align_;
+  c.position = glm::vec3(unalign_ * glm::vec4(shownCamera.position, 1.f));
+  return c;
+}
+
+Camera Viewer::from_pose_frame(const Camera &poseCamera) const {
+  Camera c = poseCamera;
+  c.view = poseCamera.view * unalign_;
+  c.position = shown(poseCamera.position);
+  return c;
 }
 
 float Viewer::pixels_per_point() const {
@@ -1285,7 +1366,7 @@ std::optional<std::size_t> Viewer::view_at(glm::vec2 pixel, float radius) const 
   float bestDistance = radius;
   for (std::size_t i = 0; i < views_.size(); ++i) {
     if (snapped_ == i) continue;
-    const auto p = project(camera, views_[i].camera.position);
+    const auto p = project(camera, shown(views_[i].camera.position));
     if (!p) continue;
     const float d = glm::length(*p - pixel);
     if (d < bestDistance) {
@@ -1307,7 +1388,7 @@ void Viewer::unsnap() {
   if (!snapped_) return;
   // Continue orbiting from where the photo was taken, around a point at the
   // depth of the scene's centre.
-  const Camera &c = views_[*snapped_].camera;
+  const Camera c = from_pose_frame(views_[*snapped_].camera);
   const glm::vec3 forward = forward_of(c);
   const glm::vec3 center(bounds_.center[0], bounds_.center[1], bounds_.center[2]);
   const float depth = std::max(glm::dot(center - c.position, forward), bounds_.radius * 0.2f);
@@ -1336,11 +1417,7 @@ void Viewer::toast(std::string text, bool warning) {
   toastTime_ = 4.0;
 }
 
-void Viewer::log(const std::string &line) {
-  std::println("{}", line);
-  log_.push_back(line);
-  while (log_.size() > 200) log_.pop_front();
-}
+void Viewer::log(const std::string &line) { std::println("{}", line); }
 
 // --- UI ---------------------------------------------------------------------
 
@@ -1475,15 +1552,7 @@ void Viewer::panel_training() {
     trainOptions_.iterations = std::max(trainOptions_.iterations, 1);
     trainOptions_.maxSize = std::max(trainOptions_.maxSize, 0);
     trainOptions_.holdout = std::max(trainOptions_.holdout, 0);
-    // CGC is far smaller; training itself is the same either way.
-    int format = cloud_format(trainOptions_.out) == CloudFormat::Cgc ? 1 : 0;
-    ImGui::TextColored(kDim, "save as");
-    ImGui::SameLine();
-    const bool ply = ImGui::RadioButton(".ply", &format, 0);
-    ImGui::SameLine();
-    const bool cgc = ImGui::RadioButton(".cgc (compressed)", &format, 1);
-    if (ply || cgc) trainOptions_.out.replace_extension(format == 1 ? ".cgc" : ".ply");
-    ImGui::TextColored(kDim, "-> %s", trainOptions_.out.filename().string().c_str());
+    ImGui::TextColored(kDim, "-> %s", saved_names(trainOptions_).c_str());
     if (ImGui::Button("Start training", ImVec2(width * 0.6f, 0.f))) pending_.push_back([this] { start_training(); });
     ImGui::TreePop();
     break;
@@ -1535,8 +1604,8 @@ void Viewer::panel_training() {
       ImGui::SameLine();
       if (ImGui::Button("Save")) {
         pending_.push_back([this] {
-          session_->save(session_->options().out);
-          toast(std::format("Saved iteration {} to {}", session_->iteration(), session_->options().out.filename().string()));
+          session_->save();
+          toast(std::format("Saved iteration {} to {}", session_->iteration(), saved_names(session_->options())));
         });
       }
       ImGui::SameLine();
@@ -1546,19 +1615,12 @@ void Viewer::panel_training() {
       ImGui::SliderFloat("##budget", &trainBudgetMs_, 5.f, 200.f, "%.0f ms/frame", ImGuiSliderFlags_Logarithmic);
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("Training time per frame: more trains faster, less keeps the view smooth");
     } else {
-      ImGui::TextColored(kDim, "-> %s", s.options().out.filename().string().c_str());
-      if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", s.options().out.string().c_str());
+      ImGui::TextColored(kDim, "-> %s%s", saved_names(s.options()).c_str(), cgcWriting_.valid() ? "  (compressing .cgc)" : "");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", s.options().out.parent_path().string().c_str());
       if (ImGui::Button("Train again")) pending_.push_back([this] {
         state_ = TrainState::Idle;
         start_training();
       });
-    }
-    if (!log_.empty() && ImGui::TreeNode("Log")) {
-      ImGui::BeginChild("##log", ImVec2(width * 1.6f, 120.f * uiScale_), ImGuiChildFlags_None, ImGuiWindowFlags_HorizontalScrollbar);
-      for (const std::string &line : log_) ImGui::TextUnformatted(line.c_str());
-      if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) ImGui::SetScrollHereY(1.f);
-      ImGui::EndChild();
-      ImGui::TreePop();
     }
     break;
   }
@@ -1591,6 +1653,7 @@ void Viewer::panel_view() {
     unsnap();
     orbit_.fovDeg = fov;
   }
+  ImGui::SliderFloat("move speed", &moveSpeed_, 0.1f, 10.f, "%.2fx", ImGuiSliderFlags_Logarithmic);
   ImGui::ColorEdit3("background", background_, ImGuiColorEditFlags_NoInputs);
   ImGui::Checkbox("cameras", &showCameras_);
   ImGui::SameLine();

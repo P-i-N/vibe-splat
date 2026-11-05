@@ -72,8 +72,8 @@ void ImGuiRenderer::create_pipeline(VkFormat colorFormat) {
   plci.pPushConstantRanges = &range;
   vk::check(vkCreatePipelineLayout(dev, &plci, nullptr, &layout_), "vkCreatePipelineLayout");
 
-  VkShaderModule vert = vk::create_shader_module(dev, shaders::imgui_vert);
-  VkShaderModule frag = vk::create_shader_module(dev, shaders::imgui_frag);
+  VkShaderModule vert = vk::create_shader_module(dev, shaders::imgui_vert());
+  VkShaderModule frag = vk::create_shader_module(dev, shaders::imgui_frag());
   VkPipelineShaderStageCreateInfo stages[2]{};
   stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
   stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;

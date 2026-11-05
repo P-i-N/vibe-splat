@@ -155,20 +155,20 @@ struct Trainer::Group {
 };
 
 Trainer::Trainer(vk::Context &ctx, const GaussianCloud &initial, const TrainerOptions &options)
-    : ctx_(ctx), options_(options), preprocess_(ctx, shaders::train_preprocess_comp, 10, sizeof(PreprocessPush)),
-      binCount_(ctx, shaders::train_bin_count_comp, 5, sizeof(BinPush)),
-      binEmit_(ctx, shaders::train_bin_emit_comp, 6, sizeof(BinPush)),
-      tileRanges_(ctx, shaders::train_tile_ranges_comp, 2, sizeof(CountPush)),
-      forward_(ctx, shaders::train_forward_comp, 5, sizeof(TilePush)),
-      exposure_(ctx, shaders::train_exposure_comp, 2, sizeof(ExposurePush)),
-      ssim_(ctx, shaders::train_ssim_comp, 4, sizeof(SsimPush)),
-      loss_(ctx, shaders::train_loss_comp, 7, sizeof(LossPush)),
-      exposureBackward_(ctx, shaders::train_exposure_backward_comp, 3, sizeof(ExposurePush)),
-      errorMask_(ctx, shaders::train_error_mask_comp, 2, sizeof(ErrorMaskPush)),
-      score_(ctx, shaders::train_score_comp, 2, sizeof(ScorePush)),
-      hutchinson_(ctx, shaders::train_hutchinson_comp, 1, sizeof(HutchinsonPush)),
-      gradient_(ctx, shaders::train_gradient_comp, 21, sizeof(GradientPush)), shStep_(ctx, shaders::train_sh_step_comp, 4, sizeof(GradientPush)),
-      noise_(ctx, shaders::train_noise_comp, 4, sizeof(NoisePush)), gather_(ctx, shaders::train_gather_comp, 3, sizeof(GatherPush)),
+    : ctx_(ctx), options_(options), preprocess_(ctx, shaders::train_preprocess_comp(), 10, sizeof(PreprocessPush)),
+      binCount_(ctx, shaders::train_bin_count_comp(), 5, sizeof(BinPush)),
+      binEmit_(ctx, shaders::train_bin_emit_comp(), 6, sizeof(BinPush)),
+      tileRanges_(ctx, shaders::train_tile_ranges_comp(), 2, sizeof(CountPush)),
+      forward_(ctx, shaders::train_forward_comp(), 5, sizeof(TilePush)),
+      exposure_(ctx, shaders::train_exposure_comp(), 2, sizeof(ExposurePush)),
+      ssim_(ctx, shaders::train_ssim_comp(), 4, sizeof(SsimPush)),
+      loss_(ctx, shaders::train_loss_comp(), 7, sizeof(LossPush)),
+      exposureBackward_(ctx, shaders::train_exposure_backward_comp(), 3, sizeof(ExposurePush)),
+      errorMask_(ctx, shaders::train_error_mask_comp(), 2, sizeof(ErrorMaskPush)),
+      score_(ctx, shaders::train_score_comp(), 2, sizeof(ScorePush)),
+      hutchinson_(ctx, shaders::train_hutchinson_comp(), 1, sizeof(HutchinsonPush)),
+      gradient_(ctx, shaders::train_gradient_comp(), 21, sizeof(GradientPush)), shStep_(ctx, shaders::train_sh_step_comp(), 4, sizeof(GradientPush)),
+      noise_(ctx, shaders::train_noise_comp(), 4, sizeof(NoisePush)), gather_(ctx, shaders::train_gather_comp(), 3, sizeof(GatherPush)),
       sorter_(ctx) {
   initial.validate();
   if (initial.empty()) throw std::runtime_error("nothing to train: the cloud is empty");
@@ -180,11 +180,11 @@ Trainer::Trainer(vk::Context &ctx, const GaussianCloud &initial, const TrainerOp
 
   fixedPoint_ = options.forceFixedPoint || !ctx.info().floatAtomicAdd;
   if (fixedPoint_) {
-    backward_.emplace(ctx, shaders::train_backward_fixed_comp, 9, sizeof(TilePush));
-    fixedToFloat_.emplace(ctx, shaders::train_fixed_to_float_comp, 1, sizeof(FixedPush));
+    backward_.emplace(ctx, shaders::train_backward_fixed_comp(), 9, sizeof(TilePush));
+    fixedToFloat_.emplace(ctx, shaders::train_fixed_to_float_comp(), 1, sizeof(FixedPush));
     fixedScale_ = std::make_unique<Buffer>(ctx, sizeof(float), kStorage, MemoryUsage::Upload);
   } else {
-    backward_.emplace(ctx, shaders::train_backward_float_comp, 8, sizeof(TilePush));
+    backward_.emplace(ctx, shaders::train_backward_float_comp(), 8, sizeof(TilePush));
   }
 
   for (const auto *values : {&initial.positions, &initial.scales, &initial.rotations, &initial.opacities}) {

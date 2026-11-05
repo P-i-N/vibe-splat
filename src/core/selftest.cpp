@@ -37,7 +37,7 @@ SelfTestResult run_selftest(vk::Context &ctx, std::uint32_t elements) {
   sums.as<std::uint32_t>()[0] = 0;
   sums.flush();
 
-  vk::ComputePipeline pipeline(ctx, shaders::selftest_comp, 4, sizeof(Push));
+  vk::ComputePipeline pipeline(ctx, shaders::selftest_comp(), 4, sizeof(Push));
   const std::uint32_t groups = (elements + 255) / 256;
 
   const auto start = std::chrono::steady_clock::now();

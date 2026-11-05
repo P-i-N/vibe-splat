@@ -3,6 +3,7 @@
 #include "core/vk_context.hpp"
 #include "render/camera.hpp"
 #include "sfm/colmap_model.hpp"
+#include "splat/align.hpp"
 #include "splat/cgc.hpp"
 #include "train/schedule.hpp"
 #include "train/trainer.hpp"
@@ -13,6 +14,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <utility>
@@ -22,10 +24,14 @@ namespace splat {
 
 struct TrainOptions {
   std::filesystem::path project;
+  // Where to save: the Gaussians are written both as a .ply and as a compressed
+  // .cgc, under this name with each extension (see output_paths()).
   std::filesystem::path out;
-  int iterations = 30000;
+  int iterations = 15000;
   float lambdaSsim = 0.2f;
-  int shDegree = 3;
+  // 2, not 3DGS's 3: on bicycle 15000 iterations train 8% faster and the final
+  // .cgc compresses 3x faster, at 416 rather than 544 bytes per Gaussian.
+  int shDegree = 2;
   int maxSize = 0;  // Shrink images to this; 0 keeps their size
   int maxViews = 0; // Use only the first n views; 0 uses all
   int holdout = 0;  // Keep the first and every nth view out of training, as 3DGS does; 0 trains on all
@@ -97,10 +103,26 @@ struct TrainOptions {
   // After densification, steps from the curvature instead of Adam's second moment (3DGS^2-TR).
   bool secondOrder = false;
   bool pointExtent = false;       // The scene's extent from the sparse points, not the cameras
-  // Turn and move the saved Gaussians so the floor is level at y = 0, -y up.
-  // Training itself stays in the cameras' frame.
+  // Turn and move the saved Gaussians so the floor is level at y = 0, -y up,
+  // by scene_alignment(). Training itself stays in the cameras' frame.
   bool alignFloor = true;
 };
+
+// The two files training writes: TrainOptions::out as a .ply and as a .cgc.
+[[nodiscard]] std::array<std::filesystem::path, 2> output_paths(const TrainOptions &options);
+
+// How a project's scene is turned and moved to put its floor level at y = 0
+// with -y up, found from the poses of all its photos and its sparse points
+// before any training. Saves use it, and the viewer shows training through it,
+// so what is trained looks the same in the window as in the saved file.
+struct SceneAlignment {
+  RigidTransform transform;
+  FloorEstimate floor;
+  double tiltDeg = 0.0; // Of the floor from the cameras' up
+  // How the floor was found, for the log.
+  [[nodiscard]] std::string describe() const;
+};
+[[nodiscard]] SceneAlignment scene_alignment(const ColmapModel &model);
 
 struct TrainReport {
   float firstLoss = 0.f;
@@ -179,8 +201,12 @@ public:
   StepStats step();
   // Measures PSNR on every view, saves the result and the previews.
   TrainReport finish();
-  // Saves the current Gaussians, through a temporary file.
-  void save(const std::filesystem::path &path);
+  // The same, but leaves writing the .cgc, which takes a while at full
+  // quality, to `writeCgc`, to run on any thread. It holds its own copy of the
+  // Gaussians, so it may outlive the session.
+  TrainReport finish(std::function<void()> &writeCgc);
+  // Saves the current Gaussians to output_paths(), through temporary files.
+  void save();
 
   [[nodiscard]] Trainer &trainer() noexcept { return *trainer_; }
   [[nodiscard]] const Trainer &trainer() const noexcept { return *trainer_; }
@@ -207,8 +233,9 @@ private:
   void refill_order();
   // Mip-Splatting's 3D smoothing filter from the cameras of the current size.
   void refresh_filter(int iteration);
-  // Saves, and returns how the floor was found, or nothing if it was not looked for.
-  std::string save_output(const std::filesystem::path &path, const CgcOptions &cgcOptions);
+  // Writes the .ply, and returns the writing of the .cgc, with `quick` CGC
+  // settings for checkpoints.
+  [[nodiscard]] std::function<void()> save_outputs(bool quick);
 
   vk::Context &ctx_;
   TrainOptions options_;
@@ -234,7 +261,7 @@ private:
   double densifySeconds_ = 0.0;
   int densifyRounds_ = 0;
   double pruneSeconds_ = 0.0;
-  std::vector<Camera> allCameras_; // Training and held-out, for levelling the floor
+  std::optional<SceneAlignment> alignment_; // With TrainOptions::alignFloor
   std::vector<float> filter3d_;
   std::size_t filterLevel_ = ~std::size_t{0}; // Stale, and also after any change of the count outside a round
   int iteration_ = 0;
