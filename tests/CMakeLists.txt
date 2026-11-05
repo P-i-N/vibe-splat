@@ -68,3 +68,12 @@ if(NODE_EXECUTABLE)
   add_test(NAME web_train_html COMMAND "${NODE_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/web_html_check.mjs" "${SFM_DIR}/project/splat.html")
   set_tests_properties(web_train_html PROPERTIES DEPENDS cli_train)
 endif()
+
+# These need a Vulkan device, directly or through a file another of them
+# writes. The unit tests skip themselves without one; a GPU-less machine such
+# as CI's Windows runner leaves these out with `ctest -LE gpu`.
+set(GPU_CLI_TESTS cli_selftest cli_render cli_render_cgc cli_ingest cli_sfm_render cli_train)
+if(NODE_EXECUTABLE)
+  list(APPEND GPU_CLI_TESTS web_train_html)
+endif()
+set_tests_properties(${GPU_CLI_TESTS} PROPERTIES LABELS gpu)

@@ -75,9 +75,9 @@ jobs:
       - run: New-Item -ItemType Directory -Force .vcpkg-cache
       - run: cmake --preset windows-release
       - run: cmake --build --preset windows-release
-      # Hosted Windows runners have no Vulkan driver: GPU tests skip themselves,
-      # and the CLI selftest is excluded.
-      - run: ctest --preset windows-release -E cli_selftest
+      # Hosted Windows runners have no Vulkan driver: the GPU unit tests skip
+      # themselves, and the CLI tests that need a GPU are labelled gpu.
+      - run: ctest --preset windows-release -LE gpu
 
       - name: Package the zip
         run: |
