@@ -474,6 +474,9 @@ TrainSession::TrainSession(vk::Context &ctx, const TrainOptions &options, TrainD
     : ctx_(ctx), options_(options), data_(std::move(data)), log_(std::move(log)), rng_(options.seed), densifyRng_(options.seed + 1),
       growth_(data_.startingPoints.size(), growth_factor(options)), lastOpacityReset_(-kCheckpointRecovery) {
   if (!log_) log_ = [](const std::string &line) { std::println("{}", line); };
+  // Now, not at the first checkpoint minutes later: a folder that cannot be
+  // made fails before any training is done.
+  if (const fs::path folder = output_paths(options_)[0].parent_path(); !folder.empty()) fs::create_directories(folder);
   if (options_.adaptiveSchedule && !options_.fullResolution) {
     log_(std::format("Image sizes: quarter until {:.0f}% of training, half until {:.0f}%, then full", 100.0 * data_.coarseUntil[1],
                      100.0 * data_.coarseUntil[0]));

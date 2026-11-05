@@ -861,6 +861,16 @@ TEST_CASE("Training holds out views in file name order and samples the sparse po
 
   options.sparsePoints = 0;
   CHECK(load_train_data(options).startingPoints.size() == 500);
+
+  // A checkpoint into a folder that does not exist yet: training once ran
+  // to its first save and only then failed on the missing folder.
+  if (vk::Context *ctx = test::context(); ctx != nullptr) {
+    options.out = project / "not" / "there" / "splat";
+    TrainSession session(*ctx, options, load_train_data(options), [](const std::string &) {});
+    session.save();
+    CHECK(fs::exists(project / "not" / "there" / "splat.ply"));
+    CHECK(fs::exists(project / "not" / "there" / "splat.cgc"));
+  }
   fs::remove_all(project);
 }
 
