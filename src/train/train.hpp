@@ -29,7 +29,9 @@ struct TrainOptions {
   std::filesystem::path out;
   int iterations = 15000;
   float lambdaSsim = 0.2f;
-  int shDegree = 3;
+  // 2, not 3DGS's 3: on bicycle 15000 iterations train 8% faster and the final
+  // .cgc compresses 3x faster, at 416 rather than 544 bytes per Gaussian.
+  int shDegree = 2;
   int maxSize = 0;  // Shrink images to this; 0 keeps their size
   int maxViews = 0; // Use only the first n views; 0 uses all
   int holdout = 0;  // Keep the first and every nth view out of training, as 3DGS does; 0 trains on all

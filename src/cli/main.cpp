@@ -123,7 +123,7 @@ train options (writes project/splat.ply, project/splat.cgc and project/preview_*
   -o, --out <file>        Output name, saved both as .ply and as compressed .cgc
   --iterations <n>        Default 15000
   --lambda-ssim <x>       Weight of D-SSIM against L1 (default 0.2)
-  --sh-degree <0-3>       Default 3
+  --sh-degree <0-3>       Default 2
   --max-size <px>         Shrink training images to this (default: keep size)
   --max-views <n>         Use only the first n views
   --holdout <n>           Keep the first and every nth view out of training, to

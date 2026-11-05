@@ -245,11 +245,14 @@ does automatic differentiation: each pass has a hand-derived counterpart.
   Gaussians. It helps when poses are a little off and costs a little when they
   are good, so it is off by default.
 - **View dependence.** SH starts at degree 0 and gains a degree every 1000
-  iterations, up to `--sh-degree`.
+  iterations, up to `--sh-degree`, 2 by default. Degree 3, as in 3DGS, adds
+  finer view-dependent colour; on bicycle at 15000 iterations it trained 8%
+  slower and its final `.cgc` took 3x longer to compress.
 - **Memory.** A hard budget, by default 90% of the GPU's free memory
   (`--vram-budget` overrides it). At the limit, the Gaussians with the highest
   gradients densify first, and a view that still does not fit gives up the
-  largest ones. At SH degree 3 a Gaussian takes about 540 bytes, plus 16 bytes
+  largest ones. At SH degree 2 a Gaussian takes about 420 bytes (540 at
+  degree 3), plus 16 bytes
   per tile it covers: values are floats, but SH above degree 0 half floats,
   Adam's moments are bfloat16, and gradients are never stored, as each step is
   taken where they are found.
