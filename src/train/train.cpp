@@ -296,6 +296,17 @@ struct TrainSession::ViewPose {
   }
 };
 
+namespace {
+
+// Through a temporary file, so that a crash never leaves half a file.
+void save_through_temporary(const GaussianCloud &cloud, const fs::path &path, CloudFormat format, const CgcOptions &options) {
+  const fs::path temporary = fs::path(path).concat(".tmp");
+  save_cloud(cloud, temporary, format, options);
+  fs::rename(temporary, path);
+}
+
+} // namespace
+
 Camera posed_camera(const ColmapImage &image, const ColmapCamera &camera, double scale) {
   Camera out;
   const glm::dvec2 f = focal_of(camera) * scale, c = principal_of(camera) * scale;
@@ -318,6 +329,33 @@ Camera posed_camera(const ColmapImage &image, const ColmapCamera &camera, double
   out.view = glm::mat4(viewMatrix);
   out.position = glm::vec3(image.center());
   return out;
+}
+
+std::array<fs::path, 2> output_paths(const TrainOptions &options) {
+  return {fs::path(options.out).replace_extension(".ply"), fs::path(options.out).replace_extension(".cgc")};
+}
+
+SceneAlignment scene_alignment(const ColmapModel &model) {
+  std::vector<Camera> cameras;
+  cameras.reserve(model.images.size());
+  for (const auto &[id, image] : model.images) cameras.push_back(posed_camera(image, model.cameras.at(image.cameraId)));
+  // The sparse points as opaque Gaussians, which is all the floor search looks at.
+  GaussianCloud points;
+  points.resize(model.points.size(), 0);
+  for (std::size_t i = 0; i < model.points.size(); ++i) {
+    for (int a = 0; a < 3; ++a) points.positions[i * 3 + static_cast<std::size_t>(a)] = static_cast<float>(model.points[i].position[a]);
+    points.opacities[i] = 8.f;
+  }
+  SceneAlignment alignment;
+  alignment.floor = estimate_floor(points, cameras);
+  alignment.transform = floor_alignment(alignment.floor, points);
+  alignment.tiltDeg = glm::degrees(std::acos(std::clamp(glm::dot(alignment.floor.normal, estimate_up(cameras)), -1.0, 1.0)));
+  return alignment;
+}
+
+std::string SceneAlignment::describe() const {
+  return floor.fitted ? std::format("floor plane through {} of {} sparse points, {:.1f} deg off the cameras' up", floor.inliers, floor.candidates, tiltDeg)
+                      : std::string("no floor plane in the sparse points, levelled by the cameras' up");
 }
 
 double growth_factor(const TrainOptions &options) noexcept {
@@ -473,13 +511,14 @@ TrainSession::TrainSession(vk::Context &ctx, const TrainOptions &options, TrainD
   poses_.resize(data_.trainViews.size());
   positionStart_ = 1.6e-4 * data_.extent;
   positionEnd_ = 1.6e-6 * data_.extent;
-  for (const auto *views : {&data_.trainViews, &data_.holdoutViews}) {
-    for (const TrainView &view : *views) allCameras_.push_back(view.camera);
-  }
   log_(std::format("Training from {} Gaussians on {} views ({} held out) at {}x{} for {} iterations, SH degree {}, VRAM budget {:.1f} GiB{}",
                    data_.startingPoints.size(), data_.trainViews.size(), data_.holdoutViews.size(), data_.trainViews[0].camera.width,
                    data_.trainViews[0].camera.height, options_.iterations, options_.shDegree, budgetGiB_,
                    trainer_->uses_fixed_point() ? " (fixed-point gradients: this GPU has no float atomics)" : ""));
+  if (options_.alignFloor) {
+    alignment_ = scene_alignment(data_.model);
+    log_(std::format("Saved with the floor level: {}", alignment_->describe()));
+  }
   refresh_filter(1);
 }
 
@@ -705,49 +744,52 @@ StepStats TrainSession::step() {
   if (options.saveEvery > 0 && iteration % options.saveEvery == 0) checkpointDue_ = true;
   if (checkpointDue_ && iteration - lastOpacityReset_ >= kCheckpointRecovery && iteration < options.iterations) {
     checkpointDue_ = false;
-    save(options.out);
+    save();
   }
   return stats;
 }
 
-std::string TrainSession::save_output(const fs::path &path, const CgcOptions &cgcOptions) {
+std::function<void()> TrainSession::save_outputs(bool quick) {
   if (options_.mipFilter3d && (filterLevel_ == ~std::size_t{0} || filter3d_.size() != trainer_->gaussian_count())) {
     refresh_filter(std::max(iteration_, 1));
   }
-  GaussianCloud cloud = trainer_->cloud();
-  if (options_.mipFilter3d) bake_filter(cloud, filter3d_);
-  // The format follows the output's name, also for a temporary file.
-  const CloudFormat format = cloud_format(options_.out);
+  auto cloud = std::make_shared<GaussianCloud>(trainer_->cloud());
+  if (options_.mipFilter3d) bake_filter(*cloud, filter3d_);
+  if (alignment_) transform_cloud(*cloud, alignment_->transform);
+  const auto [ply, cgc] = output_paths(options_);
+  save_through_temporary(*cloud, ply, CloudFormat::Ply, {});
   // CGC refuses NaN and infinity, which a few Gaussians can pick up after
-  // densification has stopped pruning them, so those are left out of CGC files.
-  if (format == CloudFormat::Cgc) {
-    if (const std::size_t removed = remove_non_finite(cloud); removed > 0) {
-      log_(std::format("  left out {} Gaussians with NaN or infinite values", removed));
+  // densification has stopped pruning them, so those are left out of it.
+  if (const std::size_t removed = remove_non_finite(*cloud); removed > 0) {
+    log_(std::format("  left out {} Gaussians with NaN or infinite values from {}", removed, cgc.filename().string()));
+  }
+  // Quick settings for checkpoints, so that they don't hold up training. At
+  // full quality a million Gaussians take about a minute.
+  return [cloud, cgc, quick, log = log_] {
+    const auto start = std::chrono::steady_clock::now();
+    if (!quick) log(std::format("Compressing {} Gaussians into {}", cloud->size(), cgc.filename().string()));
+    save_through_temporary(*cloud, cgc, CloudFormat::Cgc, CgcOptions{.fast = quick});
+    if (!quick) {
+      log(std::format("Wrote {} in {:.1f} s ({:.1f} MB)", cgc.string(),
+                      std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), static_cast<double>(fs::file_size(cgc)) / 1e6));
     }
-  }
-  std::string floorNote;
-  if (options_.alignFloor) {
-    const FloorEstimate floor = estimate_floor(cloud, allCameras_);
-    transform_cloud(cloud, floor_alignment(floor, cloud));
-    const double tilt = glm::degrees(std::acos(std::clamp(glm::dot(floor.normal, estimate_up(allCameras_)), -1.0, 1.0)));
-    floorNote = floor.fitted ? std::format("floor plane through {} of {} opaque Gaussians, {:.1f} deg off the cameras' up", floor.inliers,
-                                           floor.candidates, tilt)
-                             : "no floor plane found, levelled by the cameras' up";
-  }
-  save_cloud(cloud, path, format, cgcOptions);
-  return floorNote;
+  };
 }
 
-void TrainSession::save(const fs::path &path) {
-  // Through a temporary file, so that a crash never leaves half a checkpoint.
-  // Quick settings, so that CGC checkpoints don't hold up training.
-  const fs::path temporary = fs::path(path).concat(".tmp");
-  const std::string floorNote = save_output(temporary, CgcOptions{.fast = true});
-  fs::rename(temporary, path);
-  log_(std::format("  iteration {:6}: checkpoint saved to {}{}", iteration_, path.string(), floorNote.empty() ? "" : " (" + floorNote + ")"));
+void TrainSession::save() {
+  save_outputs(true)();
+  const auto [ply, cgc] = output_paths(options_);
+  log_(std::format("  iteration {:6}: checkpoint saved to {} and {}", iteration_, ply.string(), cgc.filename().string()));
 }
 
 TrainReport TrainSession::finish() {
+  std::function<void()> writeCgc;
+  TrainReport report = finish(writeCgc);
+  writeCgc();
+  return report;
+}
+
+TrainReport TrainSession::finish(std::function<void()> &writeCgc) {
   Trainer &trainer = *trainer_;
   report_.iterationsPerSecond = iteration_ / std::max(trainingSeconds_, 1e-9);
 
@@ -772,9 +814,7 @@ TrainReport TrainSession::finish() {
   }
 
   report_.gaussians = trainer.gaussian_count();
-  if (const std::string floorNote = save_output(options_.out, CgcOptions{}); !floorNote.empty()) {
-    log_(std::format("Aligned to the floor: {}", floorNote));
-  }
+  writeCgc = save_outputs(false);
   write_preview(trainer.render(data_.trainViews[0].camera), data_.trainViews[0], options_.project / "preview_train.png");
   if (!data_.holdoutViews.empty()) {
     write_preview(trainer.render(data_.holdoutViews[0].camera), data_.holdoutViews[0], options_.project / "preview_holdout.png");
@@ -797,7 +837,7 @@ TrainReport TrainSession::finish() {
                      1000.0 * densifySeconds_ / densifyRounds_));
   }
   if (pruneSeconds_ > 0.0) log_(std::format("Pruning: {:.1f} s in total", pruneSeconds_));
-  log_(std::format("Finished in {:.1f} s ({:.1f} it/s) -> {}", trainingSeconds_, report_.iterationsPerSecond, options_.out.string()));
+  log_(std::format("Finished in {:.1f} s ({:.1f} it/s) -> {}", trainingSeconds_, report_.iterationsPerSecond, output_paths(options_)[0].string()));
   return report_;
 }
 

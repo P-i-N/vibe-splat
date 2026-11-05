@@ -119,9 +119,9 @@ sfm options (writes project/sparse/0 in COLMAP's format, plus preview.ply):
   --cpu                   Match features on the CPU even when a GPU is available
   --import <dir>          Instead of estimating, import a COLMAP sparse model
 
-train options (writes project/splat.ply and project/preview_*.png):
-  -o, --out <file>        Output file, .ply or compressed .cgc
-  --iterations <n>        Default 30000
+train options (writes project/splat.ply, project/splat.cgc and project/preview_*.png):
+  -o, --out <file>        Output name, saved both as .ply and as compressed .cgc
+  --iterations <n>        Default 15000
   --lambda-ssim <x>       Weight of D-SSIM against L1 (default 0.2)
   --sh-degree <0-3>       Default 3
   --max-size <px>         Shrink training images to this (default: keep size)
@@ -130,7 +130,7 @@ train options (writes project/splat.ply and project/preview_*.png):
                           measure quality on the same views as 3DGS does
   --seed <n>              Default 1
   --report-every <n>      Default 500
-  --save-every <n>        Save the output this often, 0 only at the end (default 5000)
+  --save-every <n>        Save the outputs this often, 0 only at the end (default 5000)
   --no-densify            Keep the initial Gaussians, without adding or removing any
   --densify <mode>        adc: clone, split and prune as in the paper (default);
                           mcmc: relocate the transparent and grow by sampling (3DGS-MCMC)
@@ -186,7 +186,8 @@ train options (writes project/splat.ply and project/preview_*.png):
   --sparse-init <n>       Start from a random sample of at most n sparse points (0: all)
   --point-extent          Take the scene's extent from the sparse points, not the cameras
   --no-align              Save in the cameras' frame, rather than with the floor
-                          level at y = 0 (-y up) under the scene's centre
+                          level at y = 0 (-y up) under the scene's centre, as found
+                          from the camera poses and sparse points before training
   --view                  Train in the viewer window, watching it as it goes
 
 make-test-views options:
