@@ -1,0 +1,15 @@
+# Common warning and platform settings applied to every first-party target.
+function(splat_target_defaults target)
+  if(MSVC)
+    target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8 /Zc:__cplusplus)
+    target_compile_definitions(${target} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+  else()
+    target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wno-sign-conversion -Wno-missing-field-initializers)
+  endif()
+endfunction()
+
+function(splat_static_runtime target)
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR (UNIX AND CMAKE_CXX_COMPILER_ID MATCHES "Clang"))
+    target_link_options(${target} PRIVATE -static-libstdc++ -static-libgcc)
+  endif()
+endfunction()

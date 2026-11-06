@@ -1,0 +1,19 @@
+#version 460
+// Adds each block's scanned offset to its 1024 elements.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Data { uint data[]; };
+layout(std430, binding = 1) readonly buffer Sums { uint sums[]; };
+
+layout(push_constant) uniform Push { uint count; } pc;
+
+void main() {
+  const uint add = sums[gl_WorkGroupID.x];
+  const uint base = gl_WorkGroupID.x * 1024u + gl_LocalInvocationIndex * 4u;
+  for (uint j = 0; j < 4u; ++j) {
+    const uint i = base + j;
+    if (i < pc.count) {
+      data[i] += add;
+    }
+  }
+}

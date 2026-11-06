@@ -1,0 +1,52 @@
+{
+  "name": "vibe-splat",
+  "version-string": "1.0.0",
+  "license": "0BSD",
+  "description": "Gaussian splat generator and viewer built on Vulkan.",
+  "builtin-baseline": "9a5dfef5d1a0438a7d24856a85bd60f309d355e9",
+  "dependencies": [
+    "volk",
+    "vulkan-headers",
+    "vulkan-memory-allocator",
+    "glm",
+    "stb",
+    "nlohmann-json",
+    "eigen3",
+    "liblzma",
+    {
+      "name": "imgui",
+      "features": [
+        "sdl3-binding"
+      ]
+    },
+    {
+      "name": "sdl3",
+      "default-features": false,
+      "features": [
+        "vulkan",
+        {
+          "name": "x11",
+          "platform": "linux"
+        },
+        {
+          "name": "wayland",
+          "platform": "linux"
+        }
+      ]
+    },
+    {
+      "name": "glslang",
+      "host": true,
+      "default-features": false,
+      "features": [
+        "tools"
+      ]
+    },
+    "catch2"
+  ],
+  "vcpkg-configuration": {
+    "overlay-ports": [
+      "./cmake/vcpkg-overlays"
+    ]
+  }
+}

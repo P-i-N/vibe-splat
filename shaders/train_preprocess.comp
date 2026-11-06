@@ -1,0 +1,134 @@
+#version 460
+// Forward pass, step 1: from raw trainable parameters to screen-space splats,
+// a depth sort key, and how many tiles each splat covers. position.w of the
+// camera holds the near plane.
+#extension GL_GOOGLE_include_directive : require
+#include "splat_types.glsl"
+#include "train_types.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Positions { float positions[]; };
+layout(std430, binding = 1) readonly buffer Scales { float scales[]; };
+layout(std430, binding = 2) readonly buffer Rotations { float rotations[]; };
+layout(std430, binding = 3) readonly buffer Opacities { float opacities[]; };
+layout(std430, binding = 4) readonly buffer SH { uint sh[]; }; // See train_sh.glsl
+layout(std430, binding = 5) readonly buffer Camera { CameraParams cam; };
+layout(std430, binding = 6) writeonly buffer Splats { TrainSplat splats[]; };
+layout(std430, binding = 7) writeonly buffer Keys { uint keys[]; };
+layout(std430, binding = 8) writeonly buffer Values { uint values[]; };
+layout(std430, binding = 9) readonly buffer Filter3d { float filter3d[]; }; // Mip-Splatting's 3D smoothing filter, 0 for none
+
+#include "train_sh.glsl"
+
+layout(push_constant) uniform Push {
+  uint mipFilter; // Mip-Splatting's 2D filter instead of the 0.3 dilation
+  float shDropout; // SH dropout: probability, retained degree and this iteration's seed
+  uint shRetained;
+  uint shSeed;
+} pc;
+
+void main() {
+  const uint i = gl_GlobalInvocationID.x;
+  if (i >= cam.counts.x) {
+    return;
+  }
+  keys[i] = INVISIBLE;
+  values[i] = i;
+
+  const vec3 p = vec3(positions[i * 3u], positions[i * 3u + 1u], positions[i * 3u + 2u]);
+  const vec3 t = (cam.view * vec4(p, 1.0)).xyz;
+  // Written so that NaN fails: one such Gaussian would blacken every pixel it
+  // touches, and through the loss reach all the Gaussians there.
+  if (!(t.z >= cam.position.w)) {
+    return;
+  }
+  const float opacity = 1.0 / (1.0 + exp(-opacities[i]));
+  if (!(opacity >= 1.0 / 255.0)) {
+    return;
+  }
+
+  vec4 q = vec4(rotations[i * 4u], rotations[i * 4u + 1u], rotations[i * 4u + 2u], rotations[i * 4u + 3u]);
+  const float len = length(q);
+  if (!(len >= MIN_QUATERNION_LENGTH)) {
+    return;
+  }
+  q /= len;
+  const vec3 s = exp(vec3(scales[i * 3u], scales[i * 3u + 1u], scales[i * 3u + 2u]));
+  const mat3 M = train_quat_to_mat(q) * mat3(s.x, 0.0, 0.0, 0.0, s.y, 0.0, 0.0, 0.0, s.z);
+  const float smooth3d = filter3d[i];
+  const mat3 sigma = M * transpose(M) + mat3(smooth3d);
+  // The filter widens the Gaussian; its opacity shrinks to keep the integral.
+  const vec3 s2 = s * s;
+  const float opacity3 = opacity * sqrt(s2.x / (s2.x + smooth3d) * s2.y / (s2.y + smooth3d) * s2.z / (s2.z + smooth3d));
+  if (!(opacity3 >= 1.0 / 255.0)) {
+    return;
+  }
+
+  const float fx = cam.intrinsics.x, fy = cam.intrinsics.y;
+  const float limX = 1.3 * cam.viewport.z, limY = 1.3 * cam.viewport.w;
+  const float tx = clamp(t.x / t.z, -limX, limX) * t.z;
+  const float ty = clamp(t.y / t.z, -limY, limY) * t.z;
+  const mat3 J = mat3(fx / t.z, 0.0, 0.0,
+                      0.0, fy / t.z, 0.0,
+                      -fx * tx / (t.z * t.z), -fy * ty / (t.z * t.z), 0.0);
+  const mat3 T = J * mat3(cam.view);
+  const mat3 cov = T * sigma * transpose(T);
+
+  // Low-pass: the paper's 0.3 pixel dilation, or Mip-Splatting's 0.1 with the
+  // opacity scaled to keep the integral.
+  const float dilation = pc.mipFilter != 0u ? 0.1 : 0.3;
+  const float a = cov[0][0] + dilation;
+  const float b = cov[0][1];
+  const float c = cov[1][1] + dilation;
+  const float det = a * c - b * b;
+  if (!(det > MIN_CONIC_DETERMINANT)) {
+    return;
+  }
+  float opacityUsed = opacity3;
+  if (pc.mipFilter != 0u) {
+    const float rawDet = cov[0][0] * cov[1][1] - b * b;
+    opacityUsed = rawDet > 0.0 ? opacity3 * sqrt(rawDet / det) : 0.0;
+    if (!(opacityUsed >= 1.0 / 255.0)) {
+      return;
+    }
+  }
+  const float mid = 0.5 * (a + c);
+  const float lambda = mid + sqrt(max(0.1, mid * mid - det));
+  const float radius = ceil(3.0 * sqrt(lambda));
+
+  const vec2 center = vec2(fx * t.x / t.z + cam.intrinsics.z, fy * t.y / t.z + cam.intrinsics.w);
+  if (center.x + radius < 0.0 || center.y + radius < 0.0 || center.x - radius > cam.viewport.x ||
+      center.y - radius > cam.viewport.y) {
+    return;
+  }
+
+  const uint degree = cam.counts.y;
+  float basis[16];
+  sh_basis(normalize(p - cam.position.xyz), degree, basis);
+  const uint coefficients = train_sh_coefficients(i, cam.counts.w, pc.shDropout, pc.shRetained, pc.shSeed);
+  const uint base = i * cam.counts.z;
+  vec3 color = vec3(0.5);
+  for (uint k = 0u; k < coefficients; ++k) {
+    color += basis[k] * sh_coefficient(base, k);
+  }
+
+  if (!all(lessThan(abs(color), vec3(1e30)))) {
+    return;
+  }
+
+  // A pixel counts only if opacity * exp(power) >= 1/255, which is an ellipse.
+  // Its bounding box is often far smaller than the square of radius 3 sigma, above
+  // all at low opacity, and how much is computed depends on that area. So this
+  // is what makes training fast, and leaves the picture exactly the same.
+  const float reach = 2.0 * log(255.0 * opacityUsed);
+  const vec2 extent = min(vec2(sqrt(reach * a), sqrt(reach * c)), vec2(radius));
+
+  TrainSplat splat;
+  splat.conicOpacity = vec4(vec3(c, -b, a) / det, opacityUsed);
+  splat.colorRadius = vec4(max(color, vec3(0.0)), radius);
+  splat.center = center;
+  splat.extent = extent;
+  splats[i] = splat;
+  keys[i] = 0xFFFFFFFFu - floatBitsToUint(t.z);
+}

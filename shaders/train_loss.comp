@@ -1,0 +1,113 @@
+#version 460
+// Loss, part 2: per-pixel adjoint dL/dImage for
+//   L = (1 - lambda) mean|image - target| + lambda (1 - mean SSIM)
+// with means over pixels and channels. The window is symmetric, so the
+// derivative applies the same weights to the fields of part 1: a horizontal
+// pass into shared memory, then a vertical pass out of it, one workgroup per
+// 16x16 tile as in part 1. Each workgroup also writes the L1 total of its pixels.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_GOOGLE_include_directive : require
+#include "workgroup_sum.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer Image { vec4 image[]; };
+layout(std430, binding = 1) readonly buffer Target { uint target[]; };
+layout(std430, binding = 2) readonly buffer Fields { vec4 fields[]; }; // Plane j at j * pixels
+layout(std430, binding = 3) writeonly buffer Adjoint { vec4 adjoint[]; };
+layout(std430, binding = 4) buffer GroupTotals { vec2 groupTotals[]; }; // x: SSIM, y: L1
+layout(std430, binding = 5) buffer ErrorMax { uint errorMax; }; // The worst pixel, over 65535, when scoring
+layout(std430, binding = 6) writeonly buffer Edge { float edge[]; }; // When scoring: how much of an edge the target has at each pixel
+
+layout(push_constant) uniform Push { uint width; uint height; uint gridW; float lambda; uint scoring; } pc;
+
+const float WEIGHTS[11] = float[](0.00102838, 0.00759876, 0.03600077, 0.10936069, 0.21300554, 0.26601172,
+                                  0.21300554, 0.10936069, 0.03600077, 0.00759876, 0.00102838);
+const int HALO = 5;
+const int ROWS = 16 + 2 * HALO;
+
+// Horizontal window sums of the three fields for the tile's columns and ROWS rows.
+shared float h[3][3][ROWS * 16];
+
+// The target's luminance at a pixel, clamped to the image.
+float target_luminance(int x, int y) {
+  x = clamp(x, 0, int(pc.width) - 1);
+  y = clamp(y, 0, int(pc.height) - 1);
+  precise const float luminance = dot(unpackUnorm4x8(target[uint(y) * pc.width + uint(x)]).rgb, vec3(0.299, 0.587, 0.114));
+  return luminance;
+}
+
+// A Laplacian of the target's luminance, in [0, 1): the edge weight of the
+// edge-aware score (Improving Densification in 3DGS, CVPR 2026).
+float target_edge(int x, int y) {
+  // As differences, so that a flat patch gives exactly zero in float. precise
+  // keeps the compiler from regrouping them, which Mesa's RADV otherwise does.
+  precise const float centre = target_luminance(x, y);
+  precise const float laplacian =(target_luminance(x - 1, y) - centre) + (target_luminance(x + 1, y) - centre) +
+                          (target_luminance(x, y - 1) - centre) + (target_luminance(x, y + 1) - centre);
+  return clamp(abs(laplacian) / 4.0, 0.0, 0.999);
+}
+
+void main() {
+  const uint tile = gl_WorkGroupID.x;
+  const int x0 = int(tile % pc.gridW) * 16, y0 = int(tile / pc.gridW) * 16;
+  const uint pixels = pc.width * pc.height;
+
+  for (uint i = gl_LocalInvocationIndex; i < uint(ROWS * 16); i += 256u) {
+    const int r = int(i) / 16, c = int(i) % 16;
+    const int y = y0 + r - HALO, x = x0 + c;
+    vec3 p = vec3(0.0), q = vec3(0.0), s = vec3(0.0);
+    if (y >= 0 && y < int(pc.height) && x < int(pc.width)) {
+      const int u0 = max(x - 5, 0), u1 = min(x + 5, int(pc.width) - 1);
+      for (int u = u0; u <= u1; ++u) {
+        const float w = WEIGHTS[u - x + 5];
+        const uint at = uint(y) * pc.width + uint(u);
+        p += w * fields[at].rgb;
+        q += w * fields[pixels + at].rgb;
+        s += w * fields[2u * pixels + at].rgb;
+      }
+    }
+    for (int k = 0; k < 3; ++k) {
+      h[0][k][i] = p[k];
+      h[1][k][i] = q[k];
+      h[2][k][i] = s[k];
+    }
+  }
+  barrier();
+
+  const int px = x0 + int(gl_LocalInvocationID.x), py = y0 + int(gl_LocalInvocationID.y);
+  float own = 0.0;
+  if (px < int(pc.width) && py < int(pc.height)) {
+    const float perValue = 1.0 / (3.0 * float(pc.width) * float(pc.height));
+    const uint pixel = uint(py) * pc.width + uint(px);
+    const vec3 x = image[pixel].rgb;
+    const vec3 y = unpackUnorm4x8(target[pixel]).rgb;
+    const vec3 difference = x - y;
+    own = abs(difference.r) + abs(difference.g) + abs(difference.b);
+
+    vec3 p = vec3(0.0), q = vec3(0.0), r = vec3(0.0);
+    const int v0 = max(py - 5, 0), v1 = min(py + 5, int(pc.height) - 1);
+    for (int v = v0; v <= v1; ++v) {
+      const float w = WEIGHTS[v - py + 5];
+      const uint at = uint((v - y0 + HALO) * 16) + gl_LocalInvocationID.x;
+      for (int k = 0; k < 3; ++k) {
+        p[k] += w * h[0][k][at];
+        q[k] += w * h[1][k][at];
+        r[k] += w * h[2][k][at];
+      }
+    }
+    const vec3 result = (1.0 - pc.lambda) * sign(difference) - pc.lambda * (p + 2.0 * x * q + y * r);
+    // When scoring, alpha holds the pixel's mean error, for train_error_mask.comp.
+    const float error = own / 3.0;
+    adjoint[pixel] = vec4(result * perValue, pc.scoring != 0u ? error : 0.0);
+    if (pc.scoring != 0u) {
+      atomicMax(errorMax, uint(clamp(error, 0.0, 1.0) * 65535.0));
+      edge[pixel] = target_edge(px, py);
+    }
+  }
+  const float total = workgroup_sum(own);
+  if (gl_LocalInvocationIndex == 0u) {
+    groupTotals[tile].y = total;
+  }
+}

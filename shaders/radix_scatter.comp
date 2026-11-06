@@ -1,0 +1,85 @@
+#version 460
+// Pass 2 of a radix-sort pass: stable scatter.
+// Each workgroup walks its tile in rounds of 256 keys, in index order. A round
+// is sorted locally by digit with eight stable 1-bit splits, which gives each
+// key its rank among equal digits; the global position is then
+//   scanned_hist[digit][tile] + keys of that digit in earlier rounds + rank.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#include "radix_common.glsl"
+#include "workgroup_scan.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer KeysIn { uint keysIn[]; };
+layout(std430, binding = 1) readonly buffer ValsIn { uint valsIn[]; };
+layout(std430, binding = 2) writeonly buffer KeysOut { uint keysOut[]; };
+layout(std430, binding = 3) writeonly buffer ValsOut { uint valsOut[]; };
+layout(std430, binding = 4) readonly buffer Offsets { uint offsets[]; }; // scanned histogram
+
+shared uint s_base[RADIX_BUCKETS];
+shared uint s_run[RADIX_BUCKETS];
+shared uint s_start[RADIX_BUCKETS];
+shared uint s_key[RADIX_THREADS];
+shared uint s_val[RADIX_THREADS];
+shared uint s_valid[RADIX_THREADS];
+shared uint s_digit[RADIX_THREADS];
+
+uint digit_of(uint key, uint valid) {
+  return valid != 0u ? (key >> pc.shift) & 0xFFu : 0xFFu;
+}
+
+void main() {
+  const uint lid = gl_LocalInvocationIndex;
+  const uint tile = gl_WorkGroupID.x;
+
+  s_base[lid] = offsets[lid * pc.numTiles + tile];
+  s_run[lid] = 0;
+  barrier();
+
+  for (uint r = 0; r < RADIX_KEYS_PER_THREAD; ++r) {
+    const uint i = tile * RADIX_TILE + r * RADIX_THREADS + lid;
+    uint valid = i < pc.count ? 1u : 0u;
+    uint key = valid != 0u ? keysIn[i] : 0xFFFFFFFFu;
+    uint val = valid != 0u ? valsIn[i] : 0u;
+    uint digit = digit_of(key, valid);
+
+    // Stable local sort of this round by digit. Invalid keys (past the end)
+    // get digit 255 and, being last in index order, stay behind valid ones.
+    for (uint b = 0; b < 8u; ++b) {
+      const uint bit = (digit >> b) & 1u;
+      uint zeros;
+      const uint zerosBefore = workgroup_exclusive_add(1u - bit, zeros);
+      const uint dst = bit == 0u ? zerosBefore : zeros + (lid - zerosBefore);
+      s_key[dst] = key;
+      s_val[dst] = val;
+      s_valid[dst] = valid;
+      barrier();
+      key = s_key[lid];
+      val = s_val[lid];
+      valid = s_valid[lid];
+      digit = digit_of(key, valid);
+      barrier();
+    }
+
+    s_digit[lid] = digit;
+    barrier();
+    if (lid == 0u || s_digit[lid - 1u] != digit) {
+      s_start[digit] = lid;
+    }
+    barrier();
+
+    const uint rank = lid - s_start[digit];
+    if (valid != 0u) {
+      const uint dst = s_base[digit] + s_run[digit] + rank;
+      keysOut[dst] = key;
+      valsOut[dst] = val;
+    }
+    barrier();
+    if (lid == RADIX_THREADS - 1u || s_digit[lid + 1u] != digit) {
+      s_run[digit] += rank + 1u;
+    }
+    barrier();
+  }
+}

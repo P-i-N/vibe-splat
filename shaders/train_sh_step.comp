@@ -1,0 +1,70 @@
+#version 460
+// SH's part of the optimiser's step, after train_gradient.comp: one thread per
+// word of the values, so that neighbouring threads touch neighbouring memory.
+// The gradient of coefficient k is basis[k] times the colour gradient, both of
+// which that pass left in the sums' place.
+#extension GL_GOOGLE_include_directive : require
+#include "bf16.glsl"
+#include "splat_types.glsl"
+#include "train_types.glsl"
+#include "train_step.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer SH { uint sh[]; }; // See train_sh.glsl
+layout(std430, binding = 1) buffer SHState { uint shState[]; }; // As train_gradient.comp's
+layout(std430, binding = 2) readonly buffer Raw { float raw[]; }; // As the end of chain() in train_gradient.comp left them
+layout(std430, binding = 3) readonly buffer Camera { CameraParams cam; };
+
+void main() {
+  const uint w = gl_GlobalInvocationID.x;
+  const uint words = cam.counts.z;
+  if (w >= cam.counts.x * words) {
+    return;
+  }
+  const uint i = w / words, q = w - i * words;
+  const uint at = i * RAW_PER_SPLAT;
+  const vec3 gColour = vec3(raw[at], raw[at + 1u], raw[at + 2u]);
+  const uint coefficients = floatBitsToUint(raw[at + 9u]);
+  // Only Adam, when not selective, steps parameters without a gradient.
+  const bool secondOrder = (pc.flags & FLAG_SECOND_ORDER) != 0u;
+  const bool zeros = pc.mode == MODE_STEP && (pc.flags & FLAG_SELECTIVE) == 0u && !secondOrder;
+  if (coefficients == 0u && !zeros) {
+    return; // Out of view, which leaves it alone
+  }
+  float basis[16];
+  sh_basis(vec3(raw[at + 3u], raw[at + 4u], raw[at + 5u]), cam.counts.y, basis);
+  const vec3 radius = secondOrder ? vec3(raw[at + 6u], raw[at + 7u], raw[at + 8u]) : vec3(-1.0);
+
+  // The word's elements of GaussianCloud's sh: a DC float, or two halves.
+  const uint first = q < 3u ? q : 3u + 2u * (q - 3u);
+  const uint last = q < 3u ? q : min(first + 1u, pc.shFloats - 1u);
+  uint word = sh[w];
+  bool changed = false;
+  for (uint j = first; j <= last; ++j) {
+    const uint k = j / 3u, c = j - 3u * k;
+    const float g = k < coefficients ? basis[k] * gColour[c] : 0.0;
+    if (g == 0.0 && !zeros) {
+      continue;
+    }
+    const uint s = i * pc.shFloats + j;
+    uint state = shState[s];
+    if (pc.mode == MODE_CURVATURE) {
+      shState[s] = with_curvature(state, g, s * 5u + 4u);
+      continue;
+    }
+    float value = trainer_sh_value(word, j);
+    step_parameter(value, state, g, k == 0u ? pc.rates[4] : pc.rates[4] * pc.restScale, radius[c], s * 5u + 4u);
+    shState[s] = state;
+    if (j < 3u) {
+      word = floatBitsToUint(value);
+    } else {
+      const uint shift = 16u * ((j - 3u) & 1u);
+      word = (word & ~(0xFFFFu << shift)) | (half_stochastic(value, s, pc.seed ^ 0x5DEECE66u) << shift);
+    }
+    changed = true;
+  }
+  if (changed) {
+    sh[w] = word;
+  }
+}

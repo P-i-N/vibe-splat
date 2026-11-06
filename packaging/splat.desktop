@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=splat
+GenericName=Gaussian splat viewer
+Comment=View and train 3D Gaussian splats
+Exec=splat view %f
+Icon=splat
+Terminal=false
+Categories=Graphics;3DGraphics;Viewer;

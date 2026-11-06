@@ -1,0 +1,123 @@
+#version 460
+// Loss, part 1: SSIM per pixel, with the 11x11 Gaussian window applied as a
+// horizontal pass into shared memory and a vertical pass out of it. One
+// workgroup per 16x16 tile; the horizontal pass covers the tile plus five
+// rows above and below. Writes the three per-pixel fields that the loss pass
+// turns into dSSIM/dImage:
+//   P = dS/dmu_x - 2 mu_x dS/dvar_x - mu_y dS/dcov,  Q = dS/dvar_x,  R = dS/dcov
+// each divided by the vertical and horizontal window's total weight, as the
+// window is cut off at the image border. Each workgroup also writes the SSIM
+// total of its pixels.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_GOOGLE_include_directive : require
+#include "workgroup_sum.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer Image { vec4 image[]; };
+layout(std430, binding = 1) readonly buffer Target { uint target[]; };
+layout(std430, binding = 2) writeonly buffer Fields { vec4 fields[]; }; // Plane j at j * pixels
+layout(std430, binding = 3) writeonly buffer GroupTotals { vec2 groupTotals[]; }; // x: SSIM, y: L1
+
+layout(push_constant) uniform Push { uint width; uint height; uint gridW; } pc;
+
+const float WEIGHTS[11] = float[](0.00102838, 0.00759876, 0.03600077, 0.10936069, 0.21300554, 0.26601172,
+                                  0.21300554, 0.10936069, 0.03600077, 0.00759876, 0.00102838);
+const float C1 = 0.0001, C2 = 0.0009;
+const int HALO = 5;
+const int ROWS = 16 + 2 * HALO;
+
+// Horizontal window means for the tile's columns and ROWS rows: x, y, x^2, y^2, xy.
+shared float h[5][3][ROWS * 16];
+
+float window_norm(int at, int size) {
+  float norm = 0.0;
+  for (int i = max(at - 5, 0); i <= min(at + 5, size - 1); ++i) {
+    norm += WEIGHTS[i - at + 5];
+  }
+  return norm;
+}
+
+void main() {
+  const uint tile = gl_WorkGroupID.x;
+  const int x0 = int(tile % pc.gridW) * 16, y0 = int(tile / pc.gridW) * 16;
+
+  for (uint i = gl_LocalInvocationIndex; i < uint(ROWS * 16); i += 256u) {
+    const int r = int(i) / 16, c = int(i) % 16;
+    const int y = y0 + r - HALO, x = x0 + c;
+    vec3 mx = vec3(0.0), my = vec3(0.0), xx = vec3(0.0), yy = vec3(0.0), xy = vec3(0.0);
+    if (y >= 0 && y < int(pc.height) && x < int(pc.width)) {
+      float norm = 0.0;
+      const int u0 = max(x - 5, 0), u1 = min(x + 5, int(pc.width) - 1);
+      for (int u = u0; u <= u1; ++u) {
+        const float w = WEIGHTS[u - x + 5];
+        const uint at = uint(y) * pc.width + uint(u);
+        const vec3 a = image[at].rgb;
+        const vec3 b = unpackUnorm4x8(target[at]).rgb;
+        mx += w * a;
+        my += w * b;
+        xx += w * a * a;
+        yy += w * b * b;
+        xy += w * a * b;
+        norm += w;
+      }
+      mx /= norm;
+      my /= norm;
+      xx /= norm;
+      yy /= norm;
+      xy /= norm;
+    }
+    for (int k = 0; k < 3; ++k) {
+      h[0][k][i] = mx[k];
+      h[1][k][i] = my[k];
+      h[2][k][i] = xx[k];
+      h[3][k][i] = yy[k];
+      h[4][k][i] = xy[k];
+    }
+  }
+  barrier();
+
+  const int px = x0 + int(gl_LocalInvocationID.x), py = y0 + int(gl_LocalInvocationID.y);
+  float own = 0.0;
+  if (px < int(pc.width) && py < int(pc.height)) {
+    const float rowNorm = window_norm(py, int(pc.height));
+    vec3 mx = vec3(0.0), my = vec3(0.0), xx = vec3(0.0), yy = vec3(0.0), xy = vec3(0.0);
+    const int v0 = max(py - 5, 0), v1 = min(py + 5, int(pc.height) - 1);
+    for (int v = v0; v <= v1; ++v) {
+      const float w = WEIGHTS[v - py + 5];
+      const uint at = uint((v - y0 + HALO) * 16) + gl_LocalInvocationID.x;
+      for (int k = 0; k < 3; ++k) {
+        mx[k] += w * h[0][k][at];
+        my[k] += w * h[1][k][at];
+        xx[k] += w * h[2][k][at];
+        yy[k] += w * h[3][k][at];
+        xy[k] += w * h[4][k][at];
+      }
+    }
+    mx /= rowNorm;
+    my /= rowNorm;
+    const vec3 vx = xx / rowNorm - mx * mx, vy = yy / rowNorm - my * my, cxy = xy / rowNorm - mx * my;
+
+    const vec3 n1 = 2.0 * mx * my + C1, n2 = 2.0 * cxy + C2;
+    const vec3 d1 = mx * mx + my * my + C1, d2 = vx + vy + C2;
+    const vec3 s = (n1 * n2) / (d1 * d2);
+    own = s.r + s.g + s.b;
+
+    // n1 and n2 are cancelled out of s by hand: n2 can be exactly zero, and
+    // s / n2 would then be NaN although the derivative is well defined.
+    const vec3 dMu = 2.0 * my * n2 / (d1 * d2) - s * 2.0 * mx / d1;
+    const vec3 dVar = -s / d2;
+    const vec3 dCov = 2.0 * n1 / (d1 * d2);
+    const float norm = rowNorm * window_norm(px, int(pc.width));
+    const uint pixels = pc.width * pc.height;
+    const uint pixel = uint(py) * pc.width + uint(px);
+    fields[pixel] = vec4((dMu - 2.0 * mx * dVar - my * dCov) / norm, 0.0);
+    fields[pixels + pixel] = vec4(dVar / norm, 0.0);
+    fields[2u * pixels + pixel] = vec4(dCov / norm, 0.0);
+  }
+  const float total = workgroup_sum(own);
+  if (gl_LocalInvocationIndex == 0u) {
+    groupTotals[tile].x = total;
+  }
+}

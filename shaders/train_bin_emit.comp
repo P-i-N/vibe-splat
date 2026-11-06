@@ -1,0 +1,38 @@
+#version 460
+// Forward pass, step 3: writes one (tile, splat) entry per covered tile, in
+// depth order. A stable sort by tile then gives each tile a depth-sorted list.
+#extension GL_GOOGLE_include_directive : require
+#include "train_types.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Keys { uint keys[]; };
+layout(std430, binding = 1) readonly buffer Values { uint values[]; };
+layout(std430, binding = 2) readonly buffer Splats { TrainSplat splats[]; };
+layout(std430, binding = 3) readonly buffer Offsets { uint offsets[]; };
+layout(std430, binding = 4) writeonly buffer EntryKeys { uint entryKeys[]; };
+layout(std430, binding = 5) writeonly buffer EntryValues { uint entryValues[]; };
+
+layout(push_constant) uniform Push { uint count; uint gridW; uint gridH; } pc;
+
+void main() {
+  const uint r = gl_GlobalInvocationID.x;
+  if (r >= pc.count || keys[r] == INVISIBLE) {
+    return;
+  }
+  const uint splat = values[r];
+  const TrainSplat s = splats[splat];
+  const uvec4 t = splat_tiles(s, uvec2(pc.gridW, pc.gridH));
+  uint slot = offsets[r];
+  for (uint y = t.y; y <= t.w; ++y) {
+    for (uint x = t.x; x <= t.z; ++x) {
+      // The same test as in train_bin_count.comp, so the counts hold.
+      if (!splat_reaches_tile(s, x, y)) {
+        continue;
+      }
+      entryKeys[slot] = y * pc.gridW + x;
+      entryValues[slot] = splat;
+      ++slot;
+    }
+  }
+}
